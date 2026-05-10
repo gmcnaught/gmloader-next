@@ -20,7 +20,17 @@ DynLibFunction symtable_gles2[2048] = {};
 static std::string shader_override_dir = "";
 static bool should_dump_shaders = false;
 
+#ifdef MISTER_NATIVE_VIDEO
+#include <dlfcn.h>
+// Defined in main.cpp — handle to bundled libGLES_sw.so
+extern void* g_gles_handle;
+static void* mister_gles2_resolver(const char* name) {
+    return g_gles_handle ? dlsym(g_gles_handle, name) : nullptr;
+}
+#define PTR_RESOLVE(x) resolve_thunked<&glad_##x>(#x, symtable_gles2_index, symtable_gles2, mister_gles2_resolver)
+#else
 #define PTR_RESOLVE(x) resolve_thunked<&glad_##x>(#x, symtable_gles2_index, symtable_gles2, SDL_GL_GetProcAddress)
+#endif
 
 static std::string read_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary);

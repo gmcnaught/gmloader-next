@@ -22,10 +22,24 @@ extern void glShaderSource_dump(
     const GLint*  lengths
 );
 
+#ifdef MISTER_NATIVE_VIDEO
+#include <dlfcn.h>
+// Defined in main.cpp — handle to bundled libGLES_sw.so
+extern void* g_gles_handle;
+static void* mister_egl_resolver(const char* name) {
+    return g_gles_handle ? dlsym(g_gles_handle, name) : nullptr;
+}
+#undef PTR_RESOLVE
+#define PTR_RESOLVE(x) resolve_thunked<&glad_##x>(#x, symtable_egl_index, symtable_egl, mister_egl_resolver)
+#endif
+
+#ifndef MISTER_NATIVE_VIDEO
 #define PTR_RESOLVE(x) resolve_thunked<&glad_##x>(#x, symtable_egl_index, symtable_egl, SDL_GL_GetProcAddress)
+#endif
+
 ABI_ATTR __eglMustCastToProperFunctionPointerType EGLAPIENTRY eglGetProcAddress_impl (const char *procname)
 {
-
+    // glShaderSource interception must fire on both MiSTer and standard paths
     if (strcmp(procname, "glShaderSource") == 0)
         return (__eglMustCastToProperFunctionPointerType)glShaderSource_dump;
 
@@ -34,6 +48,15 @@ ABI_ATTR __eglMustCastToProperFunctionPointerType EGLAPIENTRY eglGetProcAddress_
             return (__eglMustCastToProperFunctionPointerType)symtable_gles2[i].func;
         }
     }
+
+#ifdef MISTER_NATIVE_VIDEO
+    // Delegate to the bundled library's own eglGetProcAddress for any extension
+    // functions not already thunked in the symtable
+    if (g_gles_handle) {
+        auto pfnGetProcAddr = (void*(*)(const char*))dlsym(g_gles_handle, "eglGetProcAddress");
+        if (pfnGetProcAddr) return (__eglMustCastToProperFunctionPointerType)pfnGetProcAddr(procname);
+    }
+#endif
 
     return NULL;
 }

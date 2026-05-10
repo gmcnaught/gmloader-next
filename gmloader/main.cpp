@@ -19,6 +19,15 @@
 #include "video.h"
 #include "splash.h"
 
+#ifdef MISTER_NATIVE_VIDEO
+#include <dlfcn.h>
+#include <libgen.h>
+#include "mister/native_video_writer.h"
+#include "mister/frame_capture.h"
+// Global handle to bundled libGLES_sw.so — also used by egl.cpp and gles2.cpp via extern
+void* g_gles_handle = nullptr;
+#endif
+
 
 int relaunch_flag = 0;
 char *program_name = nullptr;
@@ -190,6 +199,24 @@ int main(int argc, char *argv[])
     String *pkg_dir_arg = (String *)env->NewStringUTF("com.johnny.loader");
     printf("apk_path %s save_dir %s pkg_dir %s\n", apk_path_arg->str, save_dir_arg->str, pkg_dir_arg->str);
 
+#ifdef MISTER_NATIVE_VIDEO
+    // Build path to bundled libGLES_sw.so relative to the binary (same dir as argv[0])
+    {
+        char argv0_buf[4096];
+        strncpy(argv0_buf, argv[0], sizeof(argv0_buf) - 1);
+        argv0_buf[sizeof(argv0_buf) - 1] = '\0';
+        char *bin_dir = dirname(argv0_buf);
+        char lib_path[4096];
+        snprintf(lib_path, sizeof(lib_path), "%s/libGLES_sw.so", bin_dir);
+        g_gles_handle = dlopen(lib_path, RTLD_LAZY | RTLD_GLOBAL);
+        if (!g_gles_handle) {
+            fatal_error("Cannot load libGLES_sw.so: %s\n", dlerror());
+            return -1;
+        }
+        warning("Loaded bundled GLES library: %s\n", lib_path);
+    }
+#endif
+
     // Initialize SDL with video, audio, joystick, and controller support
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC) != 0) {
         fatal_error("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
@@ -205,7 +232,9 @@ int main(int argc, char *argv[])
     }
 
     SDL_Window *sdl_win;
+#ifndef MISTER_NATIVE_VIDEO
     SDL_GLContext sdl_ctx;
+#endif
 
     SDL_DisplayMode mode = {};
     if (SDL_GetDesktopDisplayMode(0, &mode) != 0) {
@@ -214,13 +243,22 @@ int main(int argc, char *argv[])
         mode.h = 480;
     }
 
-    sdl_win = SDL_CreateWindow("GMLoader", 0, 0, mode.w, mode.h, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_MAXIMIZED);
+#ifdef MISTER_NATIVE_VIDEO
+    // Under MISTER_NATIVE_VIDEO the SDL window is for input/audio only — no OpenGL flag
+    sdl_win = SDL_CreateWindow("GMLoader", 0, 0, mode.w, mode.h,
+                               SDL_WINDOW_RESIZABLE | SDL_WINDOW_MAXIMIZED);
+#else
+    sdl_win = SDL_CreateWindow("GMLoader", 0, 0, mode.w, mode.h,
+                               SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_MAXIMIZED);
+#endif
     if (sdl_win == NULL) {
         fatal_error("Failed to create SDL Window: %s\n", SDL_GetError());
         return -1;
     }
 
-    // Basic OpenGL ES 2.x setup
+#ifndef MISTER_NATIVE_VIDEO
+    // Basic OpenGL ES 2.x setup — skip entirely under MISTER_NATIVE_VIDEO to
+    // avoid SDL warnings about setting GL attributes on a non-GL window
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
@@ -232,6 +270,73 @@ int main(int argc, char *argv[])
     }
 
     SDL_GL_MakeCurrent(sdl_win, sdl_ctx);
+#else
+    // EGL headless pbuffer context via bundled libGLES_sw.so
+    {
+        // Resolve core EGL entry points directly from the bundled library
+        auto pfnGetDisplay   = (EGLDisplay(*)(EGLNativeDisplayType))dlsym(g_gles_handle, "eglGetDisplay");
+        auto pfnInitialize   = (EGLBoolean(*)(EGLDisplay, EGLint*, EGLint*))dlsym(g_gles_handle, "eglInitialize");
+        auto pfnChooseConfig = (EGLBoolean(*)(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*))dlsym(g_gles_handle, "eglChooseConfig");
+        auto pfnCreateCtx    = (EGLContext(*)(EGLDisplay, EGLConfig, EGLContext, const EGLint*))dlsym(g_gles_handle, "eglCreateContext");
+        auto pfnCreatePbuf   = (EGLSurface(*)(EGLDisplay, EGLConfig, const EGLint*))dlsym(g_gles_handle, "eglCreatePbufferSurface");
+        auto pfnMakeCurrent  = (EGLBoolean(*)(EGLDisplay, EGLSurface, EGLSurface, EGLContext))dlsym(g_gles_handle, "eglMakeCurrent");
+        auto pfnBindAPI      = (EGLBoolean(*)(EGLenum))dlsym(g_gles_handle, "eglBindAPI");
+
+        if (!pfnGetDisplay || !pfnInitialize || !pfnChooseConfig ||
+            !pfnCreateCtx  || !pfnCreatePbuf  || !pfnMakeCurrent) {
+            fatal_error("Failed to resolve core EGL symbols from libGLES_sw.so\n");
+            return -1;
+        }
+
+        EGLDisplay egl_dpy = pfnGetDisplay(EGL_NO_DISPLAY);
+        EGLint egl_major, egl_minor;
+        if (!pfnInitialize(egl_dpy, &egl_major, &egl_minor))
+            fatal_error("eglInitialize failed\n");
+        if (pfnBindAPI) pfnBindAPI(EGL_OPENGL_ES_API);
+
+        static const EGLint cfg_attribs[] = {
+            EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_RED_SIZE,   8,  EGL_GREEN_SIZE,  8,
+            EGL_BLUE_SIZE,  8,  EGL_ALPHA_SIZE,  8,
+            EGL_DEPTH_SIZE, 16, EGL_NONE
+        };
+        EGLConfig egl_cfg; EGLint ncfg = 0;
+        pfnChooseConfig(egl_dpy, cfg_attribs, &egl_cfg, 1, &ncfg);
+        if (ncfg == 0) fatal_error("eglChooseConfig: no matching config\n");
+
+        static const EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+        EGLContext egl_ctx = pfnCreateCtx(egl_dpy, egl_cfg, EGL_NO_CONTEXT, ctx_attribs);
+        if (egl_ctx == EGL_NO_CONTEXT) fatal_error("eglCreateContext failed\n");
+
+        static const EGLint pbuf_attribs[] = { EGL_WIDTH, MISTER_WIDTH, EGL_HEIGHT, MISTER_HEIGHT, EGL_NONE };
+        EGLSurface egl_surf = pfnCreatePbuf(egl_dpy, egl_cfg, pbuf_attribs);
+        if (egl_surf == EGL_NO_SURFACE) fatal_error("eglCreatePbufferSurface failed\n");
+
+        if (!pfnMakeCurrent(egl_dpy, egl_surf, egl_surf, egl_ctx))
+            fatal_error("eglMakeCurrent failed\n");
+
+        warning("EGL headless context created: %d.%d, pbuffer %dx%d\n",
+                egl_major, egl_minor, MISTER_WIDTH, MISTER_HEIGHT);
+    }
+
+    if (!NativeVideoWriter_Init()) {
+        warning("NativeVideoWriter: /dev/mem unavailable, using SDL fallback\n");
+    }
+    SDL_Renderer* sdl_renderer = nullptr;
+    SDL_Texture*  sdl_texture  = nullptr;
+    if (!NativeVideoWriter_IsActive()) {
+        sdl_renderer = SDL_CreateRenderer(sdl_win, -1, SDL_RENDERER_SOFTWARE);
+        if (!sdl_renderer)
+            fatal_error("SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        sdl_texture = SDL_CreateTexture(sdl_renderer,
+                                        SDL_PIXELFORMAT_RGBA32,
+                                        SDL_TEXTUREACCESS_STREAMING,
+                                        MISTER_WIDTH, MISTER_HEIGHT);
+        if (!sdl_texture)
+            fatal_error("SDL_CreateTexture failed: %s\n", SDL_GetError());
+    }
+#endif
 
     // The libraries are loaded by SDL2.0, and the API entry points by the following
     // functions using the GLAD generated headers.
@@ -258,6 +363,14 @@ int main(int argc, char *argv[])
     RunnerJNILib::Startup(env, 0, apk_path_arg, save_dir_arg, pkg_dir_arg, 4, 0);
     setup_ended = 1;
 
+#ifdef MISTER_NATIVE_VIDEO
+    {
+        int init_w, init_h;
+        SDL_GetWindowSize(sdl_win, &init_w, &init_h);
+        FrameCapture_Init(init_w, init_h);
+    }
+#endif
+
     while (cont != 0 && cont != 2 && RunnerJNILib_MoveTaskToBackCalled == 0 && relaunch_flag == 0) {
         #ifdef VIDEO_SUPPORT
         video_process();
@@ -265,12 +378,52 @@ int main(int argc, char *argv[])
         if (update_inputs(sdl_win) != 1)
             break;
         SDL_GetWindowSize(sdl_win, &w, &h);
+#ifdef MISTER_NATIVE_VIDEO
+        cont = RunnerJNILib::Process(env, 0, MISTER_WIDTH, MISTER_HEIGHT, 0, 0, 0, 0, 0, 60);
+        if (RunnerJNILib::canFlip(env, 0)) {
+            FrameCapture_ReadFrame();
+
+            // glReadPixels returns bottom-row-first; flip to top-row-first for FPGA/SDL
+            {
+                static uint8_t flip_row[MISTER_WIDTH * 4];
+                uint8_t* buf = const_cast<uint8_t*>(FrameCapture_GetRGBA());
+                for (int top = 0, bot = MISTER_HEIGHT - 1; top < bot; top++, bot--) {
+                    uint8_t* row_top = buf + top * MISTER_WIDTH * 4;
+                    uint8_t* row_bot = buf + bot * MISTER_WIDTH * 4;
+                    memcpy(flip_row, row_top, MISTER_WIDTH * 4);
+                    memcpy(row_top, row_bot, MISTER_WIDTH * 4);
+                    memcpy(row_bot, flip_row, MISTER_WIDTH * 4);
+                }
+            }
+
+            if (NativeVideoWriter_IsActive()) {
+                static uint16_t rgb565_buf[MISTER_WIDTH * MISTER_HEIGHT];
+                FrameCapture_ConvertToRGB565(rgb565_buf);
+                NativeVideoWriter_WriteFrame(rgb565_buf, MISTER_WIDTH, MISTER_HEIGHT,
+                                            MISTER_WIDTH * 2);
+            } else {
+                SDL_UpdateTexture(sdl_texture, NULL,
+                                  FrameCapture_GetRGBA(), MISTER_WIDTH * 4);
+                SDL_RenderClear(sdl_renderer);
+                SDL_RenderCopy(sdl_renderer, sdl_texture, NULL, NULL);
+                SDL_RenderPresent(sdl_renderer);
+            }
+        }
+#else
         cont = RunnerJNILib::Process(env, 0, w, h, 0, 0, 0, 0, 0, 60);
         if (RunnerJNILib::canFlip(env, 0))
             SDL_GL_SwapWindow(sdl_win);
+#endif
     }
 
+#ifdef MISTER_NATIVE_VIDEO
+    NativeVideoWriter_Shutdown();
+    if (sdl_texture)  SDL_DestroyTexture(sdl_texture);
+    if (sdl_renderer) SDL_DestroyRenderer(sdl_renderer);
+#endif
+#ifndef MISTER_NATIVE_VIDEO
     SDL_GL_DeleteContext(sdl_ctx);
+#endif
     SDL_DestroyWindow(sdl_win);
     SDL_Quit();
 
