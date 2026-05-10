@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [ "master" ]
+    tags: ['v*']
     paths-ignore:
       - '**/README.md'
   pull_request:
@@ -12,6 +13,56 @@ on:
       - '**/README.md'
 
 jobs:
+  build-mister-arm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Build ARM binary in container
+        run: |
+          chmod +x .github/scripts/build_mister_arm.sh
+          docker run --rm --platform linux/arm/v7 \
+            -v ${{ github.workspace }}:/src \
+            -w /src \
+            arm32v7/debian:bullseye-slim \
+            bash .github/scripts/build_mister_arm.sh
+
+      - name: Commit binary (master push)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.actor != 'github-actions[bot]'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add games/gmloader/gmloader
+          git diff --staged --quiet || git commit -m "ci: rebuild ARM binary [skip ci]"
+          git push
+
+      - name: Upload release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cd ${{ github.workspace }}
+          cp gmloader.json games/gmloader/gmloader.json
+          printf "# libGLES_sw.so\n\nThis file is NOT included in the repository.\nSee 3rdparty/gles2-sw/ for instructions on obtaining the software GLES2 renderer.\nPlace libGLES_sw.so in the same directory as the gmloader binary.\n" \
+            > games/gmloader/libGLES_SW_README.txt
+          mkdir -p games/gmloader/APKs
+          cd games
+          zip -r ${{ github.workspace }}/gmloader-mister-${{ github.ref_name }}.zip gmloader/
+
+      - name: Upload release zip
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: gmloader-mister-${{ github.ref_name }}
+          path: gmloader-mister-${{ github.ref_name }}.zip
+
   build:
     runs-on: ubuntu-latest
     container:
