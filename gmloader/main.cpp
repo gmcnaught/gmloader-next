@@ -23,6 +23,7 @@
 #include <dlfcn.h>
 #include <libgen.h>
 #include "mister/native_video_writer.h"
+#include "mister/frame_capture.h"
 // Global handle to bundled libGLES_sw.so — also used by egl.cpp and gles2.cpp via extern
 void* g_gles_handle = nullptr;
 #endif
@@ -318,6 +319,23 @@ int main(int argc, char *argv[])
         warning("EGL headless context created: %d.%d, pbuffer %dx%d\n",
                 egl_major, egl_minor, MISTER_WIDTH, MISTER_HEIGHT);
     }
+
+    if (!NativeVideoWriter_Init()) {
+        warning("NativeVideoWriter: /dev/mem unavailable, using SDL fallback\n");
+    }
+    SDL_Renderer* sdl_renderer = nullptr;
+    SDL_Texture*  sdl_texture  = nullptr;
+    if (!NativeVideoWriter_IsActive()) {
+        sdl_renderer = SDL_CreateRenderer(sdl_win, -1, SDL_RENDERER_SOFTWARE);
+        if (!sdl_renderer)
+            fatal_error("SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        sdl_texture = SDL_CreateTexture(sdl_renderer,
+                                        SDL_PIXELFORMAT_RGBA32,
+                                        SDL_TEXTUREACCESS_STREAMING,
+                                        MISTER_WIDTH, MISTER_HEIGHT);
+        if (!sdl_texture)
+            fatal_error("SDL_CreateTexture failed: %s\n", SDL_GetError());
+    }
 #endif
 
     // The libraries are loaded by SDL2.0, and the API entry points by the following
@@ -345,6 +363,14 @@ int main(int argc, char *argv[])
     RunnerJNILib::Startup(env, 0, apk_path_arg, save_dir_arg, pkg_dir_arg, 4, 0);
     setup_ended = 1;
 
+#ifdef MISTER_NATIVE_VIDEO
+    {
+        int init_w, init_h;
+        SDL_GetWindowSize(sdl_win, &init_w, &init_h);
+        FrameCapture_Init(init_w, init_h);
+    }
+#endif
+
     while (cont != 0 && cont != 2 && RunnerJNILib_MoveTaskToBackCalled == 0 && relaunch_flag == 0) {
         #ifdef VIDEO_SUPPORT
         video_process();
@@ -352,13 +378,49 @@ int main(int argc, char *argv[])
         if (update_inputs(sdl_win) != 1)
             break;
         SDL_GetWindowSize(sdl_win, &w, &h);
+#ifdef MISTER_NATIVE_VIDEO
+        cont = RunnerJNILib::Process(env, 0, MISTER_WIDTH, MISTER_HEIGHT, 0, 0, 0, 0, 0, 60);
+        if (RunnerJNILib::canFlip(env, 0)) {
+            FrameCapture_ReadFrame();
+
+            // glReadPixels returns bottom-row-first; flip to top-row-first for FPGA/SDL
+            {
+                static uint8_t flip_row[MISTER_WIDTH * 4];
+                uint8_t* buf = const_cast<uint8_t*>(FrameCapture_GetRGBA());
+                for (int top = 0, bot = MISTER_HEIGHT - 1; top < bot; top++, bot--) {
+                    uint8_t* row_top = buf + top * MISTER_WIDTH * 4;
+                    uint8_t* row_bot = buf + bot * MISTER_WIDTH * 4;
+                    memcpy(flip_row, row_top, MISTER_WIDTH * 4);
+                    memcpy(row_top, row_bot, MISTER_WIDTH * 4);
+                    memcpy(row_bot, flip_row, MISTER_WIDTH * 4);
+                }
+            }
+
+            if (NativeVideoWriter_IsActive()) {
+                static uint16_t rgb565_buf[MISTER_WIDTH * MISTER_HEIGHT];
+                FrameCapture_ConvertToRGB565(rgb565_buf);
+                NativeVideoWriter_WriteFrame(rgb565_buf, MISTER_WIDTH, MISTER_HEIGHT,
+                                            MISTER_WIDTH * 2);
+            } else {
+                SDL_UpdateTexture(sdl_texture, NULL,
+                                  FrameCapture_GetRGBA(), MISTER_WIDTH * 4);
+                SDL_RenderClear(sdl_renderer);
+                SDL_RenderCopy(sdl_renderer, sdl_texture, NULL, NULL);
+                SDL_RenderPresent(sdl_renderer);
+            }
+        }
+#else
         cont = RunnerJNILib::Process(env, 0, w, h, 0, 0, 0, 0, 0, 60);
-#ifndef MISTER_NATIVE_VIDEO
         if (RunnerJNILib::canFlip(env, 0))
             SDL_GL_SwapWindow(sdl_win);
 #endif
     }
 
+#ifdef MISTER_NATIVE_VIDEO
+    NativeVideoWriter_Shutdown();
+    if (sdl_texture)  SDL_DestroyTexture(sdl_texture);
+    if (sdl_renderer) SDL_DestroyRenderer(sdl_renderer);
+#endif
 #ifndef MISTER_NATIVE_VIDEO
     SDL_GL_DeleteContext(sdl_ctx);
 #endif
