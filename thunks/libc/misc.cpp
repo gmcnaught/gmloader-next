@@ -10,6 +10,11 @@
 #include <stdarg.h>
 #include <link.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <sys/file.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <setjmp.h>
 #include "platform.h"
 #include "so_util.h"
 
@@ -73,9 +78,16 @@ extern "C" ABI_ATTR int dlclose_impl(void *handle)
     return 0;
 }
 
+static void gl_missing_stub(void) {}
+
 extern "C" ABI_ATTR void *dlsym_impl(void *handle, const char *name)
 {
-    return (void*)so_resolve_link(NULL, name);
+    void *result = (void*)so_resolve_link(NULL, name);
+    if (!result && name && strncmp(name, "gl", 2) == 0) {
+        warning("dlsym: no thunk for GL func '%s', returning stub\n", name);
+        return (void*)gl_missing_stub;
+    }
+    return result;
 }
 
 extern "C" ABI_ATTR const void *
@@ -226,4 +238,45 @@ ABI_ATTR int scandir_impl(const char *dir,
                                      const struct bionic_dirent **))
 {
     return scandirat_impl(AT_FDCWD, dir, namelist, filter, compar);
+}
+
+// Pseudo-variadic syscall wrappers — ARM32 passes all args in r0-r3/stack
+// regardless of variadic declaration, so fixed-arg versions are safe.
+extern "C" ABI_ATTR int open_impl(const char *path, int flags, mode_t mode)
+{
+    return open(path, flags, mode);
+}
+
+extern "C" ABI_ATTR int ioctl_impl(int fd, unsigned long request, void *arg)
+{
+    return ioctl(fd, request, arg);
+}
+
+extern "C" ABI_ATTR int fcntl_impl(int fd, int cmd, long arg)
+{
+    return fcntl(fd, cmd, arg);
+}
+
+extern "C" ABI_ATTR int flock_impl(int fd, int operation)
+{
+    return flock(fd, operation);
+}
+
+extern "C" ABI_ATTR int execl_impl(const char *path, const char *arg0, ...)
+{
+    WARN_STUB
+    return -1;
+}
+
+extern "C" ABI_ATTR void __assert2_impl(const char *file, int line,
+                                         const char *func, const char *msg)
+{
+    fatal_error("Assertion failed: %s (%s:%d in %s)\n", msg, file, line, func);
+    exit(-1);
+}
+
+extern "C" ABI_ATTR int sigsetjmp_impl(sigjmp_buf env, int savemask)
+{
+    WARN_STUB
+    return 0;
 }

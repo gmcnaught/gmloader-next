@@ -398,14 +398,13 @@ void patch_libyoyo(so_module *mod)
         rehook_new(mod, &REHFunctionAdd, (uintptr_t)Function_Add, (uintptr_t)&Function_Add_Hook);
         rehook_hook(&REHFunctionAdd);
     }
-    
+
 #if defined(__arm__)
     // Add a "game_end" function (useless on 1.4.1788+ until 1.4.1804ish?)
     // From 'https://store.yoyogames.com/downloads/gm-studio/release-notes-studio.html':
-    //   "Changed game_end() to be ignored on Android and iOS, following crash 
+    //   "Changed game_end() to be ignored on Android and iOS, following crash
     //   logs that indicated this was causing memory corruption and crashes in
     //   subsequent runs of your app"
-    
     uint32_t *_Z15Command_EndGamev = (uint32_t *)so_symbol(mod, "_Z15Command_EndGamev");
     // _Z15Command_EndGamev+0x00: bx lr (noop function)
     if (_Z15Command_EndGamev != NULL && *_Z15Command_EndGamev == 0xE12FFF1E) {

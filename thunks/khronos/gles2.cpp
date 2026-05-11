@@ -25,7 +25,9 @@ static bool should_dump_shaders = false;
 // Defined in main.cpp — handle to bundled libGLES_sw.so
 extern void* g_gles_handle;
 static void* mister_gles2_resolver(const char* name) {
-    return g_gles_handle ? dlsym(g_gles_handle, name) : nullptr;
+    void* sym = g_gles_handle ? dlsym(g_gles_handle, name) : nullptr;
+    // Fall back to any globally loaded library (handles GLVND split-lib case)
+    return sym ? sym : dlsym(RTLD_DEFAULT, name);
 }
 #define PTR_RESOLVE(x) resolve_thunked<&glad_##x>(#x, symtable_gles2_index, symtable_gles2, mister_gles2_resolver)
 #else
@@ -825,4 +827,32 @@ void load_gles2_funcs()
 	glad_glStartTilingQCOM = (PFNGLSTARTTILINGQCOMPROC)PTR_RESOLVE(glStartTilingQCOM);
 	glad_glEndTilingQCOM = (PFNGLENDTILINGQCOMPROC)PTR_RESOLVE(glEndTilingQCOM);
 	glad_glGetString = (PFNGLGETSTRINGPROC)PTR_RESOLVE(glGetString);
+
+	// OES aliases: GL_OES_framebuffer_object functions became core in GLES2.
+	// Games that use eglGetProcAddress with OES suffix (e.g. GameMaker Android runner)
+	// need these in the symtable to avoid NULL function pointer crashes.
+#define OES_ALIAS(oes_name, glad_ptr) \
+	if (glad_ptr && symtable_gles2_index < 2047) { \
+		symtable_gles2[symtable_gles2_index].symbol = oes_name; \
+		symtable_gles2[symtable_gles2_index].func   = (uintptr_t)(glad_ptr); \
+		symtable_gles2_index++; \
+	}
+	OES_ALIAS("glGenFramebuffersOES",                    glad_glGenFramebuffers)
+	OES_ALIAS("glBindFramebufferOES",                    glad_glBindFramebuffer)
+	OES_ALIAS("glFramebufferTexture2DOES",               glad_glFramebufferTexture2D)
+	OES_ALIAS("glDeleteFramebuffersOES",                 glad_glDeleteFramebuffers)
+	OES_ALIAS("glCheckFramebufferStatusOES",             glad_glCheckFramebufferStatus)
+	OES_ALIAS("glGenRenderbuffersOES",                   glad_glGenRenderbuffers)
+	OES_ALIAS("glBindRenderbufferOES",                   glad_glBindRenderbuffer)
+	OES_ALIAS("glRenderbufferStorageOES",                glad_glRenderbufferStorage)
+	OES_ALIAS("glDeleteRenderbuffersOES",                glad_glDeleteRenderbuffers)
+	OES_ALIAS("glFramebufferRenderbufferOES",            glad_glFramebufferRenderbuffer)
+	OES_ALIAS("glGetFramebufferAttachmentParameterivOES",glad_glGetFramebufferAttachmentParameteriv)
+	OES_ALIAS("glIsRenderbufferOES",                     glad_glIsRenderbuffer)
+	OES_ALIAS("glIsFramebufferOES",                      glad_glIsFramebuffer)
+#undef OES_ALIAS
+
+	// Terminate the symbol table
+	symtable_gles2[symtable_gles2_index].symbol = NULL;
+	symtable_gles2[symtable_gles2_index].func   = (uintptr_t)NULL;
 }

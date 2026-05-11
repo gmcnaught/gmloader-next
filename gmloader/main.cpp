@@ -80,8 +80,31 @@ static fs::path get_absolute_path(const char* path, fs::path work_dir){
     return fs_path;
 }
 
+static void segfault_handler(int sig, siginfo_t *info, void *ctx)
+{
+    ucontext_t *uc = (ucontext_t *)ctx;
+    uintptr_t fault_addr = (uintptr_t)info->si_addr;
+#if defined(__arm__)
+    uintptr_t pc = uc->uc_mcontext.arm_pc;
+    uintptr_t lr = uc->uc_mcontext.arm_lr;
+    uintptr_t r3 = uc->uc_mcontext.arm_r3;
+    uintptr_t r4 = uc->uc_mcontext.arm_r4;
+    fprintf(stderr, "SIGSEGV: fault_addr=%p PC=%p LR=%p R3=%p R4=%p\n",
+            (void*)fault_addr, (void*)pc, (void*)lr, (void*)r3, (void*)r4);
+#else
+    fprintf(stderr, "SIGSEGV: fault_addr=%p\n", (void*)fault_addr);
+#endif
+    signal(SIGSEGV, SIG_DFL);
+    raise(SIGSEGV);
+}
+
 int main(int argc, char *argv[])
 {
+    struct sigaction sa = {};
+    sa.sa_sigaction = segfault_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+
     // Store the program name from argv[0]
     if (argc > 0 && argv[0]) {
         program_name = argv[0];
@@ -178,8 +201,10 @@ int main(int argc, char *argv[])
         fatal_error("Could not load libyoyo.so!\n");
         return -1;
     }
+    warning("DBG: so_load_module done\n");
 
     patch_libyoyo(libyoyo);
+    warning("DBG: patch_libyoyo done\n");
     if(gmloader_config.disable_depth == 1) {
         disable_depth();
     }
@@ -193,21 +218,58 @@ int main(int argc, char *argv[])
     patch_steam(libyoyo);
     patch_texture(libyoyo);
     patch_lua(libyoyo);
+    warning("DBG: all patches done\n");
 
+    warning("DBG: before NewStringUTF apk_path\n");
     String *apk_path_arg = (String *)env->NewStringUTF(apk_path.c_str());
+    warning("DBG: before NewStringUTF save_dir\n");
     String *save_dir_arg = (String *)env->NewStringUTF(save_dir.c_str());
+    warning("DBG: before NewStringUTF pkg_dir\n");
     String *pkg_dir_arg = (String *)env->NewStringUTF("com.johnny.loader");
+    warning("DBG: after NewStringUTF calls\n");
     printf("apk_path %s save_dir %s pkg_dir %s\n", apk_path_arg->str, save_dir_arg->str, pkg_dir_arg->str);
 
 #ifdef MISTER_NATIVE_VIDEO
     // Build path to bundled libGLES_sw.so relative to the binary (same dir as argv[0])
     {
+        warning("DBG: entering MISTER_NATIVE_VIDEO block\n");
         char argv0_buf[4096];
         strncpy(argv0_buf, argv[0], sizeof(argv0_buf) - 1);
         argv0_buf[sizeof(argv0_buf) - 1] = '\0';
         char *bin_dir = dirname(argv0_buf);
         char lib_path[4096];
+        char mesa_dir[4096];
+        snprintf(mesa_dir, sizeof(mesa_dir), "%s/mesa", bin_dir);
+
+        // Standalone Mesa 21.3 (no GLVND, no X11/Wayland/GBM, softpipe/no-LLVM).
+        // EGL_PLATFORM=surfaceless: use the Mesa surfaceless headless backend.
+        // LIBGL_DRIVERS_PATH: DRI loader finds swrast_dri.so here.
+        setenv("EGL_PLATFORM", "surfaceless", 0);
+        setenv("LIBGL_DRIVERS_PATH", mesa_dir, 0);
+        setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
+        warning("DBG: set EGL_PLATFORM=surfaceless, LIBGL_DRIVERS_PATH=%s\n", mesa_dir);
+
+        // Pre-load Mesa runtime libs from mesa/ subdir so the dynamic linker finds
+        // them before attempting system paths (MiSTer has no system Mesa).
+        static const char* const preload_libs[] = {
+            "libdrm.so.2", "libglapi.so.0", "libEGL.so.1", NULL
+        };
+        for (int i = 0; preload_libs[i]; i++) {
+            // Try mesa/ subdir first
+            snprintf(lib_path, sizeof(lib_path), "%s/%s", mesa_dir, preload_libs[i]);
+            void *h = dlopen(lib_path, RTLD_LAZY | RTLD_GLOBAL);
+            if (h) {
+                warning("DBG: preloaded mesa/%s ok\n", preload_libs[i]);
+            } else {
+                warning("DBG: mesa/%s fail: %s\n", preload_libs[i], dlerror());
+                // Fall back to bin_dir
+                snprintf(lib_path, sizeof(lib_path), "%s/%s", bin_dir, preload_libs[i]);
+                h = dlopen(lib_path, RTLD_LAZY | RTLD_GLOBAL);
+                warning("DBG: bin_dir/%s %s\n", preload_libs[i], h ? "ok" : "fail");
+            }
+        }
         snprintf(lib_path, sizeof(lib_path), "%s/libGLES_sw.so", bin_dir);
+        warning("DBG: dlopen libGLES_sw.so at %s\n", lib_path);
         g_gles_handle = dlopen(lib_path, RTLD_LAZY | RTLD_GLOBAL);
         if (!g_gles_handle) {
             fatal_error("Cannot load libGLES_sw.so: %s\n", dlerror());
@@ -215,6 +277,15 @@ int main(int argc, char *argv[])
         }
         warning("Loaded bundled GLES library: %s\n", lib_path);
     }
+#endif
+
+    // In MISTER_NATIVE_VIDEO mode the real display is the DDR framebuffer; use SDL's
+    // dummy video driver so SDL_Init doesn't fail looking for a display device.
+    // Audio and joystick still go through real drivers.
+#ifdef MISTER_NATIVE_VIDEO
+    setenv("SDL_VIDEODRIVER", "dummy", 0);
+    setenv("SDL_AUDIODRIVER", "dummy", 0);
+    warning("DBG: SDL_VIDEODRIVER=dummy for MISTER_NATIVE_VIDEO\n");
 #endif
 
     // Initialize SDL with video, audio, joystick, and controller support
@@ -273,14 +344,19 @@ int main(int argc, char *argv[])
 #else
     // EGL headless pbuffer context via bundled libGLES_sw.so
     {
-        // Resolve core EGL entry points directly from the bundled library
-        auto pfnGetDisplay   = (EGLDisplay(*)(EGLNativeDisplayType))dlsym(g_gles_handle, "eglGetDisplay");
-        auto pfnInitialize   = (EGLBoolean(*)(EGLDisplay, EGLint*, EGLint*))dlsym(g_gles_handle, "eglInitialize");
-        auto pfnChooseConfig = (EGLBoolean(*)(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*))dlsym(g_gles_handle, "eglChooseConfig");
-        auto pfnCreateCtx    = (EGLContext(*)(EGLDisplay, EGLConfig, EGLContext, const EGLint*))dlsym(g_gles_handle, "eglCreateContext");
-        auto pfnCreatePbuf   = (EGLSurface(*)(EGLDisplay, EGLConfig, const EGLint*))dlsym(g_gles_handle, "eglCreatePbufferSurface");
-        auto pfnMakeCurrent  = (EGLBoolean(*)(EGLDisplay, EGLSurface, EGLSurface, EGLContext))dlsym(g_gles_handle, "eglMakeCurrent");
-        auto pfnBindAPI      = (EGLBoolean(*)(EGLenum))dlsym(g_gles_handle, "eglBindAPI");
+        // Resolve core EGL entry points. libGLES_sw.so is a GLES2 dispatch wrapper
+        // and does not export EGL symbols; those live in the preloaded libEGL.so.1
+        // (loaded with RTLD_GLOBAL above).  Use RTLD_DEFAULT to search the global
+        // symbol namespace rather than a specific handle.
+        auto pfnGetDisplay   = (EGLDisplay(*)(EGLNativeDisplayType))dlsym(RTLD_DEFAULT, "eglGetDisplay");
+        auto pfnInitialize   = (EGLBoolean(*)(EGLDisplay, EGLint*, EGLint*))dlsym(RTLD_DEFAULT, "eglInitialize");
+        auto pfnChooseConfig = (EGLBoolean(*)(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*))dlsym(RTLD_DEFAULT, "eglChooseConfig");
+        auto pfnCreateCtx    = (EGLContext(*)(EGLDisplay, EGLConfig, EGLContext, const EGLint*))dlsym(RTLD_DEFAULT, "eglCreateContext");
+        auto pfnCreatePbuf   = (EGLSurface(*)(EGLDisplay, EGLConfig, const EGLint*))dlsym(RTLD_DEFAULT, "eglCreatePbufferSurface");
+        auto pfnMakeCurrent  = (EGLBoolean(*)(EGLDisplay, EGLSurface, EGLSurface, EGLContext))dlsym(RTLD_DEFAULT, "eglMakeCurrent");
+        auto pfnBindAPI      = (EGLBoolean(*)(EGLenum))dlsym(RTLD_DEFAULT, "eglBindAPI");
+        warning("DBG: EGL syms: GetDisplay=%p Init=%p Choose=%p\n",
+                (void*)pfnGetDisplay, (void*)pfnInitialize, (void*)pfnChooseConfig);
 
         if (!pfnGetDisplay || !pfnInitialize || !pfnChooseConfig ||
             !pfnCreateCtx  || !pfnCreatePbuf  || !pfnMakeCurrent) {
@@ -288,8 +364,38 @@ int main(int argc, char *argv[])
             return -1;
         }
 
-        EGLDisplay egl_dpy = pfnGetDisplay(EGL_NO_DISPLAY);
-        EGLint egl_major, egl_minor;
+        // This Mesa has EGL_EXT_platform_device but not surfaceless.
+        // Extension function pointers must be fetched via eglGetProcAddress (not dlsym).
+        // Use eglQueryDevicesEXT + eglGetPlatformDisplayEXT(DEVICE_EXT) for headless.
+#ifndef EGL_PLATFORM_DEVICE_EXT
+#define EGL_PLATFORM_DEVICE_EXT 0x313F
+#endif
+        auto pfnGetProcAddr = (void*(*)(const char*))dlsym(RTLD_DEFAULT, "eglGetProcAddress");
+        auto pfnQueryDevicesEXT       = pfnGetProcAddr ?
+            (EGLBoolean(*)(EGLint, void**, EGLint*))pfnGetProcAddr("eglQueryDevicesEXT") : nullptr;
+        auto pfnGetPlatformDisplayEXT = pfnGetProcAddr ?
+            (EGLDisplay(*)(EGLenum, void*, const EGLint*))pfnGetProcAddr("eglGetPlatformDisplayEXT") : nullptr;
+        warning("DBG: eglGetProcAddress=%p QueryDevices=%p GetPlatformDisplay=%p\n",
+                (void*)pfnGetProcAddr, (void*)pfnQueryDevicesEXT, (void*)pfnGetPlatformDisplayEXT);
+
+        EGLDisplay egl_dpy = EGL_NO_DISPLAY;
+        if (pfnQueryDevicesEXT && pfnGetPlatformDisplayEXT) {
+            void* egl_devices[4] = {};
+            EGLint num_devices = 0;
+            if (pfnQueryDevicesEXT(4, egl_devices, &num_devices) && num_devices > 0) {
+                warning("DBG: EGL_PLATFORM_DEVICE: %d device(s)\n", num_devices);
+                egl_dpy = pfnGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, egl_devices[0], NULL);
+                warning("DBG: eglGetPlatformDisplayEXT(DEVICE_0) = %p\n", (void*)egl_dpy);
+            } else {
+                warning("DBG: eglQueryDevicesEXT returned %d devices\n", num_devices);
+            }
+        }
+        if (egl_dpy == EGL_NO_DISPLAY) {
+            warning("DBG: falling back to eglGetDisplay(DEFAULT)\n");
+            egl_dpy = pfnGetDisplay(EGL_DEFAULT_DISPLAY);
+        }
+
+        EGLint egl_major = 0, egl_minor = 0;
         if (!pfnInitialize(egl_dpy, &egl_major, &egl_minor))
             fatal_error("eglInitialize failed\n");
         if (pfnBindAPI) pfnBindAPI(EGL_OPENGL_ES_API);
