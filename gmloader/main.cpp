@@ -25,6 +25,7 @@
 #include "mister/native_video_writer.h"
 #include "mister/frame_capture.h"
 #include "mister/draw_trace.h"
+#include "mister/blitter.h"
 // Global handle to bundled libGLES_sw.so — also used by egl.cpp and gles2.cpp via extern
 void* g_gles_handle = nullptr;
 #endif
@@ -510,6 +511,7 @@ int main(int argc, char *argv[])
         FrameCapture_Init(init_w, init_h);
     }
     DrawTrace_Init();
+    Blitter_Init();
 #endif
 
     while (cont != 0 && cont != 2 && RunnerJNILib_MoveTaskToBackCalled == 0 && relaunch_flag == 0) {
@@ -524,6 +526,14 @@ int main(int argc, char *argv[])
         cont = RunnerJNILib::Process(env, 0, MISTER_WIDTH, MISTER_HEIGHT, 0, 0, 0, 0, 0, 60);
         uint64_t _dt_p1 = DrawTrace_NowNs();
         if (RunnerJNILib::canFlip(env, 0)) {
+          const uint8_t* _blit = Blitter_PresentDefault();
+          if (_blit && NativeVideoWriter_IsActive()) {
+            // Blitter owns the frame: convert (with row flip) straight to DDR,
+            // skipping glReadPixels entirely.
+            static uint16_t rgb565_blit[MISTER_WIDTH * MISTER_HEIGHT];
+            Blitter_ToRGB565(_blit, rgb565_blit);
+            NativeVideoWriter_WriteFrame(rgb565_blit, MISTER_WIDTH, MISTER_HEIGHT, MISTER_WIDTH * 2);
+          } else {
             FrameCapture_ReadFrame();
 
             // glReadPixels returns bottom-row-first; flip to top-row-first for FPGA/SDL
@@ -551,8 +561,27 @@ int main(int argc, char *argv[])
                 SDL_RenderCopy(sdl_renderer, sdl_texture, NULL, NULL);
                 SDL_RenderPresent(sdl_renderer);
             }
+          }
         }
         DrawTrace_FrameEnd(_dt_p1 - _dt_p0, DrawTrace_NowNs() - _dt_p1);
+        // Frame-rate cap: the blitter can run the game far above 60Hz, which
+        // races the game's logic/intro and triggers relaunch loops. Pace the
+        // loop (and therefore the runner's game logic) to ~60fps. Override with
+        // GMLOADER_FPS; 0 disables the cap.
+        {
+            static Uint32 frame_ms = 0xFFFFFFFF, next_ms = 0;
+            if (frame_ms == 0xFFFFFFFF) {
+                const char *fe = getenv("GMLOADER_FPS");
+                int fps = fe ? atoi(fe) : 60;
+                frame_ms = (fps > 0) ? (Uint32)(1000 / fps) : 0;
+            }
+            if (frame_ms) {
+                Uint32 now = SDL_GetTicks();
+                if (next_ms == 0 || now > next_ms + frame_ms) next_ms = now;
+                next_ms += frame_ms;
+                if (now < next_ms) SDL_Delay(next_ms - now);
+            }
+        }
 #else
         cont = RunnerJNILib::Process(env, 0, w, h, 0, 0, 0, 0, 0, 60);
         if (RunnerJNILib::canFlip(env, 0))

@@ -11,6 +11,7 @@
 #ifdef MISTER_NATIVE_VIDEO
 
 #include "blitter.h"
+#include "blitter_raster.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,13 +20,33 @@
 #include <map>
 #include <string>
 #include <array>
+#include <vector>
+
+#ifndef MISTER_WIDTH
+#define MISTER_WIDTH  320
+#endif
+#ifndef MISTER_HEIGHT
+#define MISTER_HEIGHT 240
+#endif
 
 // ---- master gate ------------------------------------------------------------
-static int g_enabled = 0;
+// GMLOADER_BLITTER level: 0 off; 1 = shadow + decode-log + GL fallback (safe,
+// validated); 2 = blitter OWNS rendering (rasterize into our surfaces, skip GL
+// scene draws/clears, present our framebuffer).
+static int      g_level   = 0;
+static int      g_own     = 0;   // level >= 2
+static int      g_enabled = 0;   // level >= 1
+static uint8_t *g_defSurf = nullptr;   // default framebuffer, RGBA8888, GL bottom-up
+
 void Blitter_Init(void) {
     const char *e = getenv("GMLOADER_BLITTER");
-    g_enabled = (e && *e) ? 1 : 0;
-    if (g_enabled) fprintf(stderr, "BLITTER decode-log enabled (no rasterize yet)\n");
+    g_level   = e ? atoi(e) : 0;
+    g_enabled = g_level >= 1;
+    g_own     = g_level >= 2;
+    if (g_enabled) {
+        g_defSurf = (uint8_t *)calloc((size_t)MISTER_WIDTH * MISTER_HEIGHT, 4);
+        fprintf(stderr, "BLITTER enabled (level %d, own=%d)\n", g_level, g_own);
+    }
 }
 int Blitter_Enabled(void) { return g_enabled; }
 
@@ -172,6 +193,44 @@ void read_attrib(const Attrib &a, int i, float *out) {
     }
 }
 
+// Map current GL blend state to an RBlend; false if unsupported.
+bool get_rblend(RBlend *out) {
+    if (!g_blendEnabled) { *out = RB_NONE; return true; }
+    if (g_blendSrc == GL_SRC_ALPHA && g_blendDst == GL_ONE_MINUS_SRC_ALPHA) { *out = RB_ALPHA; return true; }
+    if (g_blendSrc == GL_ONE && g_blendDst == GL_ONE_MINUS_SRC_ALPHA)       { *out = RB_PREMULT; return true; }
+    if ((g_blendSrc == GL_ONE && g_blendDst == GL_ONE) ||
+        (g_blendSrc == GL_SRC_ALPHA && g_blendDst == GL_ONE))               { *out = RB_ADD; return true; }
+    return false;
+}
+
+// Current render target as an RSurface. The default fb maps to g_defSurf; an FBO
+// maps to its color attachment texture's CPU buffer (allocated on first use, so
+// it works as both a render target and a sampleable texture). False if unknown.
+bool get_render_target(RSurface *out) {
+    if (g_curFBO == 0) {
+        out->rgba = g_defSurf; out->w = MISTER_WIDTH; out->h = MISTER_HEIGHT;
+        return out->rgba != nullptr;
+    }
+    auto fit = g_fboColorTex.find(g_curFBO);
+    if (fit == g_fboColorTex.end()) return false;
+    Tex &t = g_textures[fit->second];
+    if (t.w <= 0 || t.h <= 0) return false;
+    if (!t.rgba) { t.rgba = (uint8_t *)calloc((size_t)t.w * t.h, 4); t.valid = t.rgba ? 1 : 0; }
+    out->rgba = t.rgba; out->w = t.w; out->h = t.h;
+    return out->rgba != nullptr;
+}
+
+// Bound texture as an RTexture for sampling (valid=0 if no CPU pixels yet).
+void get_rtexture(RTexture *out) {
+    auto it = g_textures.find(g_boundTex2D);
+    if (it != g_textures.end() && it->second.rgba) {
+        out->rgba = it->second.rgba; out->w = it->second.w; out->h = it->second.h;
+        out->nearest = 1; out->valid = 1;
+    } else {
+        out->rgba = nullptr; out->w = 0; out->h = 0; out->nearest = 1; out->valid = 0;
+    }
+}
+
 } // namespace
 
 // ---- state-shadow hooks -----------------------------------------------------
@@ -262,11 +321,19 @@ void Blitter_OnViewport(int x, int y, int w, int h) {
     g_vpX = x; g_vpY = y; g_vpW = w; g_vpH = h;
 }
 void Blitter_OnScissor(int, int, int, int, int) {}
-void Blitter_OnClear(GLbitfield) {}
+int Blitter_OnClear(GLbitfield) {
+    if (!g_own) return 0;
+    RSurface rt;
+    if (get_render_target(&rt))
+        memset(rt.rgba, 0, (size_t)rt.w * rt.h * 4);   // clear to transparent black
+    return 1;   // cleared ourselves — caller skips the (slow) GL clear
+}
 
-// ---- draw decode (logs, then falls back to GL) ------------------------------
-static int decode_and_log(const char *kind, GLenum mode, int count,
-                          const uint8_t *indices, GLenum idx_type) {
+// ---- draw decode + rasterize ------------------------------------------------
+static std::vector<BVtx> s_verts;
+
+static int handle_draw(const char *kind, GLenum mode, int count,
+                       const uint8_t *indices, GLenum idx_type) {
     g_drawNo++;
     if (!g_enabled) return 0;
 
@@ -277,22 +344,10 @@ static int decode_and_log(const char *kind, GLenum mode, int count,
                 g_nUniMat, g_buffers.size(), g_matByLoc.size());
     }
 
-    // Resolve render target surface size.
-    int rt_w = g_vpW, rt_h = g_vpH; GLuint rt_tex = 0;
-    if (g_curFBO != 0) {
-        rt_tex = g_fboColorTex.count(g_curFBO) ? g_fboColorTex[g_curFBO] : 0;
-        if (rt_tex && g_textures.count(rt_tex)) { rt_w = g_textures[rt_tex].w; rt_h = g_textures[rt_tex].h; }
-    }
-
-    // Bound texture info.
-    Tex *bt = g_textures.count(g_boundTex2D) ? &g_textures[g_boundTex2D] : nullptr;
-
-    // Decode geometry: transform each vertex to screen space, track bbox + uv range.
     int pidx = attr_index("in_Position");
     int tidx = attr_index("in_TextureCoord");
     int cidx = attr_index("in_Colour");
-    // Fallback heuristic if names weren't bound: first 3f attrib=pos, 2f=uv, 4ub=colour.
-    if (pidx < 0 || tidx < 0) {
+    if (pidx < 0 || tidx < 0) {   // fallback: infer by component layout
         for (int i = 0; i < 16; i++) {
             if (!g_attribs[i].enabled) continue;
             if (pidx < 0 && g_attribs[i].size == 3 && g_attribs[i].type == GL_FLOAT) pidx = i;
@@ -301,61 +356,66 @@ static int decode_and_log(const char *kind, GLenum mode, int count,
         }
     }
 
-    // Diagnostics: position attrib source — VBO id, or 0 = client array (ptr).
-    GLuint    vb   = (pidx >= 0) ? g_attribs[pidx].buffer : 0;
-    uintptr_t vptr = (pidx >= 0) ? g_attribs[pidx].offset : 0;
     const float *mvp = get_mvp();
 
-    float minx=1e9f, miny=1e9f, maxx=-1e9f, maxy=-1e9f, minw=1e9f, maxw=-1e9f;
-    float u0=1e9f, u1=-1e9f, v0=1e9f, v1=-1e9f;
+    // Decode each vertex to a screen-space BVtx (GL bottom-up pixel coords).
+    s_verts.clear();
+    float minx=1e9f, miny=1e9f, maxx=-1e9f, maxy=-1e9f;
     int decoded = 0;
     if (pidx >= 0 && mvp && g_attribs[pidx].enabled) {
         for (int k = 0; k < count; k++) {
-            int vi = k;
-            if (indices) {
-                vi = (idx_type == GL_UNSIGNED_SHORT) ? ((const uint16_t *)indices)[k]
-                                                     : ((const uint8_t *)indices)[k];
-            }
-            float pos[4]; read_attrib(g_attribs[pidx], vi, pos); pos[3]=1.0f;
+            int vi = indices ? (idx_type == GL_UNSIGNED_SHORT ? ((const uint16_t*)indices)[k]
+                                                              : ((const uint8_t*)indices)[k])
+                             : k;
+            float pos[4]; read_attrib(g_attribs[pidx], vi, pos); pos[3] = 1.0f;
             float clip[4]; mat4_mul_vec4(mvp, pos, clip);
             float w = clip[3] != 0 ? clip[3] : 1.0f;
             float ndcx = clip[0]/w, ndcy = clip[1]/w;
-            float sx = g_vpX + (ndcx*0.5f+0.5f)*g_vpW;
-            float sy = g_vpY + (ndcy*0.5f+0.5f)*g_vpH;
-            if (sx<minx)minx=sx; if (sx>maxx)maxx=sx;
-            if (sy<miny)miny=sy; if (sy>maxy)maxy=sy;
-            if (w<minw)minw=w; if (w>maxw)maxw=w;
-            if (tidx >= 0) {
-                float uv[4]; read_attrib(g_attribs[tidx], vi, uv);
-                if(uv[0]<u0)u0=uv[0]; if(uv[0]>u1)u1=uv[0];
-                if(uv[1]<v0)v0=uv[1]; if(uv[1]>v1)v1=uv[1];
-            }
+            BVtx bv;
+            bv.x = g_vpX + (ndcx*0.5f + 0.5f) * g_vpW;
+            bv.y = g_vpY + (ndcy*0.5f + 0.5f) * g_vpH;     // GL bottom-up
+            bv.u = bv.v = 0.0f;
+            bv.r = bv.g = bv.b = bv.a = 1.0f;
+            if (tidx >= 0) { float uv[4]; read_attrib(g_attribs[tidx], vi, uv); bv.u = uv[0]; bv.v = uv[1]; }
+            if (cidx >= 0) { float c[4];  read_attrib(g_attribs[cidx], vi, c);  bv.r=c[0]; bv.g=c[1]; bv.b=c[2]; bv.a=c[3]; }
+            s_verts.push_back(bv);
+            if (bv.x<minx)minx=bv.x; if (bv.x>maxx)maxx=bv.x;
+            if (bv.y<miny)miny=bv.y; if (bv.y>maxy)maxy=bv.y;
             decoded++;
         }
     }
 
-    if (g_drawNo <= LOG_FIRST) {
-        fprintf(stderr,
-            "BLIT draw#%llu %s mode=%d count=%d | rt=%s(%dx%d) tex=%u(%dx%d val=%d) "
-            "blend=%s prog=%u attr[p=%d t=%d c=%d] mvp=%d vb=%u clientptr=%d | "
-            "screen=[%.0f,%.0f..%.0f,%.0f] uv=[%.2f,%.2f..%.2f,%.2f] decoded=%d/%d\n",
-            (unsigned long long)g_drawNo, kind, mode, count,
-            g_curFBO ? "FBO" : "DEFAULT", rt_w, rt_h,
-            g_boundTex2D, bt?bt->w:0, bt?bt->h:0, bt?bt->valid:0,
-            blend_name(), g_curProgram, pidx, tidx, cidx,
-            mvp ? 1 : 0, vb, (vb == 0 && vptr != 0) ? 1 : 0,
-            decoded?minx:0, decoded?miny:0, decoded?maxx:0, decoded?maxy:0,
-            decoded?u0:0, decoded?v0:0, decoded?u1:0, decoded?v1:0, decoded, count);
+    // Rasterize into our surfaces (owning mode only).
+    int rast = 0;
+    if (g_own && decoded == count && mode == GL_TRIANGLES && count >= 3) {
+        RSurface rt; RBlend blend;
+        if (get_render_target(&rt) && get_rblend(&blend)) {
+            RTexture tex; get_rtexture(&tex);
+            if (tex.valid) {
+                for (int t = 0; t + 2 < count; t += 3)
+                    Blitter_RasterTri(&rt, &s_verts[t], &tex, blend, 0.0f);
+                rast = 1;
+            }
+        }
     }
-    return 0;   // step 1: never handle — always fall back to GL
+
+    if (g_drawNo <= LOG_FIRST) {
+        Tex *bt = g_textures.count(g_boundTex2D) ? &g_textures[g_boundTex2D] : nullptr;
+        fprintf(stderr, "BLIT draw#%llu %s rt=%s tex=%u(%dx%d val=%d) blend=%s "
+                "decoded=%d/%d rast=%d screen=[%.0f,%.0f..%.0f,%.0f]\n",
+                (unsigned long long)g_drawNo, kind, g_curFBO ? "FBO" : "DEF",
+                g_boundTex2D, bt?bt->w:0, bt?bt->h:0, bt?bt->valid:0, blend_name(),
+                decoded, count, rast, decoded?minx:0, decoded?miny:0, decoded?maxx:0, decoded?maxy:0);
+    }
+
+    return g_own ? 1 : 0;   // owning mode: blitter owns the draw, skip GL
 }
 
 int Blitter_TryDrawArrays(GLenum mode, GLint first, GLsizei count) {
     (void)first;
-    return decode_and_log("arrays", mode, count, nullptr, 0);
+    return handle_draw("arrays", mode, count, nullptr, 0);
 }
 int Blitter_TryDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
-    // indices is a byte offset into the bound element buffer (VBO path).
     const uint8_t *ip = nullptr;
     if (g_buffers.count(g_elemBuffer)) {
         Buf &eb = g_buffers[g_elemBuffer];
@@ -363,9 +423,21 @@ int Blitter_TryDrawElements(GLenum mode, GLsizei count, GLenum type, const void 
     } else {
         ip = (const uint8_t *)indices;   // client-side indices
     }
-    return decode_and_log("elements", mode, count, ip, type);
+    return handle_draw("elements", mode, count, ip, type);
 }
 
-const uint8_t *Blitter_PresentDefault(void) { return nullptr; }  // step 2
+const uint8_t *Blitter_PresentDefault(void) { return g_own ? g_defSurf : nullptr; }
+
+void Blitter_ToRGB565(const uint8_t *src_rgba, uint16_t *dst) {
+    // src is GL bottom-up; the DDR framebuffer wants top-down -> flip rows.
+    for (int y = 0; y < MISTER_HEIGHT; y++) {
+        const uint8_t *s = src_rgba + (size_t)(MISTER_HEIGHT - 1 - y) * MISTER_WIDTH * 4;
+        uint16_t *d = dst + (size_t)y * MISTER_WIDTH;
+        for (int x = 0; x < MISTER_WIDTH; x++) {
+            uint8_t r = s[x*4+0], g = s[x*4+1], b = s[x*4+2];
+            d[x] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+        }
+    }
+}
 
 #endif // MISTER_NATIVE_VIDEO

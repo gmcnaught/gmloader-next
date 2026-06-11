@@ -51,6 +51,7 @@ static void GLDrawElements_trace(GLenum mode, GLsizei count, GLenum type, const 
     DrawTrace_RecordDraw(DrawTrace_NowNs() - t0, count, mode == GL_TRIANGLES);
 }
 static void GLClear_trace(GLbitfield mask) {
+    if (Blitter_Enabled() && Blitter_OnClear(mask)) return;  // blitter cleared it; skip GL
     if (!DrawTrace_Enabled()) { glad_glClear(mask); return; }
     uint64_t t0 = DrawTrace_NowNs();
     glad_glClear(mask);

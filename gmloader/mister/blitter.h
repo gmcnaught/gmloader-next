@@ -90,10 +90,14 @@ int Blitter_TryDrawElements(GLenum mode, GLsizei count, GLenum type, const void 
 
 // ---- Frame boundary ---------------------------------------------------------
 // Called when the default framebuffer is ready to present (canFlip). Returns the
-// RGBA8888 320x240 result for the existing RGBA->565->DDR path, or NULL if the
-// blitter did not produce this frame (GL fallback owns it).
+// RGBA8888 320x240 result (GL bottom-up) when the blitter owns rendering, or NULL
+// (GL path produces the frame).
 const uint8_t *Blitter_PresentDefault(void);
-void Blitter_OnClear(GLbitfield mask);
+// Convert a bottom-up RGBA8888 320x240 buffer to top-down RGB565 for the DDR writer.
+void Blitter_ToRGB565(const uint8_t *src_rgba, uint16_t *dst);
+// Clear the current render-target surface; returns 1 if it owned the clear (caller
+// then skips the real glClear), 0 otherwise.
+int  Blitter_OnClear(GLbitfield mask);
 
 #ifdef __cplusplus
 }
