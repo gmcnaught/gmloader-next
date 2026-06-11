@@ -1,0 +1,74 @@
+//
+//  MiSTer 2D software blitter — P2 step 2: the software triangle rasterizer.
+//  See BLITTER_DESIGN.md. This is the inner compositor: it takes already-decoded
+//  screen-space textured triangles and composites them into a CPU RGBA8888
+//  surface. It is deliberately GL/SDL-INDEPENDENT and host-buildable so it can be
+//  unit-tested with plain g++/clang++ on the dev machine.
+//
+//  The blitter.cpp decode step (which IS GL-dependent) adapts its SoftSurface /
+//  ShadowTexture / BlendMode to the GL-free RSurface / RTexture / RBlend below
+//  and calls Blitter_RasterTri per triangle.
+//
+//  Scalar + correct first; NEON inner loop is a later phase.
+//
+#pragma once
+
+#include <stdint.h>
+
+// ---- Render target ----------------------------------------------------------
+// Destination surface, RGBA8888, top-left origin, tightly packed (row pitch = w*4).
+struct RSurface {
+    uint8_t *rgba;
+    int      w, h;
+};
+
+// ---- Source texture ---------------------------------------------------------
+// CPU copy of a texture's pixels (RGBA8888). When valid==0 (or tex==nullptr) the
+// sampler returns opaque white, so an untextured draw is just the vertex colour.
+struct RTexture {
+    const uint8_t *rgba;
+    int            w, h;
+    int            nearest;   // 1 = nearest filter (only mode implemented; linear TODO)
+    int            valid;     // pixels present and usable
+};
+
+// ---- Blend modes ------------------------------------------------------------
+// Mirrors BlendMode in blitter.h (GL-free). src = frag after the alpha test,
+// dst = existing pixel, everything normalized to [0,1] before compositing:
+//   RB_NONE    : out = src                                        (opaque copy)
+//   RB_ALPHA   : out.rgb = src.rgb*src.a + dst.rgb*(1-src.a)
+//                out.a   = src.a + dst.a*(1-src.a)
+//   RB_PREMULT : out.rgb = src.rgb + dst.rgb*(1-src.a)
+//                out.a   = src.a + dst.a*(1-src.a)
+//   RB_ADD     : out.rgb = src.rgb*src.a + dst.rgb  (clamp 1)
+//                out.a   = max(src.a, dst.a)
+enum RBlend {
+    RB_NONE = 0,
+    RB_ALPHA,
+    RB_PREMULT,
+    RB_ADD
+};
+
+// ---- Vertex -----------------------------------------------------------------
+// One decoded vertex: screen-space pixel position in the dest (top-left origin),
+// texcoords in [0,1] (wrap-repeat outside), and a per-vertex colour in [0,1].
+struct BVtx {
+    float x, y;
+    float u, v;
+    float r, g, b, a;
+};
+
+// ---- API --------------------------------------------------------------------
+// Rasterize one triangle into dst. Per covered pixel the pipeline is:
+//   texel    = tex valid ? nearest-sample(u,v) wrap-repeat : white(1,1,1,1)
+//   frag.rgb = vtx.rgb * texel.rgb ;  frag.a = vtx.a * texel.a   (all in [0,1])
+//   alpha test: if frag.a <= alphaRef -> discard the pixel
+//   composite frag into dst[x,y] per the blend mode above
+// u,v and r,g,b,a are interpolated barycentrically. Writes are clipped to
+// [0,dst->w) x [0,dst->h) — never out of bounds. Degenerate / zero-area /
+// non-finite triangles are skipped.
+void Blitter_RasterTri(RSurface *dst, const BVtx v[3], const RTexture *tex,
+                       RBlend blend, float alphaRef);
+
+// Fill the whole surface with a colour (used for clears).
+void Blitter_ClearSurface(RSurface *s, uint8_t r, uint8_t g, uint8_t b, uint8_t a);
