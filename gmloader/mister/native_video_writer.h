@@ -25,6 +25,10 @@
 
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /// Initialize DDR3 native video writer. Maps /dev/mem at 0x3A000000.
 /// Clears both video buffers and writes control word = 0.
 /// Returns false on any failure.
@@ -47,6 +51,10 @@ void NativeVideoWriter_WriteFrame(const void* pixels_rgb565, int width,
 
 /// Returns true if DDR3 writer is initialized and ready.
 bool NativeVideoWriter_IsActive(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #else /* !MISTER_NATIVE_VIDEO — no-op stubs for non-MiSTer builds */
 

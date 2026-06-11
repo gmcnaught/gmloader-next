@@ -1,4 +1,5 @@
 #include <SDL2/SDL.h>
+#include <stdio.h>
 #include "glad_egl.h"
 #include "glad.h"
 
@@ -27,7 +28,10 @@ extern void glShaderSource_dump(
 // Defined in main.cpp — handle to bundled libGLES_sw.so
 extern void* g_gles_handle;
 static void* mister_egl_resolver(const char* name) {
-    return g_gles_handle ? dlsym(g_gles_handle, name) : nullptr;
+    void* sym = g_gles_handle ? dlsym(g_gles_handle, name) : nullptr;
+    // Fall back to any globally loaded library (handles GLVND split-lib case where
+    // EGL and GLES2 symbols live in different .so files all opened with RTLD_GLOBAL)
+    return sym ? sym : dlsym(RTLD_DEFAULT, name);
 }
 #undef PTR_RESOLVE
 #define PTR_RESOLVE(x) resolve_thunked<&glad_##x>(#x, symtable_egl_index, symtable_egl, mister_egl_resolver)
@@ -50,14 +54,22 @@ ABI_ATTR __eglMustCastToProperFunctionPointerType EGLAPIENTRY eglGetProcAddress_
     }
 
 #ifdef MISTER_NATIVE_VIDEO
-    // Delegate to the bundled library's own eglGetProcAddress for any extension
-    // functions not already thunked in the symtable
-    if (g_gles_handle) {
-        auto pfnGetProcAddr = (void*(*)(const char*))dlsym(g_gles_handle, "eglGetProcAddress");
-        if (pfnGetProcAddr) return (__eglMustCastToProperFunctionPointerType)pfnGetProcAddr(procname);
+    // Delegate to Mesa's real eglGetProcAddress (in libEGL.so.1, loaded RTLD_GLOBAL)
+    // for any extension functions not already in the symtable.
+    // Must use RTLD_DEFAULT — libEGL.so.1 exports eglGetProcAddress, not libGLESv2.so.2.
+    {
+        static auto pfnGetProcAddr =
+            (void*(*)(const char*))dlsym(RTLD_DEFAULT, "eglGetProcAddress");
+        if (pfnGetProcAddr) {
+            auto r = (__eglMustCastToProperFunctionPointerType)pfnGetProcAddr(procname);
+            if (!r)
+                fprintf(stderr, "DBG eglGetProcAddress NULL: '%s'\n", procname);
+            return r;
+        }
     }
 #endif
 
+    fprintf(stderr, "DBG eglGetProcAddress NULL: '%s'\n", procname);
     return NULL;
 }
 

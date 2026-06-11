@@ -1,6 +1,7 @@
 #pragma once
 #include "so_util.h"
 #include "thunk_gen.h"
+#include <stdio.h>
 template<typename D, typename R, typename... Args>
 struct ThunkFloatImplPtr;
 
@@ -81,6 +82,9 @@ void *resolve_thunked(const char *symbol, int &index, DynLibFunction tab[], void
     if (f) {
         tab[index++] = (DynLibFunction){symbol, select_either_ptr<F>(f, symbol)};
         tab[index] = {NULL};
+    } else {
+        // Only log first 256 chars of symbol to avoid log flood for long extension names
+        fprintf(stderr, "DBG resolve NULL: %.64s\n", symbol);
     }
 
     return f;

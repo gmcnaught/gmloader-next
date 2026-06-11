@@ -24,6 +24,8 @@
 #include <libgen.h>
 #include "mister/native_video_writer.h"
 #include "mister/frame_capture.h"
+#include "mister/draw_trace.h"
+#include "mister/blitter.h"
 // Global handle to bundled libGLES_sw.so — also used by egl.cpp and gles2.cpp via extern
 void* g_gles_handle = nullptr;
 #endif
@@ -80,8 +82,45 @@ static fs::path get_absolute_path(const char* path, fs::path work_dir){
     return fs_path;
 }
 
+static void crash_handler(int sig, siginfo_t *info, void *ctx)
+{
+    ucontext_t *uc = (ucontext_t *)ctx;
+    uintptr_t fault_addr = (uintptr_t)info->si_addr;
+    const char *name = sig == SIGSEGV ? "SIGSEGV" :
+                       sig == SIGILL  ? "SIGILL"  :
+                       sig == SIGBUS  ? "SIGBUS"  : "SIGNAL";
+#if defined(__arm__)
+    uintptr_t pc = uc->uc_mcontext.arm_pc;
+    uintptr_t lr = uc->uc_mcontext.arm_lr;
+    fprintf(stderr, "%s: fault_addr=%p PC=%p LR=%p\n", name,
+            (void*)fault_addr, (void*)pc, (void*)lr);
+    fprintf(stderr, "  r0=%08lx r1=%08lx r2=%08lx r3=%08lx\n",
+            uc->uc_mcontext.arm_r0, uc->uc_mcontext.arm_r1,
+            uc->uc_mcontext.arm_r2, uc->uc_mcontext.arm_r3);
+    fprintf(stderr, "  r4=%08lx r5=%08lx r6=%08lx r7=%08lx\n",
+            uc->uc_mcontext.arm_r4, uc->uc_mcontext.arm_r5,
+            uc->uc_mcontext.arm_r6, uc->uc_mcontext.arm_r7);
+    fprintf(stderr, "  sp=%08lx ip=%08lx fp=%08lx\n",
+            uc->uc_mcontext.arm_sp, uc->uc_mcontext.arm_ip,
+            uc->uc_mcontext.arm_fp);
+    // Dump the instruction at PC so we can see what faulted
+    fprintf(stderr, "  insn@PC: %08x\n", *(uint32_t*)(pc & ~3));
+#else
+    fprintf(stderr, "%s: fault_addr=%p\n", name, (void*)fault_addr);
+#endif
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 int main(int argc, char *argv[])
 {
+    struct sigaction sa = {};
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+
     // Store the program name from argv[0]
     if (argc > 0 && argv[0]) {
         program_name = argv[0];
@@ -178,8 +217,10 @@ int main(int argc, char *argv[])
         fatal_error("Could not load libyoyo.so!\n");
         return -1;
     }
+    warning("DBG: so_load_module done\n");
 
     patch_libyoyo(libyoyo);
+    warning("DBG: patch_libyoyo done\n");
     if(gmloader_config.disable_depth == 1) {
         disable_depth();
     }
@@ -193,21 +234,58 @@ int main(int argc, char *argv[])
     patch_steam(libyoyo);
     patch_texture(libyoyo);
     patch_lua(libyoyo);
+    warning("DBG: all patches done\n");
 
+    warning("DBG: before NewStringUTF apk_path\n");
     String *apk_path_arg = (String *)env->NewStringUTF(apk_path.c_str());
+    warning("DBG: before NewStringUTF save_dir\n");
     String *save_dir_arg = (String *)env->NewStringUTF(save_dir.c_str());
+    warning("DBG: before NewStringUTF pkg_dir\n");
     String *pkg_dir_arg = (String *)env->NewStringUTF("com.johnny.loader");
+    warning("DBG: after NewStringUTF calls\n");
     printf("apk_path %s save_dir %s pkg_dir %s\n", apk_path_arg->str, save_dir_arg->str, pkg_dir_arg->str);
 
 #ifdef MISTER_NATIVE_VIDEO
     // Build path to bundled libGLES_sw.so relative to the binary (same dir as argv[0])
     {
+        warning("DBG: entering MISTER_NATIVE_VIDEO block\n");
         char argv0_buf[4096];
         strncpy(argv0_buf, argv[0], sizeof(argv0_buf) - 1);
         argv0_buf[sizeof(argv0_buf) - 1] = '\0';
         char *bin_dir = dirname(argv0_buf);
         char lib_path[4096];
+        char mesa_dir[4096];
+        snprintf(mesa_dir, sizeof(mesa_dir), "%s/mesa", bin_dir);
+
+        // Standalone Mesa 21.3 (no GLVND, no X11/Wayland/GBM, softpipe/no-LLVM).
+        // EGL_PLATFORM=surfaceless: use the Mesa surfaceless headless backend.
+        // LIBGL_DRIVERS_PATH: DRI loader finds swrast_dri.so here.
+        setenv("EGL_PLATFORM", "surfaceless", 0);
+        setenv("LIBGL_DRIVERS_PATH", mesa_dir, 0);
+        setenv("LIBGL_ALWAYS_SOFTWARE", "1", 0);
+        warning("DBG: set EGL_PLATFORM=surfaceless, LIBGL_DRIVERS_PATH=%s\n", mesa_dir);
+
+        // Pre-load Mesa runtime libs from mesa/ subdir so the dynamic linker finds
+        // them before attempting system paths (MiSTer has no system Mesa).
+        static const char* const preload_libs[] = {
+            "libdrm.so.2", "libglapi.so.0", "libEGL.so.1", NULL
+        };
+        for (int i = 0; preload_libs[i]; i++) {
+            // Try mesa/ subdir first
+            snprintf(lib_path, sizeof(lib_path), "%s/%s", mesa_dir, preload_libs[i]);
+            void *h = dlopen(lib_path, RTLD_LAZY | RTLD_GLOBAL);
+            if (h) {
+                warning("DBG: preloaded mesa/%s ok\n", preload_libs[i]);
+            } else {
+                warning("DBG: mesa/%s fail: %s\n", preload_libs[i], dlerror());
+                // Fall back to bin_dir
+                snprintf(lib_path, sizeof(lib_path), "%s/%s", bin_dir, preload_libs[i]);
+                h = dlopen(lib_path, RTLD_LAZY | RTLD_GLOBAL);
+                warning("DBG: bin_dir/%s %s\n", preload_libs[i], h ? "ok" : "fail");
+            }
+        }
         snprintf(lib_path, sizeof(lib_path), "%s/libGLES_sw.so", bin_dir);
+        warning("DBG: dlopen libGLES_sw.so at %s\n", lib_path);
         g_gles_handle = dlopen(lib_path, RTLD_LAZY | RTLD_GLOBAL);
         if (!g_gles_handle) {
             fatal_error("Cannot load libGLES_sw.so: %s\n", dlerror());
@@ -215,6 +293,15 @@ int main(int argc, char *argv[])
         }
         warning("Loaded bundled GLES library: %s\n", lib_path);
     }
+#endif
+
+    // In MISTER_NATIVE_VIDEO mode the real display is the DDR framebuffer; use SDL's
+    // dummy video driver so SDL_Init doesn't fail looking for a display device.
+    // Audio and joystick still go through real drivers.
+#ifdef MISTER_NATIVE_VIDEO
+    setenv("SDL_VIDEODRIVER", "dummy", 0);
+    setenv("SDL_AUDIODRIVER", "dummy", 0);
+    warning("DBG: SDL_VIDEODRIVER=dummy for MISTER_NATIVE_VIDEO\n");
 #endif
 
     // Initialize SDL with video, audio, joystick, and controller support
@@ -273,14 +360,19 @@ int main(int argc, char *argv[])
 #else
     // EGL headless pbuffer context via bundled libGLES_sw.so
     {
-        // Resolve core EGL entry points directly from the bundled library
-        auto pfnGetDisplay   = (EGLDisplay(*)(EGLNativeDisplayType))dlsym(g_gles_handle, "eglGetDisplay");
-        auto pfnInitialize   = (EGLBoolean(*)(EGLDisplay, EGLint*, EGLint*))dlsym(g_gles_handle, "eglInitialize");
-        auto pfnChooseConfig = (EGLBoolean(*)(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*))dlsym(g_gles_handle, "eglChooseConfig");
-        auto pfnCreateCtx    = (EGLContext(*)(EGLDisplay, EGLConfig, EGLContext, const EGLint*))dlsym(g_gles_handle, "eglCreateContext");
-        auto pfnCreatePbuf   = (EGLSurface(*)(EGLDisplay, EGLConfig, const EGLint*))dlsym(g_gles_handle, "eglCreatePbufferSurface");
-        auto pfnMakeCurrent  = (EGLBoolean(*)(EGLDisplay, EGLSurface, EGLSurface, EGLContext))dlsym(g_gles_handle, "eglMakeCurrent");
-        auto pfnBindAPI      = (EGLBoolean(*)(EGLenum))dlsym(g_gles_handle, "eglBindAPI");
+        // Resolve core EGL entry points. libGLES_sw.so is a GLES2 dispatch wrapper
+        // and does not export EGL symbols; those live in the preloaded libEGL.so.1
+        // (loaded with RTLD_GLOBAL above).  Use RTLD_DEFAULT to search the global
+        // symbol namespace rather than a specific handle.
+        auto pfnGetDisplay   = (EGLDisplay(*)(EGLNativeDisplayType))dlsym(RTLD_DEFAULT, "eglGetDisplay");
+        auto pfnInitialize   = (EGLBoolean(*)(EGLDisplay, EGLint*, EGLint*))dlsym(RTLD_DEFAULT, "eglInitialize");
+        auto pfnChooseConfig = (EGLBoolean(*)(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*))dlsym(RTLD_DEFAULT, "eglChooseConfig");
+        auto pfnCreateCtx    = (EGLContext(*)(EGLDisplay, EGLConfig, EGLContext, const EGLint*))dlsym(RTLD_DEFAULT, "eglCreateContext");
+        auto pfnCreatePbuf   = (EGLSurface(*)(EGLDisplay, EGLConfig, const EGLint*))dlsym(RTLD_DEFAULT, "eglCreatePbufferSurface");
+        auto pfnMakeCurrent  = (EGLBoolean(*)(EGLDisplay, EGLSurface, EGLSurface, EGLContext))dlsym(RTLD_DEFAULT, "eglMakeCurrent");
+        auto pfnBindAPI      = (EGLBoolean(*)(EGLenum))dlsym(RTLD_DEFAULT, "eglBindAPI");
+        warning("DBG: EGL syms: GetDisplay=%p Init=%p Choose=%p\n",
+                (void*)pfnGetDisplay, (void*)pfnInitialize, (void*)pfnChooseConfig);
 
         if (!pfnGetDisplay || !pfnInitialize || !pfnChooseConfig ||
             !pfnCreateCtx  || !pfnCreatePbuf  || !pfnMakeCurrent) {
@@ -288,10 +380,57 @@ int main(int argc, char *argv[])
             return -1;
         }
 
-        EGLDisplay egl_dpy = pfnGetDisplay(EGL_NO_DISPLAY);
-        EGLint egl_major, egl_minor;
-        if (!pfnInitialize(egl_dpy, &egl_major, &egl_minor))
-            fatal_error("eglInitialize failed\n");
+        // This Mesa has EGL_EXT_platform_device but not surfaceless.
+        // Extension function pointers must be fetched via eglGetProcAddress (not dlsym).
+        // Use eglQueryDevicesEXT + eglGetPlatformDisplayEXT(DEVICE_EXT) for headless.
+#ifndef EGL_PLATFORM_DEVICE_EXT
+#define EGL_PLATFORM_DEVICE_EXT 0x313F
+#endif
+        auto pfnGetProcAddr = (void*(*)(const char*))dlsym(RTLD_DEFAULT, "eglGetProcAddress");
+        auto pfnQueryDevicesEXT       = pfnGetProcAddr ?
+            (EGLBoolean(*)(EGLint, void**, EGLint*))pfnGetProcAddr("eglQueryDevicesEXT") : nullptr;
+        auto pfnGetPlatformDisplayEXT = pfnGetProcAddr ?
+            (EGLDisplay(*)(EGLenum, void*, const EGLint*))pfnGetProcAddr("eglGetPlatformDisplayEXT") : nullptr;
+        warning("DBG: eglGetProcAddress=%p QueryDevices=%p GetPlatformDisplay=%p\n",
+                (void*)pfnGetProcAddr, (void*)pfnQueryDevicesEXT, (void*)pfnGetPlatformDisplayEXT);
+
+        EGLDisplay egl_dpy = EGL_NO_DISPLAY;
+        if (pfnQueryDevicesEXT && pfnGetPlatformDisplayEXT) {
+            void* egl_devices[4] = {};
+            EGLint num_devices = 0;
+            if (pfnQueryDevicesEXT(4, egl_devices, &num_devices) && num_devices > 0) {
+                warning("DBG: EGL_PLATFORM_DEVICE: %d device(s)\n", num_devices);
+                egl_dpy = pfnGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, egl_devices[0], NULL);
+                warning("DBG: eglGetPlatformDisplayEXT(DEVICE_0) = %p\n", (void*)egl_dpy);
+            } else {
+                warning("DBG: eglQueryDevicesEXT returned %d devices\n", num_devices);
+            }
+        }
+        auto pfnGetError = (EGLint(*)(void))dlsym(RTLD_DEFAULT, "eglGetError");
+        #ifndef EGL_PLATFORM_SURFACELESS_MESA
+        #define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
+        #endif
+        // Preferred headless path for a software Mesa with no /dev/dri:
+        // the surfaceless platform via eglGetPlatformDisplay.
+        if (egl_dpy == EGL_NO_DISPLAY && pfnGetPlatformDisplayEXT) {
+            egl_dpy = pfnGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+            warning("DBG: eglGetPlatformDisplay(SURFACELESS_MESA) = %p\n", (void*)egl_dpy);
+        }
+        if (egl_dpy == EGL_NO_DISPLAY) {
+            warning("DBG: falling back to eglGetDisplay(DEFAULT)\n");
+            egl_dpy = pfnGetDisplay(EGL_DEFAULT_DISPLAY);
+            warning("DBG: eglGetDisplay(DEFAULT) = %p\n", (void*)egl_dpy);
+        }
+
+        EGLint egl_major = 0, egl_minor = 0;
+        // NOTE: fatal_error() only prints — it does NOT exit. Without an explicit
+        // return, a failed eglInitialize cascades through every following EGL call
+        // and ends in a null GL context -> SIGSEGV deep inside Mesa. Bail out here.
+        if (!pfnInitialize(egl_dpy, &egl_major, &egl_minor)) {
+            EGLint e = pfnGetError ? pfnGetError() : 0;
+            fatal_error("eglInitialize failed (dpy=%p eglGetError=0x%04x)\n", (void*)egl_dpy, e);
+            return -1;
+        }
         if (pfnBindAPI) pfnBindAPI(EGL_OPENGL_ES_API);
 
         static const EGLint cfg_attribs[] = {
@@ -303,21 +442,37 @@ int main(int argc, char *argv[])
         };
         EGLConfig egl_cfg; EGLint ncfg = 0;
         pfnChooseConfig(egl_dpy, cfg_attribs, &egl_cfg, 1, &ncfg);
-        if (ncfg == 0) fatal_error("eglChooseConfig: no matching config\n");
+        if (ncfg == 0) { fatal_error("eglChooseConfig: no matching config\n"); return -1; }
 
         static const EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
         EGLContext egl_ctx = pfnCreateCtx(egl_dpy, egl_cfg, EGL_NO_CONTEXT, ctx_attribs);
-        if (egl_ctx == EGL_NO_CONTEXT) fatal_error("eglCreateContext failed\n");
+        if (egl_ctx == EGL_NO_CONTEXT) { fatal_error("eglCreateContext failed\n"); return -1; }
 
-        static const EGLint pbuf_attribs[] = { EGL_WIDTH, MISTER_WIDTH, EGL_HEIGHT, MISTER_HEIGHT, EGL_NONE };
+        // Render size: 320x240 normally, or GMLOADER_RENDER_W/H when the blitter
+        // owns rendering (so the game's native size can be presented 1:1 +
+        // letterboxed into the fixed 320x240 DDR buffer — no upscale artifacts).
+        int pbw = MISTER_WIDTH, pbh = MISTER_HEIGHT;
+        {
+            const char *bl = getenv("GMLOADER_BLITTER"); int lvl = bl ? atoi(bl) : 0;
+            if (lvl >= 2) {
+                const char *rw = getenv("GMLOADER_RENDER_W"), *rh = getenv("GMLOADER_RENDER_H");
+                if (rw) pbw = atoi(rw);
+                if (rh) pbh = atoi(rh);
+                if (pbw <= 0 || pbw > MISTER_WIDTH)  pbw = MISTER_WIDTH;
+                if (pbh <= 0 || pbh > MISTER_HEIGHT) pbh = MISTER_HEIGHT;
+            }
+        }
+        EGLint pbuf_attribs[] = { EGL_WIDTH, pbw, EGL_HEIGHT, pbh, EGL_NONE };
         EGLSurface egl_surf = pfnCreatePbuf(egl_dpy, egl_cfg, pbuf_attribs);
-        if (egl_surf == EGL_NO_SURFACE) fatal_error("eglCreatePbufferSurface failed\n");
+        if (egl_surf == EGL_NO_SURFACE) { fatal_error("eglCreatePbufferSurface failed\n"); return -1; }
 
-        if (!pfnMakeCurrent(egl_dpy, egl_surf, egl_surf, egl_ctx))
+        if (!pfnMakeCurrent(egl_dpy, egl_surf, egl_surf, egl_ctx)) {
             fatal_error("eglMakeCurrent failed\n");
+            return -1;
+        }
 
         warning("EGL headless context created: %d.%d, pbuffer %dx%d\n",
-                egl_major, egl_minor, MISTER_WIDTH, MISTER_HEIGHT);
+                egl_major, egl_minor, pbw, pbh);
     }
 
     if (!NativeVideoWriter_Init()) {
@@ -369,6 +524,8 @@ int main(int argc, char *argv[])
         SDL_GetWindowSize(sdl_win, &init_w, &init_h);
         FrameCapture_Init(init_w, init_h);
     }
+    DrawTrace_Init();
+    Blitter_Init();
 #endif
 
     while (cont != 0 && cont != 2 && RunnerJNILib_MoveTaskToBackCalled == 0 && relaunch_flag == 0) {
@@ -379,8 +536,18 @@ int main(int argc, char *argv[])
             break;
         SDL_GetWindowSize(sdl_win, &w, &h);
 #ifdef MISTER_NATIVE_VIDEO
-        cont = RunnerJNILib::Process(env, 0, MISTER_WIDTH, MISTER_HEIGHT, 0, 0, 0, 0, 0, 60);
+        uint64_t _dt_p0 = DrawTrace_NowNs();
+        cont = RunnerJNILib::Process(env, 0, Blitter_RenderW(), Blitter_RenderH(), 0, 0, 0, 0, 0, 60);
+        uint64_t _dt_p1 = DrawTrace_NowNs();
         if (RunnerJNILib::canFlip(env, 0)) {
+          const uint8_t* _blit = Blitter_PresentDefault();
+          if (_blit && NativeVideoWriter_IsActive()) {
+            // Blitter owns the frame: convert (with row flip) straight to DDR,
+            // skipping glReadPixels entirely.
+            static uint16_t rgb565_blit[MISTER_WIDTH * MISTER_HEIGHT];
+            Blitter_ToRGB565(_blit, rgb565_blit);
+            NativeVideoWriter_WriteFrame(rgb565_blit, MISTER_WIDTH, MISTER_HEIGHT, MISTER_WIDTH * 2);
+          } else {
             FrameCapture_ReadFrame();
 
             // glReadPixels returns bottom-row-first; flip to top-row-first for FPGA/SDL
@@ -407,6 +574,27 @@ int main(int argc, char *argv[])
                 SDL_RenderClear(sdl_renderer);
                 SDL_RenderCopy(sdl_renderer, sdl_texture, NULL, NULL);
                 SDL_RenderPresent(sdl_renderer);
+            }
+          }
+        }
+        DrawTrace_FrameEnd(_dt_p1 - _dt_p0, DrawTrace_NowNs() - _dt_p1);
+        Blitter_ProfFrameEnd(_dt_p1 - _dt_p0);
+        // Frame-rate cap: the blitter can run the game far above 60Hz, which
+        // races the game's logic/intro and triggers relaunch loops. Pace the
+        // loop (and therefore the runner's game logic) to ~60fps. Override with
+        // GMLOADER_FPS; 0 disables the cap.
+        {
+            static Uint32 frame_ms = 0xFFFFFFFF, next_ms = 0;
+            if (frame_ms == 0xFFFFFFFF) {
+                const char *fe = getenv("GMLOADER_FPS");
+                int fps = fe ? atoi(fe) : 60;
+                frame_ms = (fps > 0) ? (Uint32)(1000 / fps) : 0;
+            }
+            if (frame_ms) {
+                Uint32 now = SDL_GetTicks();
+                if (next_ms == 0 || now > next_ms + frame_ms) next_ms = now;
+                next_ms += frame_ms;
+                if (now < next_ms) SDL_Delay(next_ms - now);
             }
         }
 #else

@@ -328,7 +328,8 @@ static bool has_builtin_lib(std::string filename)
         filename.starts_with("libdl.so") ||
         filename.starts_with("liblog.so") ||
         filename.starts_with("libandroid.so") ||
-        filename.starts_with("libz.so"))
+        filename.starts_with("libz.so") ||
+        filename.starts_with("libm.so"))
       return true;
     return false;
 }

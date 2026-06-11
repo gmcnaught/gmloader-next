@@ -268,6 +268,7 @@ DynLibFunction symtable_zlib[] = {
     THUNK_DIRECT(deflateInit2_),
     THUNK_DIRECT(deflateReset),
     THUNK_DIRECT(crc32),
+    THUNK_DIRECT(zError),
 
     NO_THUNK("AAssetManager_fromJava", (uintptr_t)&AAssetManager_fromJava_impl),
     NO_THUNK("AAssetManager_open", (uintptr_t)&AAssetManager_open_impl),

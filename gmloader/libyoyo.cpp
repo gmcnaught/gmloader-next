@@ -391,21 +391,31 @@ void patch_libyoyo(so_module *mod)
         }
     }
 
-    // Wrap Function_Add
-    if (Function_Add && !Original_Function_Add)
+    // Wrap Function_Add — but only on runners that actually need it.
+    //
+    // The reentrant rehook exists solely to dedup Function_Add on 2024.14+ runners
+    // (see the note above). On older runners (e.g. GMS1.x) the rehook trampoline
+    // lands on a bad target and SIGILLs during the first Function_Add call.
+    //
+    // Modern runners with the dedup bug expose Function_Add with the const-char*
+    // mangling (_Z12Function_AddPKc...); older runners that append blindly use the
+    // char* mangling (_Z12Function_AddPc...). Only rehook when the modern symbol is
+    // present, so old runners are left untouched.
+    bool runner_needs_dedup =
+        so_symbol(mod, "_Z12Function_AddPKcPFvR6RValueP9CInstanceS4_iPS1_Eib") != 0;
+    if (runner_needs_dedup && Function_Add && !Original_Function_Add)
     {
         Original_Function_Add = Function_Add;
         rehook_new(mod, &REHFunctionAdd, (uintptr_t)Function_Add, (uintptr_t)&Function_Add_Hook);
         rehook_hook(&REHFunctionAdd);
     }
-    
+
 #if defined(__arm__)
     // Add a "game_end" function (useless on 1.4.1788+ until 1.4.1804ish?)
     // From 'https://store.yoyogames.com/downloads/gm-studio/release-notes-studio.html':
-    //   "Changed game_end() to be ignored on Android and iOS, following crash 
+    //   "Changed game_end() to be ignored on Android and iOS, following crash
     //   logs that indicated this was causing memory corruption and crashes in
     //   subsequent runs of your app"
-    
     uint32_t *_Z15Command_EndGamev = (uint32_t *)so_symbol(mod, "_Z15Command_EndGamev");
     // _Z15Command_EndGamev+0x00: bx lr (noop function)
     if (_Z15Command_EndGamev != NULL && *_Z15Command_EndGamev == 0xE12FFF1E) {
