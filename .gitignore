@@ -9,6 +9,9 @@ cppcheck.cppcheck
 3rdparty/fmod/**
 !3rdparty/fmod/.gitkeep
 
-# MiSTer deploy directory — user-provided runtime files
+# MiSTer deploy directory — user-provided runtime files / build artifacts
 games/gmloader/libGLES_sw.so
 games/gmloader/APKs/*.apk
+games/gmloader/gmloader
+games/gmloader/libs/
+games/gmloader/mesa/
