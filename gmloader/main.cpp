@@ -80,30 +80,44 @@ static fs::path get_absolute_path(const char* path, fs::path work_dir){
     return fs_path;
 }
 
-static void segfault_handler(int sig, siginfo_t *info, void *ctx)
+static void crash_handler(int sig, siginfo_t *info, void *ctx)
 {
     ucontext_t *uc = (ucontext_t *)ctx;
     uintptr_t fault_addr = (uintptr_t)info->si_addr;
+    const char *name = sig == SIGSEGV ? "SIGSEGV" :
+                       sig == SIGILL  ? "SIGILL"  :
+                       sig == SIGBUS  ? "SIGBUS"  : "SIGNAL";
 #if defined(__arm__)
     uintptr_t pc = uc->uc_mcontext.arm_pc;
     uintptr_t lr = uc->uc_mcontext.arm_lr;
-    uintptr_t r3 = uc->uc_mcontext.arm_r3;
-    uintptr_t r4 = uc->uc_mcontext.arm_r4;
-    fprintf(stderr, "SIGSEGV: fault_addr=%p PC=%p LR=%p R3=%p R4=%p\n",
-            (void*)fault_addr, (void*)pc, (void*)lr, (void*)r3, (void*)r4);
+    fprintf(stderr, "%s: fault_addr=%p PC=%p LR=%p\n", name,
+            (void*)fault_addr, (void*)pc, (void*)lr);
+    fprintf(stderr, "  r0=%08lx r1=%08lx r2=%08lx r3=%08lx\n",
+            uc->uc_mcontext.arm_r0, uc->uc_mcontext.arm_r1,
+            uc->uc_mcontext.arm_r2, uc->uc_mcontext.arm_r3);
+    fprintf(stderr, "  r4=%08lx r5=%08lx r6=%08lx r7=%08lx\n",
+            uc->uc_mcontext.arm_r4, uc->uc_mcontext.arm_r5,
+            uc->uc_mcontext.arm_r6, uc->uc_mcontext.arm_r7);
+    fprintf(stderr, "  sp=%08lx ip=%08lx fp=%08lx\n",
+            uc->uc_mcontext.arm_sp, uc->uc_mcontext.arm_ip,
+            uc->uc_mcontext.arm_fp);
+    // Dump the instruction at PC so we can see what faulted
+    fprintf(stderr, "  insn@PC: %08x\n", *(uint32_t*)(pc & ~3));
 #else
-    fprintf(stderr, "SIGSEGV: fault_addr=%p\n", (void*)fault_addr);
+    fprintf(stderr, "%s: fault_addr=%p\n", name, (void*)fault_addr);
 #endif
-    signal(SIGSEGV, SIG_DFL);
-    raise(SIGSEGV);
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
 int main(int argc, char *argv[])
 {
     struct sigaction sa = {};
-    sa.sa_sigaction = segfault_handler;
+    sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
 
     // Store the program name from argv[0]
     if (argc > 0 && argv[0]) {
@@ -390,14 +404,31 @@ int main(int argc, char *argv[])
                 warning("DBG: eglQueryDevicesEXT returned %d devices\n", num_devices);
             }
         }
+        auto pfnGetError = (EGLint(*)(void))dlsym(RTLD_DEFAULT, "eglGetError");
+        #ifndef EGL_PLATFORM_SURFACELESS_MESA
+        #define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
+        #endif
+        // Preferred headless path for a software Mesa with no /dev/dri:
+        // the surfaceless platform via eglGetPlatformDisplay.
+        if (egl_dpy == EGL_NO_DISPLAY && pfnGetPlatformDisplayEXT) {
+            egl_dpy = pfnGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+            warning("DBG: eglGetPlatformDisplay(SURFACELESS_MESA) = %p\n", (void*)egl_dpy);
+        }
         if (egl_dpy == EGL_NO_DISPLAY) {
             warning("DBG: falling back to eglGetDisplay(DEFAULT)\n");
             egl_dpy = pfnGetDisplay(EGL_DEFAULT_DISPLAY);
+            warning("DBG: eglGetDisplay(DEFAULT) = %p\n", (void*)egl_dpy);
         }
 
         EGLint egl_major = 0, egl_minor = 0;
-        if (!pfnInitialize(egl_dpy, &egl_major, &egl_minor))
-            fatal_error("eglInitialize failed\n");
+        // NOTE: fatal_error() only prints — it does NOT exit. Without an explicit
+        // return, a failed eglInitialize cascades through every following EGL call
+        // and ends in a null GL context -> SIGSEGV deep inside Mesa. Bail out here.
+        if (!pfnInitialize(egl_dpy, &egl_major, &egl_minor)) {
+            EGLint e = pfnGetError ? pfnGetError() : 0;
+            fatal_error("eglInitialize failed (dpy=%p eglGetError=0x%04x)\n", (void*)egl_dpy, e);
+            return -1;
+        }
         if (pfnBindAPI) pfnBindAPI(EGL_OPENGL_ES_API);
 
         static const EGLint cfg_attribs[] = {
@@ -409,18 +440,20 @@ int main(int argc, char *argv[])
         };
         EGLConfig egl_cfg; EGLint ncfg = 0;
         pfnChooseConfig(egl_dpy, cfg_attribs, &egl_cfg, 1, &ncfg);
-        if (ncfg == 0) fatal_error("eglChooseConfig: no matching config\n");
+        if (ncfg == 0) { fatal_error("eglChooseConfig: no matching config\n"); return -1; }
 
         static const EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
         EGLContext egl_ctx = pfnCreateCtx(egl_dpy, egl_cfg, EGL_NO_CONTEXT, ctx_attribs);
-        if (egl_ctx == EGL_NO_CONTEXT) fatal_error("eglCreateContext failed\n");
+        if (egl_ctx == EGL_NO_CONTEXT) { fatal_error("eglCreateContext failed\n"); return -1; }
 
         static const EGLint pbuf_attribs[] = { EGL_WIDTH, MISTER_WIDTH, EGL_HEIGHT, MISTER_HEIGHT, EGL_NONE };
         EGLSurface egl_surf = pfnCreatePbuf(egl_dpy, egl_cfg, pbuf_attribs);
-        if (egl_surf == EGL_NO_SURFACE) fatal_error("eglCreatePbufferSurface failed\n");
+        if (egl_surf == EGL_NO_SURFACE) { fatal_error("eglCreatePbufferSurface failed\n"); return -1; }
 
-        if (!pfnMakeCurrent(egl_dpy, egl_surf, egl_surf, egl_ctx))
+        if (!pfnMakeCurrent(egl_dpy, egl_surf, egl_surf, egl_ctx)) {
             fatal_error("eglMakeCurrent failed\n");
+            return -1;
+        }
 
         warning("EGL headless context created: %d.%d, pbuffer %dx%d\n",
                 egl_major, egl_minor, MISTER_WIDTH, MISTER_HEIGHT);
