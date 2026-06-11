@@ -36,6 +36,7 @@
 static int      g_level   = 0;
 static int      g_own     = 0;   // level >= 2
 static int      g_enabled = 0;   // level >= 1
+static int      g_rw = MISTER_WIDTH, g_rh = MISTER_HEIGHT;  // render size (<= DDR 320x240)
 static uint8_t *g_defSurf = nullptr;   // default framebuffer, RGBA8888, GL bottom-up
 
 void Blitter_Init(void) {
@@ -43,12 +44,23 @@ void Blitter_Init(void) {
     g_level   = e ? atoi(e) : 0;
     g_enabled = g_level >= 1;
     g_own     = g_level >= 2;
+    g_rw = MISTER_WIDTH; g_rh = MISTER_HEIGHT;
+    if (g_own) {   // render-size override only applies when the blitter presents
+        const char *rw = getenv("GMLOADER_RENDER_W"), *rh = getenv("GMLOADER_RENDER_H");
+        if (rw) g_rw = atoi(rw);
+        if (rh) g_rh = atoi(rh);
+        if (g_rw <= 0 || g_rw > MISTER_WIDTH)  g_rw = MISTER_WIDTH;
+        if (g_rh <= 0 || g_rh > MISTER_HEIGHT) g_rh = MISTER_HEIGHT;
+    }
     if (g_enabled) {
-        g_defSurf = (uint8_t *)calloc((size_t)MISTER_WIDTH * MISTER_HEIGHT, 4);
-        fprintf(stderr, "BLITTER enabled (level %d, own=%d)\n", g_level, g_own);
+        g_defSurf = (uint8_t *)calloc((size_t)g_rw * g_rh, 4);
+        fprintf(stderr, "BLITTER enabled (level %d, own=%d, render %dx%d -> DDR %dx%d)\n",
+                g_level, g_own, g_rw, g_rh, MISTER_WIDTH, MISTER_HEIGHT);
     }
 }
 int Blitter_Enabled(void) { return g_enabled; }
+int Blitter_RenderW(void) { return g_rw; }
+int Blitter_RenderH(void) { return g_rh; }
 
 // ---- shadowed GL state ------------------------------------------------------
 namespace {
@@ -208,7 +220,7 @@ bool get_rblend(RBlend *out) {
 // it works as both a render target and a sampleable texture). False if unknown.
 bool get_render_target(RSurface *out) {
     if (g_curFBO == 0) {
-        out->rgba = g_defSurf; out->w = MISTER_WIDTH; out->h = MISTER_HEIGHT;
+        out->rgba = g_defSurf; out->w = g_rw; out->h = g_rh;
         return out->rgba != nullptr;
     }
     auto fit = g_fboColorTex.find(g_curFBO);
@@ -429,11 +441,17 @@ int Blitter_TryDrawElements(GLenum mode, GLsizei count, GLenum type, const void 
 const uint8_t *Blitter_PresentDefault(void) { return g_own ? g_defSurf : nullptr; }
 
 void Blitter_ToRGB565(const uint8_t *src_rgba, uint16_t *dst) {
-    // src is GL bottom-up; the DDR framebuffer wants top-down -> flip rows.
-    for (int y = 0; y < MISTER_HEIGHT; y++) {
-        const uint8_t *s = src_rgba + (size_t)(MISTER_HEIGHT - 1 - y) * MISTER_WIDTH * 4;
-        uint16_t *d = dst + (size_t)y * MISTER_WIDTH;
-        for (int x = 0; x < MISTER_WIDTH; x++) {
+    // src is the render-size (g_rw x g_rh) GL bottom-up surface; the DDR buffer
+    // is MISTER_WIDTH x MISTER_HEIGHT top-down. Center (letterbox) src into dst
+    // 1:1 with a black border, flipping rows top<->bottom. No scaling => no
+    // resampling artifacts.
+    const int ox = (MISTER_WIDTH  - g_rw) / 2;
+    const int oy = (MISTER_HEIGHT - g_rh) / 2;
+    memset(dst, 0, (size_t)MISTER_WIDTH * MISTER_HEIGHT * 2);   // borders = black
+    for (int y = 0; y < g_rh; y++) {
+        const uint8_t *s = src_rgba + (size_t)(g_rh - 1 - y) * g_rw * 4;   // flip
+        uint16_t *d = dst + (size_t)(y + oy) * MISTER_WIDTH + ox;
+        for (int x = 0; x < g_rw; x++) {
             uint8_t r = s[x*4+0], g = s[x*4+1], b = s[x*4+2];
             d[x] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
         }

@@ -448,7 +448,21 @@ int main(int argc, char *argv[])
         EGLContext egl_ctx = pfnCreateCtx(egl_dpy, egl_cfg, EGL_NO_CONTEXT, ctx_attribs);
         if (egl_ctx == EGL_NO_CONTEXT) { fatal_error("eglCreateContext failed\n"); return -1; }
 
-        static const EGLint pbuf_attribs[] = { EGL_WIDTH, MISTER_WIDTH, EGL_HEIGHT, MISTER_HEIGHT, EGL_NONE };
+        // Render size: 320x240 normally, or GMLOADER_RENDER_W/H when the blitter
+        // owns rendering (so the game's native size can be presented 1:1 +
+        // letterboxed into the fixed 320x240 DDR buffer — no upscale artifacts).
+        int pbw = MISTER_WIDTH, pbh = MISTER_HEIGHT;
+        {
+            const char *bl = getenv("GMLOADER_BLITTER"); int lvl = bl ? atoi(bl) : 0;
+            if (lvl >= 2) {
+                const char *rw = getenv("GMLOADER_RENDER_W"), *rh = getenv("GMLOADER_RENDER_H");
+                if (rw) pbw = atoi(rw);
+                if (rh) pbh = atoi(rh);
+                if (pbw <= 0 || pbw > MISTER_WIDTH)  pbw = MISTER_WIDTH;
+                if (pbh <= 0 || pbh > MISTER_HEIGHT) pbh = MISTER_HEIGHT;
+            }
+        }
+        EGLint pbuf_attribs[] = { EGL_WIDTH, pbw, EGL_HEIGHT, pbh, EGL_NONE };
         EGLSurface egl_surf = pfnCreatePbuf(egl_dpy, egl_cfg, pbuf_attribs);
         if (egl_surf == EGL_NO_SURFACE) { fatal_error("eglCreatePbufferSurface failed\n"); return -1; }
 
@@ -458,7 +472,7 @@ int main(int argc, char *argv[])
         }
 
         warning("EGL headless context created: %d.%d, pbuffer %dx%d\n",
-                egl_major, egl_minor, MISTER_WIDTH, MISTER_HEIGHT);
+                egl_major, egl_minor, pbw, pbh);
     }
 
     if (!NativeVideoWriter_Init()) {
@@ -523,7 +537,7 @@ int main(int argc, char *argv[])
         SDL_GetWindowSize(sdl_win, &w, &h);
 #ifdef MISTER_NATIVE_VIDEO
         uint64_t _dt_p0 = DrawTrace_NowNs();
-        cont = RunnerJNILib::Process(env, 0, MISTER_WIDTH, MISTER_HEIGHT, 0, 0, 0, 0, 0, 60);
+        cont = RunnerJNILib::Process(env, 0, Blitter_RenderW(), Blitter_RenderH(), 0, 0, 0, 0, 0, 60);
         uint64_t _dt_p1 = DrawTrace_NowNs();
         if (RunnerJNILib::canFlip(env, 0)) {
           const uint8_t* _blit = Blitter_PresentDefault();

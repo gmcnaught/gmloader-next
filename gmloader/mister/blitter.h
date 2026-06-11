@@ -55,6 +55,8 @@ typedef enum {
 // ---- Lifecycle / config -----------------------------------------------------
 void Blitter_Init(void);          // read env/config; allocate default surface
 int  Blitter_Enabled(void);       // master gate (env GMLOADER_BLITTER=1)
+int  Blitter_RenderW(void);       // render size (<= DDR width); GMLOADER_RENDER_W
+int  Blitter_RenderH(void);       // render size (<= DDR height); GMLOADER_RENDER_H
 
 // ---- State-shadow hooks (called from the corresponding gles2.cpp thunks) ----
 // These keep our mirror of GL state up to date. They are cheap and run whenever
