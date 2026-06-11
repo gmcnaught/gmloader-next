@@ -65,17 +65,19 @@ void Blitter_OnTexParameter(GLuint tex, GLenum pname, GLint param);
 void Blitter_OnBindTexture(GLenum target, GLuint tex);
 void Blitter_OnDeleteTexture(GLuint tex);
 
-void Blitter_OnBufferData(GLuint buf, uint32_t size, const void *data);
-void Blitter_OnBufferSubData(GLuint buf, uint32_t off, uint32_t size, const void *data);
+void Blitter_OnBufferData(GLenum target, uint32_t size, const void *data);
+void Blitter_OnBufferSubData(GLenum target, uint32_t off, uint32_t size, const void *data);
 void Blitter_OnBindBuffer(GLenum target, GLuint buf);
 void Blitter_OnVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void *ptr);
 void Blitter_OnEnableVertexAttrib(GLuint index, int enabled);
+void Blitter_OnBindAttribLocation(GLuint program, GLuint index, const char *name);
 
 void Blitter_OnBindFramebuffer(GLenum target, GLuint fbo);
-void Blitter_OnFramebufferTexture2D(GLuint fbo, GLenum attach, GLuint tex);
+void Blitter_OnFramebufferTexture2D(GLenum attach, GLuint tex);
 
 void Blitter_OnUseProgram(GLuint program);
-void Blitter_OnUniformMatrix4fv(GLint location, const GLfloat *value);  // capture MVP
+void Blitter_OnGetUniformLocation(GLuint program, const char *name, GLint loc);
+void Blitter_OnUniformMatrix4fv(GLint location, GLsizei count, const GLfloat *value);  // capture matrices
 void Blitter_OnBlendState(int enabled, GLenum src, GLenum dst);
 void Blitter_OnViewport(int x, int y, int w, int h);
 void Blitter_OnScissor(int enabled, int x, int y, int w, int h);

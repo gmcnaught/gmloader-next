@@ -23,6 +23,7 @@ static bool should_dump_shaders = false;
 #ifdef MISTER_NATIVE_VIDEO
 #include <dlfcn.h>
 #include "gmloader/mister/draw_trace.h"
+#include "gmloader/mister/blitter.h"
 // Defined in main.cpp — handle to bundled libGLES_sw.so
 extern void* g_gles_handle;
 static void* mister_gles2_resolver(const char* name) {
@@ -32,16 +33,18 @@ static void* mister_gles2_resolver(const char* name) {
 }
 #define PTR_RESOLVE(x) resolve_thunked<&glad_##x>(#x, symtable_gles2_index, symtable_gles2, mister_gles2_resolver)
 
-// Phase-0 draw tracer: time each draw and report it; falls straight through to
-// the real driver when GMLOADER_DRAW_TRACE is unset. This is also the hook point
-// the future 2D blitter will replace.
+// Draw hooks: give the blitter first refusal (it decodes/logs and, once the
+// rasterizer lands, will return 1 to fully handle the draw). On 0 we fall back
+// to the real driver, timed by the Phase-0 tracer.
 static void GLDrawArrays_trace(GLenum mode, GLint first, GLsizei count) {
+    if (Blitter_Enabled() && Blitter_TryDrawArrays(mode, first, count)) return;
     if (!DrawTrace_Enabled()) { glad_glDrawArrays(mode, first, count); return; }
     uint64_t t0 = DrawTrace_NowNs();
     glad_glDrawArrays(mode, first, count);
     DrawTrace_RecordDraw(DrawTrace_NowNs() - t0, count, mode == GL_TRIANGLES);
 }
 static void GLDrawElements_trace(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+    if (Blitter_Enabled() && Blitter_TryDrawElements(mode, count, type, indices)) return;
     if (!DrawTrace_Enabled()) { glad_glDrawElements(mode, count, type, indices); return; }
     uint64_t t0 = DrawTrace_NowNs();
     glad_glDrawElements(mode, count, type, indices);
@@ -56,6 +59,51 @@ static void GLClear_trace(GLbitfield mask) {
 static void GLViewport_trace(GLint x, GLint y, GLsizei w, GLsizei h) {
     glad_glViewport(x, y, w, h);
     if (DrawTrace_Enabled()) DrawTrace_RecordViewport(w, h);
+    Blitter_OnViewport(x, y, w, h);
+}
+
+// Blitter state-shadow hooks: mirror the GL state a stock draw consumes so the
+// blitter can rasterize it itself. Each calls the real driver then records.
+static void GLUseProgram_b(GLuint p) { glad_glUseProgram(p); Blitter_OnUseProgram(p); }
+static void GLBindAttribLocation_b(GLuint p, GLuint i, const GLchar* n) {
+    glad_glBindAttribLocation(p, i, n); Blitter_OnBindAttribLocation(p, i, n);
+}
+static void GLBindBuffer_b(GLenum t, GLuint b) { glad_glBindBuffer(t, b); Blitter_OnBindBuffer(t, b); }
+static void GLBufferData_b(GLenum t, GLsizeiptr sz, const void* d, GLenum u) {
+    glad_glBufferData(t, sz, d, u); Blitter_OnBufferData(t, (uint32_t)sz, d);
+}
+static void GLBufferSubData_b(GLenum t, GLintptr off, GLsizeiptr sz, const void* d) {
+    glad_glBufferSubData(t, off, sz, d); Blitter_OnBufferSubData(t, (uint32_t)off, (uint32_t)sz, d);
+}
+static void GLVertexAttribPointer_b(GLuint i, GLint s, GLenum t, GLboolean n, GLsizei st, const void* p) {
+    glad_glVertexAttribPointer(i, s, t, n, st, p); Blitter_OnVertexAttribPointer(i, s, t, n, st, p);
+}
+static void GLEnableVertexAttribArray_b(GLuint i) { glad_glEnableVertexAttribArray(i); Blitter_OnEnableVertexAttrib(i, 1); }
+static void GLDisableVertexAttribArray_b(GLuint i) { glad_glDisableVertexAttribArray(i); Blitter_OnEnableVertexAttrib(i, 0); }
+static void GLBindTexture_b(GLenum t, GLuint tex) { glad_glBindTexture(t, tex); Blitter_OnBindTexture(t, tex); }
+static void GLTexImage2D_b(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h,
+                          GLint border, GLenum fmt, GLenum type, const void* px) {
+    glad_glTexImage2D(target, level, ifmt, w, h, border, fmt, type, px);
+    if (target == GL_TEXTURE_2D && level == 0) Blitter_OnTexImage2D(0, w, h, fmt, type, px);
+}
+static void GLBindFramebuffer_b(GLenum t, GLuint f) { glad_glBindFramebuffer(t, f); Blitter_OnBindFramebuffer(t, f); }
+static void GLFramebufferTexture2D_b(GLenum t, GLenum at, GLenum tt, GLuint tex, GLint lv) {
+    glad_glFramebufferTexture2D(t, at, tt, tex, lv); Blitter_OnFramebufferTexture2D(at, tex);
+}
+static void GLBlendFunc_b(GLenum s, GLenum d) { glad_glBlendFunc(s, d); Blitter_OnBlendState(-1, s, d); }
+static void GLBlendFuncSeparate_b(GLenum sR, GLenum dR, GLenum sA, GLenum dA) {
+    glad_glBlendFuncSeparate(sR, dR, sA, dA); Blitter_OnBlendState(-1, sR, dR);
+}
+static void GLEnable_b(GLenum c) { glad_glEnable(c); if (c == GL_BLEND) Blitter_OnBlendState(1, 0, 0); }
+static void GLDisable_b(GLenum c) { glad_glDisable(c); if (c == GL_BLEND) Blitter_OnBlendState(0, 0, 0); }
+static void GLUniformMatrix4fv_b(GLint loc, GLsizei count, GLboolean tr, const GLfloat* v) {
+    glad_glUniformMatrix4fv(loc, count, tr, v);
+    Blitter_OnUniformMatrix4fv(loc, count, v);
+}
+static GLint GLGetUniformLocation_b(GLuint p, const GLchar* n) {
+    GLint loc = glad_glGetUniformLocation(p, n);
+    Blitter_OnGetUniformLocation(p, n, loc);
+    return loc;
 }
 #else
 #define PTR_RESOLVE(x) resolve_thunked<&glad_##x>(#x, symtable_gles2_index, symtable_gles2, SDL_GL_GetProcAddress)
@@ -131,17 +179,41 @@ void load_gles2_funcs()
     glad_glActiveTexture = (PFNGLACTIVETEXTUREPROC)PTR_RESOLVE(glActiveTexture);
 	glad_glAttachShader = (PFNGLATTACHSHADERPROC)PTR_RESOLVE(glAttachShader);
 	glad_glBindAttribLocation = (PFNGLBINDATTRIBLOCATIONPROC)PTR_RESOLVE(glBindAttribLocation);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLBindAttribLocation_b;
+#endif
 	glad_glBindBuffer = (PFNGLBINDBUFFERPROC)PTR_RESOLVE(glBindBuffer);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLBindBuffer_b;
+#endif
 	glad_glBindFramebuffer = (PFNGLBINDFRAMEBUFFERPROC)PTR_RESOLVE(glBindFramebuffer);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLBindFramebuffer_b;
+#endif
 	glad_glBindRenderbuffer = (PFNGLBINDRENDERBUFFERPROC)PTR_RESOLVE(glBindRenderbuffer);
 	glad_glBindTexture = (PFNGLBINDTEXTUREPROC)PTR_RESOLVE(glBindTexture);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLBindTexture_b;
+#endif
 	glad_glBlendColor = (PFNGLBLENDCOLORPROC)PTR_RESOLVE(glBlendColor);
 	glad_glBlendEquation = (PFNGLBLENDEQUATIONPROC)PTR_RESOLVE(glBlendEquation);
 	glad_glBlendEquationSeparate = (PFNGLBLENDEQUATIONSEPARATEPROC)PTR_RESOLVE(glBlendEquationSeparate);
 	glad_glBlendFunc = (PFNGLBLENDFUNCPROC)PTR_RESOLVE(glBlendFunc);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLBlendFunc_b;
+#endif
 	glad_glBlendFuncSeparate = (PFNGLBLENDFUNCSEPARATEPROC)PTR_RESOLVE(glBlendFuncSeparate);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLBlendFuncSeparate_b;
+#endif
 	glad_glBufferData = (PFNGLBUFFERDATAPROC)PTR_RESOLVE(glBufferData);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLBufferData_b;
+#endif
 	glad_glBufferSubData = (PFNGLBUFFERSUBDATAPROC)PTR_RESOLVE(glBufferSubData);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLBufferSubData_b;
+#endif
 	glad_glCheckFramebufferStatus = (PFNGLCHECKFRAMEBUFFERSTATUSPROC)PTR_RESOLVE(glCheckFramebufferStatus);
 	glad_glClear = (PFNGLCLEARPROC)PTR_RESOLVE(glClear);
 #ifdef MISTER_NATIVE_VIDEO
@@ -170,7 +242,13 @@ void load_gles2_funcs()
 	glad_glDepthRangef = (PFNGLDEPTHRANGEFPROC)PTR_RESOLVE(glDepthRangef);
 	glad_glDetachShader = (PFNGLDETACHSHADERPROC)PTR_RESOLVE(glDetachShader);
 	glad_glDisable = (PFNGLDISABLEPROC)PTR_RESOLVE(glDisable);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLDisable_b;
+#endif
 	glad_glDisableVertexAttribArray = (PFNGLDISABLEVERTEXATTRIBARRAYPROC)PTR_RESOLVE(glDisableVertexAttribArray);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLDisableVertexAttribArray_b;
+#endif
 	glad_glDrawArrays = (PFNGLDRAWARRAYSPROC)PTR_RESOLVE(glDrawArrays);
 #ifdef MISTER_NATIVE_VIDEO
 	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLDrawArrays_trace;
@@ -180,11 +258,20 @@ void load_gles2_funcs()
 	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLDrawElements_trace;
 #endif
 	glad_glEnable = (PFNGLENABLEPROC)PTR_RESOLVE(glEnable);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLEnable_b;
+#endif
 	glad_glEnableVertexAttribArray = (PFNGLENABLEVERTEXATTRIBARRAYPROC)PTR_RESOLVE(glEnableVertexAttribArray);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLEnableVertexAttribArray_b;
+#endif
 	glad_glFinish = (PFNGLFINISHPROC)PTR_RESOLVE(glFinish);
 	glad_glFlush = (PFNGLFLUSHPROC)PTR_RESOLVE(glFlush);
 	glad_glFramebufferRenderbuffer = (PFNGLFRAMEBUFFERRENDERBUFFERPROC)PTR_RESOLVE(glFramebufferRenderbuffer);
 	glad_glFramebufferTexture2D = (PFNGLFRAMEBUFFERTEXTURE2DPROC)PTR_RESOLVE(glFramebufferTexture2D);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLFramebufferTexture2D_b;
+#endif
 	glad_glFrontFace = (PFNGLFRONTFACEPROC)PTR_RESOLVE(glFrontFace);
 	glad_glGenBuffers = (PFNGLGENBUFFERSPROC)PTR_RESOLVE(glGenBuffers);
 	glad_glGenerateMipmap = (PFNGLGENERATEMIPMAPPROC)PTR_RESOLVE(glGenerateMipmap);
@@ -214,6 +301,9 @@ void load_gles2_funcs()
 	glad_glGetUniformfv = (PFNGLGETUNIFORMFVPROC)PTR_RESOLVE(glGetUniformfv);
 	glad_glGetUniformiv = (PFNGLGETUNIFORMIVPROC)PTR_RESOLVE(glGetUniformiv);
 	glad_glGetUniformLocation = (PFNGLGETUNIFORMLOCATIONPROC)PTR_RESOLVE(glGetUniformLocation);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLGetUniformLocation_b;
+#endif
 	glad_glGetVertexAttribfv = (PFNGLGETVERTEXATTRIBFVPROC)PTR_RESOLVE(glGetVertexAttribfv);
 	glad_glGetVertexAttribiv = (PFNGLGETVERTEXATTRIBIVPROC)PTR_RESOLVE(glGetVertexAttribiv);
 	glad_glGetVertexAttribPointerv = (PFNGLGETVERTEXATTRIBPOINTERVPROC)PTR_RESOLVE(glGetVertexAttribPointerv);
@@ -244,6 +334,9 @@ void load_gles2_funcs()
 	glad_glStencilOp = (PFNGLSTENCILOPPROC)PTR_RESOLVE(glStencilOp);
 	glad_glStencilOpSeparate = (PFNGLSTENCILOPSEPARATEPROC)PTR_RESOLVE(glStencilOpSeparate);
 	glad_glTexImage2D = (PFNGLTEXIMAGE2DPROC)PTR_RESOLVE(glTexImage2D);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLTexImage2D_b;
+#endif
 	glad_glTexParameterf = (PFNGLTEXPARAMETERFPROC)PTR_RESOLVE(glTexParameterf);
 	glad_glTexParameterfv = (PFNGLTEXPARAMETERFVPROC)PTR_RESOLVE(glTexParameterfv);
 	glad_glTexParameteri = (PFNGLTEXPARAMETERIPROC)PTR_RESOLVE(glTexParameteri);
@@ -268,7 +361,13 @@ void load_gles2_funcs()
 	glad_glUniformMatrix2fv = (PFNGLUNIFORMMATRIX2FVPROC)PTR_RESOLVE(glUniformMatrix2fv);
 	glad_glUniformMatrix3fv = (PFNGLUNIFORMMATRIX3FVPROC)PTR_RESOLVE(glUniformMatrix3fv);
 	glad_glUniformMatrix4fv = (PFNGLUNIFORMMATRIX4FVPROC)PTR_RESOLVE(glUniformMatrix4fv);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLUniformMatrix4fv_b;
+#endif
 	glad_glUseProgram = (PFNGLUSEPROGRAMPROC)PTR_RESOLVE(glUseProgram);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLUseProgram_b;
+#endif
 	glad_glValidateProgram = (PFNGLVALIDATEPROGRAMPROC)PTR_RESOLVE(glValidateProgram);
 	glad_glVertexAttrib1f = (PFNGLVERTEXATTRIB1FPROC)PTR_RESOLVE(glVertexAttrib1f);
 	glad_glVertexAttrib1fv = (PFNGLVERTEXATTRIB1FVPROC)PTR_RESOLVE(glVertexAttrib1fv);
@@ -279,6 +378,9 @@ void load_gles2_funcs()
 	glad_glVertexAttrib4f = (PFNGLVERTEXATTRIB4FPROC)PTR_RESOLVE(glVertexAttrib4f);
 	glad_glVertexAttrib4fv = (PFNGLVERTEXATTRIB4FVPROC)PTR_RESOLVE(glVertexAttrib4fv);
 	glad_glVertexAttribPointer = (PFNGLVERTEXATTRIBPOINTERPROC)PTR_RESOLVE(glVertexAttribPointer);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLVertexAttribPointer_b;
+#endif
 	glad_glViewport = (PFNGLVIEWPORTPROC)PTR_RESOLVE(glViewport);
 #ifdef MISTER_NATIVE_VIDEO
 	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLViewport_trace;
