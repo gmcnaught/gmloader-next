@@ -97,6 +97,9 @@ int Blitter_TryDrawElements(GLenum mode, GLsizei count, GLenum type, const void 
 const uint8_t *Blitter_PresentDefault(void);
 // Convert a bottom-up RGBA8888 320x240 buffer to top-down RGB565 for the DDR writer.
 void Blitter_ToRGB565(const uint8_t *src_rgba, uint16_t *dst);
+// Per-frame profiler (env GMLOADER_BLITTER_PROF=1): logs raster/clear/texup/present/
+// logic ms. process_ns is the RunnerJNILib::Process() wall time for the frame.
+void Blitter_ProfFrameEnd(uint64_t process_ns);
 // Clear the current render-target surface; returns 1 if it owned the clear (caller
 // then skips the real glClear), 0 otherwise.
 int  Blitter_OnClear(GLbitfield mask);

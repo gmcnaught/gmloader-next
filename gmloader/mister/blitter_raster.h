@@ -70,5 +70,12 @@ struct BVtx {
 void Blitter_RasterTri(RSurface *dst, const BVtx v[3], const RTexture *tex,
                        RBlend blend, float alphaRef);
 
+// Rasterize a list of triangles (3 BVtx each: count*3 verts) into dst, splitting
+// the work across `threads` cores by horizontal scanline bands. Pixel-identical
+// to calling Blitter_RasterTri per triangle. threads<=1 => single-threaded.
+void Blitter_RasterDraw(RSurface *dst, const BVtx *verts, int triCount,
+                        const RTexture *tex, RBlend blend, float alphaRef,
+                        int threads);
+
 // Fill the whole surface with a colour (used for clears).
 void Blitter_ClearSurface(RSurface *s, uint8_t r, uint8_t g, uint8_t b, uint8_t a);

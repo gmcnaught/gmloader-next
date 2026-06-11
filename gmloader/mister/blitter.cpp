@@ -17,10 +17,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 #include <map>
 #include <string>
 #include <array>
 #include <vector>
+
+static inline uint64_t bl_now_ns() {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+// Per-frame profiler buckets (env GMLOADER_BLITTER_PROF=1). GMLOADER_BLITTER_NOTEX=1
+// forces the rasterizer to skip the texture fetch (samples white) to isolate the
+// texture-sampling cost from raster overhead.
+static int      g_prof = 0, g_notex = 0;
+static int      g_threads = 1;   // GMLOADER_BLITTER_THREADS (rasterizer worker cores)
+static uint64_t g_pf_raster = 0, g_pf_clear = 0, g_pf_tex = 0, g_pf_present = 0;
+static uint32_t g_pf_draws = 0, g_pf_tris = 0, g_pf_frame = 0;
 
 #ifndef MISTER_WIDTH
 #define MISTER_WIDTH  320
@@ -44,6 +57,11 @@ void Blitter_Init(void) {
     g_level   = e ? atoi(e) : 0;
     g_enabled = g_level >= 1;
     g_own     = g_level >= 2;
+    g_prof    = getenv("GMLOADER_BLITTER_PROF") ? 1 : 0;
+    g_notex   = getenv("GMLOADER_BLITTER_NOTEX") ? 1 : 0;
+    { const char *th = getenv("GMLOADER_BLITTER_THREADS");
+      g_threads = th ? atoi(th) : 1;
+      if (g_threads < 1) g_threads = 1; else if (g_threads > 4) g_threads = 4; }
     g_rw = MISTER_WIDTH; g_rh = MISTER_HEIGHT;
     if (g_own) {   // render-size override only applies when the blitter presents
         const char *rw = getenv("GMLOADER_RENDER_W"), *rh = getenv("GMLOADER_RENDER_H");
@@ -130,8 +148,10 @@ void store_texture(GLuint id, int w, int h, GLenum fmt, GLenum type, const void 
     if (!px || w <= 0 || h <= 0) return;            // allocated-but-unfilled (FBO target)
     if (type == GL_UNSIGNED_BYTE && (fmt == GL_RGBA)) {
         size_t n = (size_t)w * h * 4;
+        uint64_t _t0 = g_prof ? bl_now_ns() : 0;
         t.rgba = (uint8_t *)malloc(n);
         if (t.rgba) { memcpy(t.rgba, px, n); t.valid = 1; }
+        if (g_prof) g_pf_tex += bl_now_ns() - _t0;
     }
     // other formats (RGB, LUMINANCE, compressed) -> leave invalid; such draws
     // will fall back to GL. The log reports the format so we know what to add.
@@ -336,8 +356,11 @@ void Blitter_OnScissor(int, int, int, int, int) {}
 int Blitter_OnClear(GLbitfield) {
     if (!g_own) return 0;
     RSurface rt;
-    if (get_render_target(&rt))
+    if (get_render_target(&rt)) {
+        uint64_t _t0 = g_prof ? bl_now_ns() : 0;
         memset(rt.rgba, 0, (size_t)rt.w * rt.h * 4);   // clear to transparent black
+        if (g_prof) g_pf_clear += bl_now_ns() - _t0;
+    }
     return 1;   // cleared ourselves — caller skips the (slow) GL clear
 }
 
@@ -403,9 +426,11 @@ static int handle_draw(const char *kind, GLenum mode, int count,
         RSurface rt; RBlend blend;
         if (get_render_target(&rt) && get_rblend(&blend)) {
             RTexture tex; get_rtexture(&tex);
-            if (tex.valid) {
-                for (int t = 0; t + 2 < count; t += 3)
-                    Blitter_RasterTri(&rt, &s_verts[t], &tex, blend, 0.0f);
+            if (g_notex) tex.valid = 0;   // probe: skip texture fetch -> samples white
+            if (tex.valid || g_notex) {
+                uint64_t _t0 = g_prof ? bl_now_ns() : 0;
+                Blitter_RasterDraw(&rt, &s_verts[0], count / 3, &tex, blend, 0.0f, g_threads);
+                if (g_prof) { g_pf_raster += bl_now_ns() - _t0; g_pf_draws++; g_pf_tris += count/3; }
                 rast = 1;
             }
         }
@@ -445,6 +470,7 @@ void Blitter_ToRGB565(const uint8_t *src_rgba, uint16_t *dst) {
     // is MISTER_WIDTH x MISTER_HEIGHT top-down. Center (letterbox) src into dst
     // 1:1 with a black border, flipping rows top<->bottom. No scaling => no
     // resampling artifacts.
+    uint64_t _t0 = g_prof ? bl_now_ns() : 0;
     const int ox = (MISTER_WIDTH  - g_rw) / 2;
     const int oy = (MISTER_HEIGHT - g_rh) / 2;
     memset(dst, 0, (size_t)MISTER_WIDTH * MISTER_HEIGHT * 2);   // borders = black
@@ -456,6 +482,22 @@ void Blitter_ToRGB565(const uint8_t *src_rgba, uint16_t *dst) {
             d[x] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
         }
     }
+    if (g_prof) g_pf_present += bl_now_ns() - _t0;
+}
+
+void Blitter_ProfFrameEnd(uint64_t process_ns) {
+    if (!g_prof) return;
+    g_pf_frame++;
+    uint64_t bl = g_pf_raster + g_pf_clear + g_pf_tex;
+    uint64_t logic = process_ns > bl ? process_ns - bl : 0;   // GM VM + non-blitter GL
+    if (g_pf_frame % 30 == 0) {
+        fprintf(stderr, "BLITPROF f=%u draws=%u tris=%u | raster=%.1f clear=%.1f "
+                "texup=%.1f present=%.1f logic=%.1f ms%s\n",
+                g_pf_frame, g_pf_draws, g_pf_tris, g_pf_raster/1e6, g_pf_clear/1e6,
+                g_pf_tex/1e6, g_pf_present/1e6, logic/1e6, g_notex ? " [NOTEX]" : "");
+    }
+    g_pf_raster = g_pf_clear = g_pf_tex = g_pf_present = 0;
+    g_pf_draws = g_pf_tris = 0;
 }
 
 #endif // MISTER_NATIVE_VIDEO

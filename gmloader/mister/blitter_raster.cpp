@@ -9,6 +9,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stddef.h>   // size_t
+#include <pthread.h>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -207,9 +208,18 @@ static inline void blit_span(const QuadSetup &q, uint8_t *row, int x0, int x1,
 // pixel/row (DDA). The edge functions are int64 fixed-point (snapped from the
 // float setup); the per-pixel attributes (u,v in texel units, r,g,b,a in 0..255)
 // are 16.16 integer. The whole inner loop is integer — no per-pixel float ops.
-void Blitter_RasterTri(RSurface *dst, const BVtx v[3], const RTexture *tex,
-                       RBlend blend, float alphaRef) {
+// Rasterize one triangle, but only for destination rows in the half-open band
+// [yLo,yHi).  The band clamp is applied AFTER bbox clipping and uses the same
+// half-open convention as the bbox/top-left fill, so a triangle spanning a band
+// boundary is covered by exactly one band (the row y belongs to the band whose
+// [yLo,yHi) contains it).  yLo/yHi are expected pre-clamped to [0,dst->h] by the
+// caller, but we clamp defensively anyway.
+static void raster_tri_rows(RSurface *dst, const BVtx v[3], const RTexture *tex,
+                            RBlend blend, float alphaRef, int yLo, int yHi) {
     if (!dst || !dst->rgba || dst->w <= 0 || dst->h <= 0) return;
+    if (yLo < 0) yLo = 0;
+    if (yHi > dst->h) yHi = dst->h;
+    if (yLo >= yHi) return;
 
     const BVtx &v0 = v[0], &v1 = v[1], &v2 = v[2];
 
@@ -234,7 +244,16 @@ void Blitter_RasterTri(RSurface *dst, const BVtx v[3], const RTexture *tex,
     if (miny < 0) miny = 0;
     if (maxx > dst->w) maxx = dst->w;
     if (maxy > dst->h) maxy = dst->h;
-    if (minx >= maxx || miny >= maxy) return;
+    // `miny`/`minx` anchor the float edge/attribute setup below and MUST be
+    // band-independent so every band reproduces the single-threaded float
+    // expressions (and thus the identical `lrintf` LSBs) for a given row y.
+    // The band only restricts which rows we iterate, via [bandLo,bandHi).
+    int bandLo = miny, bandHi = maxy;
+    if (bandLo < yLo) bandLo = yLo;
+    if (bandHi > yHi) bandHi = yHi;
+    // Half-open band clamp: disjoint bands tile the triangle exactly — no
+    // double-write, no gap at the boundary.
+    if (minx >= maxx || bandLo >= bandHi) return;
 
     bool tl0 = is_top_left(v1.x, v1.y, v2.x, v2.y);
     bool tl1 = is_top_left(v2.x, v2.y, v0.x, v0.y);
@@ -345,8 +364,8 @@ void Blitter_RasterTri(RSurface *dst, const BVtx v[3], const RTexture *tex,
         if (hi < lo) hi = lo;
     };
 
-    for (int y = miny; y < maxy; ++y) {
-        int dy = y - miny;
+    for (int y = bandLo; y < bandHi; ++y) {
+        int dy = y - miny;   // anchored at bbox miny (band-independent setup)
         int64_t e0r = e0o + e0dy*dy, e1r = e1o + e1dy*dy, e2r = e2o + e2dy*dy;
         uint8_t *row = dst->rgba + (size_t)y * (size_t)dst->w * 4;
 
@@ -368,4 +387,163 @@ void Blitter_RasterTri(RSurface *dst, const BVtx v[3], const RTexture *tex,
         blit_span(q, row, minx+lo, minx+hi, blend, aref,
                   u, vv, cr, cg, cb, ca, uX, vX, rX, gX, bX, aX);
     }
+}
+
+// ---- public: rasterize one triangle (single-threaded, whole surface) ---------
+void Blitter_RasterTri(RSurface *dst, const BVtx v[3], const RTexture *tex,
+                       RBlend blend, float alphaRef) {
+    if (!dst) return;
+    raster_tri_rows(dst, v, tex, blend, alphaRef, 0, dst->h);
+}
+
+// ---- persistent worker thread pool ------------------------------------------
+// Created lazily on the first multi-threaded draw and reused for every draw and
+// frame thereafter (never spawned per-draw).  N workers are joined to the
+// calling thread for one band each: the caller rasterizes band 0 itself and the
+// pool covers bands 1..N-1, so a 2-thread draw uses 1 worker + the caller.
+namespace {
+
+struct DrawJob {
+    RSurface       *dst;
+    const BVtx     *verts;
+    int             triCount;
+    const RTexture *tex;
+    RBlend          blend;
+    float           alphaRef;
+    int             yLo, yHi;   // this worker's band
+};
+
+struct RasterPool {
+    static const int kMaxWorkers = 8;      // workers excluding the caller thread
+
+    pthread_mutex_t mtx   = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t  wake  = PTHREAD_COND_INITIALIZER;   // workers wait for work
+    pthread_cond_t  done  = PTHREAD_COND_INITIALIZER;   // caller waits for finish
+
+    pthread_t       tid[kMaxWorkers];
+    DrawJob         job[kMaxWorkers];
+    int             nWorkers   = 0;   // spawned worker threads
+    uint64_t        generation = 0;   // bumped each dispatch; workers compare against seen
+    uint64_t        seen[kMaxWorkers];
+    int             pending    = 0;   // workers still processing the current generation
+    bool            shutdown   = false;
+
+    void rasterizeBand(const DrawJob &j) {
+        for (int t = 0; t < j.triCount; ++t)
+            raster_tri_rows(j.dst, j.verts + (size_t)t * 3, j.tex, j.blend,
+                            j.alphaRef, j.yLo, j.yHi);
+    }
+};
+
+static RasterPool g_pool;
+
+struct WorkerArg { RasterPool *pool; int idx; };
+static WorkerArg g_workerArgs[RasterPool::kMaxWorkers];
+
+static void *worker_main(void *vp) {
+    WorkerArg *wa = (WorkerArg *)vp;
+    RasterPool *p = wa->pool;
+    int idx = wa->idx;
+    for (;;) {
+        pthread_mutex_lock(&p->mtx);
+        while (!p->shutdown && p->seen[idx] == p->generation)
+            pthread_cond_wait(&p->wake, &p->mtx);
+        if (p->shutdown) { pthread_mutex_unlock(&p->mtx); break; }
+        DrawJob j = p->job[idx];          // copy the job out under the lock
+        p->seen[idx] = p->generation;
+        pthread_mutex_unlock(&p->mtx);
+
+        p->rasterizeBand(j);              // rasterize OUTSIDE the lock (parallel)
+
+        pthread_mutex_lock(&p->mtx);
+        if (--p->pending == 0) pthread_cond_signal(&p->done);
+        pthread_mutex_unlock(&p->mtx);
+    }
+    return nullptr;
+}
+
+// Ensure at least `want` worker threads exist (caller holds no lock).
+static void pool_ensure_workers(int want) {
+    if (want > RasterPool::kMaxWorkers) want = RasterPool::kMaxWorkers;
+    pthread_mutex_lock(&g_pool.mtx);
+    while (g_pool.nWorkers < want) {
+        int i = g_pool.nWorkers;
+        g_pool.seen[i] = g_pool.generation;   // start in sync (no pending work)
+        g_workerArgs[i].pool = &g_pool;
+        g_workerArgs[i].idx  = i;
+        if (pthread_create(&g_pool.tid[i], nullptr, worker_main, &g_workerArgs[i]) != 0)
+            break;                            // out of threads: run with fewer
+        ++g_pool.nWorkers;
+    }
+    pthread_mutex_unlock(&g_pool.mtx);
+}
+
+} // namespace
+
+// ---- public: rasterize a whole draw, optionally across cores -----------------
+void Blitter_RasterDraw(RSurface *dst, const BVtx *verts, int triCount,
+                        const RTexture *tex, RBlend blend, float alphaRef,
+                        int threads) {
+    if (!dst || !dst->rgba || dst->w <= 0 || dst->h <= 0) return;
+    if (!verts || triCount <= 0) return;
+
+    // Decide the parallel width.  Cap by surface height (need >=1 row per band)
+    // and by a small-work threshold where pool overhead would dominate.
+    int H = dst->h;
+    int maxBands = RasterPool::kMaxWorkers + 1;   // caller + workers
+    if (threads > maxBands) threads = maxBands;
+    if (threads > H)        threads = H;
+    bool tiny = (triCount < 2) || ((int64_t)dst->w * H < 64 * 64);
+    if (threads <= 1 || tiny) {
+        for (int t = 0; t < triCount; ++t)
+            raster_tri_rows(dst, verts + (size_t)t * 3, tex, blend, alphaRef, 0, H);
+        return;
+    }
+
+    int nBands = threads;
+    int nWork  = nBands - 1;               // worker threads needed (caller does band 0)
+    pool_ensure_workers(nWork);
+
+    // If we couldn't get all workers, fall back to however many we actually have.
+    if (g_pool.nWorkers < nWork) nWork = g_pool.nWorkers;
+    nBands = nWork + 1;
+    if (nBands <= 1) {                      // no workers available at all
+        for (int t = 0; t < triCount; ++t)
+            raster_tri_rows(dst, verts + (size_t)t * 3, tex, blend, alphaRef, 0, H);
+        return;
+    }
+
+    // Contiguous, disjoint, gap-free row bands tiling [0,H).
+    auto bandLo = [&](int b) { return (int)((int64_t)H * b / nBands); };
+
+    pthread_mutex_lock(&g_pool.mtx);
+    ++g_pool.generation;
+    g_pool.pending = nWork;
+    // Workers NOT dispatched this generation must stay parked: pre-mark their
+    // `seen` to the new generation so the broadcast doesn't make them grab a
+    // stale job or touch `pending`.
+    for (int w = nWork; w < g_pool.nWorkers; ++w)
+        g_pool.seen[w] = g_pool.generation;
+    for (int b = 1; b < nBands; ++b) {     // bands 1..nBands-1 -> workers
+        int w = b - 1;
+        DrawJob &j = g_pool.job[w];
+        j.dst = dst; j.verts = verts; j.triCount = triCount;
+        j.tex = tex; j.blend = blend; j.alphaRef = alphaRef;
+        j.yLo = bandLo(b); j.yHi = bandLo(b + 1);
+        // Leave job[w].seen behind the new generation so worker w wakes for it.
+        g_pool.seen[w] = g_pool.generation - 1;
+    }
+    pthread_cond_broadcast(&g_pool.wake);
+    pthread_mutex_unlock(&g_pool.mtx);
+
+    // The caller thread rasterizes band 0 concurrently with the workers.
+    for (int t = 0; t < triCount; ++t)
+        raster_tri_rows(dst, verts + (size_t)t * 3, tex, blend, alphaRef,
+                        bandLo(0), bandLo(1));
+
+    // Barrier: wait for all worker bands of this generation to finish.
+    pthread_mutex_lock(&g_pool.mtx);
+    while (g_pool.pending != 0)
+        pthread_cond_wait(&g_pool.done, &g_pool.mtx);
+    pthread_mutex_unlock(&g_pool.mtx);
 }

@@ -578,6 +578,7 @@ int main(int argc, char *argv[])
           }
         }
         DrawTrace_FrameEnd(_dt_p1 - _dt_p0, DrawTrace_NowNs() - _dt_p1);
+        Blitter_ProfFrameEnd(_dt_p1 - _dt_p0);
         // Frame-rate cap: the blitter can run the game far above 60Hz, which
         // races the game's logic/intro and triggers relaunch loops. Pace the
         // loop (and therefore the runner's game logic) to ~60fps. Override with
