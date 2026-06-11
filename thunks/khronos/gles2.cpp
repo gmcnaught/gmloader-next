@@ -22,6 +22,7 @@ static bool should_dump_shaders = false;
 
 #ifdef MISTER_NATIVE_VIDEO
 #include <dlfcn.h>
+#include "gmloader/mister/draw_trace.h"
 // Defined in main.cpp — handle to bundled libGLES_sw.so
 extern void* g_gles_handle;
 static void* mister_gles2_resolver(const char* name) {
@@ -30,6 +31,32 @@ static void* mister_gles2_resolver(const char* name) {
     return sym ? sym : dlsym(RTLD_DEFAULT, name);
 }
 #define PTR_RESOLVE(x) resolve_thunked<&glad_##x>(#x, symtable_gles2_index, symtable_gles2, mister_gles2_resolver)
+
+// Phase-0 draw tracer: time each draw and report it; falls straight through to
+// the real driver when GMLOADER_DRAW_TRACE is unset. This is also the hook point
+// the future 2D blitter will replace.
+static void GLDrawArrays_trace(GLenum mode, GLint first, GLsizei count) {
+    if (!DrawTrace_Enabled()) { glad_glDrawArrays(mode, first, count); return; }
+    uint64_t t0 = DrawTrace_NowNs();
+    glad_glDrawArrays(mode, first, count);
+    DrawTrace_RecordDraw(DrawTrace_NowNs() - t0, count, mode == GL_TRIANGLES);
+}
+static void GLDrawElements_trace(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+    if (!DrawTrace_Enabled()) { glad_glDrawElements(mode, count, type, indices); return; }
+    uint64_t t0 = DrawTrace_NowNs();
+    glad_glDrawElements(mode, count, type, indices);
+    DrawTrace_RecordDraw(DrawTrace_NowNs() - t0, count, mode == GL_TRIANGLES);
+}
+static void GLClear_trace(GLbitfield mask) {
+    if (!DrawTrace_Enabled()) { glad_glClear(mask); return; }
+    uint64_t t0 = DrawTrace_NowNs();
+    glad_glClear(mask);
+    DrawTrace_RecordClear(DrawTrace_NowNs() - t0);
+}
+static void GLViewport_trace(GLint x, GLint y, GLsizei w, GLsizei h) {
+    glad_glViewport(x, y, w, h);
+    if (DrawTrace_Enabled()) DrawTrace_RecordViewport(w, h);
+}
 #else
 #define PTR_RESOLVE(x) resolve_thunked<&glad_##x>(#x, symtable_gles2_index, symtable_gles2, SDL_GL_GetProcAddress)
 #endif
@@ -117,6 +144,9 @@ void load_gles2_funcs()
 	glad_glBufferSubData = (PFNGLBUFFERSUBDATAPROC)PTR_RESOLVE(glBufferSubData);
 	glad_glCheckFramebufferStatus = (PFNGLCHECKFRAMEBUFFERSTATUSPROC)PTR_RESOLVE(glCheckFramebufferStatus);
 	glad_glClear = (PFNGLCLEARPROC)PTR_RESOLVE(glClear);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLClear_trace;
+#endif
 	glad_glClearColor = (PFNGLCLEARCOLORPROC)PTR_RESOLVE(glClearColor);
 	glad_glClearDepthf = (PFNGLCLEARDEPTHFPROC)PTR_RESOLVE(glClearDepthf);
 	glad_glClearStencil = (PFNGLCLEARSTENCILPROC)PTR_RESOLVE(glClearStencil);
@@ -142,7 +172,13 @@ void load_gles2_funcs()
 	glad_glDisable = (PFNGLDISABLEPROC)PTR_RESOLVE(glDisable);
 	glad_glDisableVertexAttribArray = (PFNGLDISABLEVERTEXATTRIBARRAYPROC)PTR_RESOLVE(glDisableVertexAttribArray);
 	glad_glDrawArrays = (PFNGLDRAWARRAYSPROC)PTR_RESOLVE(glDrawArrays);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLDrawArrays_trace;
+#endif
 	glad_glDrawElements = (PFNGLDRAWELEMENTSPROC)PTR_RESOLVE(glDrawElements);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLDrawElements_trace;
+#endif
 	glad_glEnable = (PFNGLENABLEPROC)PTR_RESOLVE(glEnable);
 	glad_glEnableVertexAttribArray = (PFNGLENABLEVERTEXATTRIBARRAYPROC)PTR_RESOLVE(glEnableVertexAttribArray);
 	glad_glFinish = (PFNGLFINISHPROC)PTR_RESOLVE(glFinish);
@@ -244,6 +280,9 @@ void load_gles2_funcs()
 	glad_glVertexAttrib4fv = (PFNGLVERTEXATTRIB4FVPROC)PTR_RESOLVE(glVertexAttrib4fv);
 	glad_glVertexAttribPointer = (PFNGLVERTEXATTRIBPOINTERPROC)PTR_RESOLVE(glVertexAttribPointer);
 	glad_glViewport = (PFNGLVIEWPORTPROC)PTR_RESOLVE(glViewport);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLViewport_trace;
+#endif
 	glad_glRenderbufferStorageMultisampleAdvancedAMD = (PFNGLRENDERBUFFERSTORAGEMULTISAMPLEADVANCEDAMDPROC)PTR_RESOLVE(glRenderbufferStorageMultisampleAdvancedAMD);
 	glad_glNamedRenderbufferStorageMultisampleAdvancedAMD = (PFNGLNAMEDRENDERBUFFERSTORAGEMULTISAMPLEADVANCEDAMDPROC)PTR_RESOLVE(glNamedRenderbufferStorageMultisampleAdvancedAMD);
 	glad_glGetPerfMonitorGroupsAMD = (PFNGLGETPERFMONITORGROUPSAMDPROC)PTR_RESOLVE(glGetPerfMonitorGroupsAMD);

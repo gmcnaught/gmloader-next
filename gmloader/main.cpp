@@ -24,6 +24,7 @@
 #include <libgen.h>
 #include "mister/native_video_writer.h"
 #include "mister/frame_capture.h"
+#include "mister/draw_trace.h"
 // Global handle to bundled libGLES_sw.so — also used by egl.cpp and gles2.cpp via extern
 void* g_gles_handle = nullptr;
 #endif
@@ -508,6 +509,7 @@ int main(int argc, char *argv[])
         SDL_GetWindowSize(sdl_win, &init_w, &init_h);
         FrameCapture_Init(init_w, init_h);
     }
+    DrawTrace_Init();
 #endif
 
     while (cont != 0 && cont != 2 && RunnerJNILib_MoveTaskToBackCalled == 0 && relaunch_flag == 0) {
@@ -518,7 +520,9 @@ int main(int argc, char *argv[])
             break;
         SDL_GetWindowSize(sdl_win, &w, &h);
 #ifdef MISTER_NATIVE_VIDEO
+        uint64_t _dt_p0 = DrawTrace_NowNs();
         cont = RunnerJNILib::Process(env, 0, MISTER_WIDTH, MISTER_HEIGHT, 0, 0, 0, 0, 0, 60);
+        uint64_t _dt_p1 = DrawTrace_NowNs();
         if (RunnerJNILib::canFlip(env, 0)) {
             FrameCapture_ReadFrame();
 
@@ -548,6 +552,7 @@ int main(int argc, char *argv[])
                 SDL_RenderPresent(sdl_renderer);
             }
         }
+        DrawTrace_FrameEnd(_dt_p1 - _dt_p0, DrawTrace_NowNs() - _dt_p1);
 #else
         cont = RunnerJNILib::Process(env, 0, w, h, 0, 0, 0, 0, 0, 60);
         if (RunnerJNILib::canFlip(env, 0))
