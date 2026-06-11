@@ -12,6 +12,7 @@
 
 #include "blitter.h"
 #include "blitter_raster.h"
+#include "configuration.h"   // gmloader_config.blitter (default level)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,8 +61,10 @@ static int      g_rw = MISTER_WIDTH, g_rh = MISTER_HEIGHT;  // render size (<= D
 static uint8_t *g_defSurf = nullptr;   // default framebuffer, RGBA8888, GL bottom-up
 
 void Blitter_Init(void) {
+    // Level comes from gmloader.json ("blitter"); env GMLOADER_BLITTER overrides
+    // it when set (for dev A/B). Default 0 (off) if neither is given.
     const char *e = getenv("GMLOADER_BLITTER");
-    g_level   = e ? atoi(e) : 0;
+    g_level   = e ? atoi(e) : gmloader_config.blitter;
     g_enabled = g_level >= 1;
     g_own     = g_level >= 2;
     g_prof    = getenv("GMLOADER_BLITTER_PROF") ? 1 : 0;

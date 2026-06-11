@@ -11,6 +11,7 @@ struct gml_config {
     std::string save_dir;
     std::string apk_path;
     std::string shader_dir;
+    std::string controller_db;   // optional path to an SDL gamecontrollerdb.txt
     bool show_cursor;
     bool disable_controller;
     bool disable_depth;
@@ -20,6 +21,8 @@ struct gml_config {
     bool disable_texhack;
     float rumble_scale;
     std::string force_platform;
+    int blitter;   // MiSTer software blitter level: 0 off, 1 shadow+GL, 2 owning.
+                   // Env GMLOADER_BLITTER overrides this when set.
 
     friend void from_json(const json& j, gml_config& c);
     void init_defaults();

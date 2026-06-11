@@ -310,6 +310,29 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    // Load an SDL controller-mapping DB so pads not in SDL's built-in list are
+    // recognized as GameControllers (update_inputs only handles the GameController
+    // API — an unmapped pad would never raise CONTROLLERDEVICEADDED). Try the
+    // configured path first, then conventional locations next to the binary and in
+    // save_dir. SDL also auto-applies the SDL_GAMECONTROLLERCONFIG env var on init.
+    {
+        std::string candidates[] = {
+            gmloader_config.controller_db,
+            "gamecontrollerdb.txt",
+            (fs::path(gmloader_config.save_dir) / "gamecontrollerdb.txt").string(),
+        };
+        for (const std::string &p : candidates) {
+            if (p.empty() || !fs::exists(p)) continue;
+            int n = SDL_GameControllerAddMappingsFromFile(p.c_str());
+            if (n < 0) {
+                warning("Controller DB '%s' failed to load: %s\n", p.c_str(), SDL_GetError());
+            } else {
+                warning("Loaded %d controller mapping(s) from %s\n", n, p.c_str());
+            }
+            break;   // first existing file wins
+        }
+    }
+
     if(gmloader_config.show_cursor == 0) {
         if (SDL_ShowCursor(SDL_DISABLE) < 0) {
             warning("Cannot disable cursor: %s\n", SDL_GetError());
