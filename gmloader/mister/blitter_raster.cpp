@@ -140,6 +140,7 @@ void Blitter_ClearSurface(RSurface *s, uint8_t r, uint8_t g, uint8_t b, uint8_t 
 struct QuadSetup {
     int hasTex, tw, th;
     const uint8_t *tpix;
+    int fmt16;       // 1 = tpix is packed RGBA4444 (2 bytes/texel), else RGBA8888
     bool whiteCol;   // vertex colour is all 255 -> skip modulate
 };
 
@@ -156,12 +157,98 @@ static inline void produce_src(const QuadSetup &q, int32_t u, int32_t vv,
     if (q.hasTex) {
         int tx = (u >> FXSH) % q.tw; if (tx < 0) tx += q.tw;
         int ty = (vv >> FXSH) % q.th; if (ty < 0) ty += q.th;
-        const uint8_t *tp = q.tpix + ((size_t)ty * q.tw + tx) * 4;
-        if (q.whiteCol) { sr=tp[0]; sg=tp[1]; sb=tp[2]; sa=tp[3]; }
-        else { sr=div255(tp[0]*ccr); sg=div255(tp[1]*ccg);
-               sb=div255(tp[2]*ccb); sa=div255(tp[3]*cca); }
+        size_t ti = (size_t)ty * q.tw + tx;
+        int tr, tg, tb, ta;
+        if (q.fmt16) {
+            // RGBA4444: one uint16 per texel; expand each nibble to 8-bit by
+            // replication (0->0, 0xF->0xFF) so the dynamic range is preserved.
+            uint16_t p = ((const uint16_t *)q.tpix)[ti];
+            int r4=(p>>12)&0xF, g4=(p>>8)&0xF, b4=(p>>4)&0xF, a4=p&0xF;
+            tr=(r4<<4)|r4; tg=(g4<<4)|g4; tb=(b4<<4)|b4; ta=(a4<<4)|a4;
+        } else {
+            const uint8_t *tp = q.tpix + ti * 4;
+            tr=tp[0]; tg=tp[1]; tb=tp[2]; ta=tp[3];
+        }
+        if (q.whiteCol) { sr=tr; sg=tg; sb=tb; sa=ta; }
+        else { sr=div255(tr*ccr); sg=div255(tg*ccg);
+               sb=div255(tb*ccb); sa=div255(ta*cca); }
     } else { sr=ccr; sg=ccg; sb=ccb; sa=cca; }
 }
+
+#if defined(__ARM_NEON)
+// Vectorized counterpart to produce_src for 8 consecutive pixels.  Reproduces the
+// scalar pipeline bit-for-bit but pushes the modulate + attribute stepping +
+// alpha test into NEON; only the nearest texel gather stays scalar (ARMv7-A NEON
+// has no gather).  Inputs are the 16.16 accumulators for lane 0 (u..ca) and the
+// per-pixel x-steps (uX..aX); lane k carries (acc + k*step), matching the scalar
+// loop's `acc += step` exactly (int32 wraparound included via vaddq_s32).  Writes
+// de-interleaved source channel vectors (8x u8) plus the coverage mask `cov`
+// (0xFF keep / 0x00 discard) from the alpha test sa>aref.
+// RGBA8888 only: the caller skips this path when q.fmt16 (RGBA4444), which the
+// scalar produce_src handles (NEON gather here assumes 4 bytes/texel).
+static inline void produce_src8_neon(const QuadSetup &q,
+                                     int32_t u, int32_t vv,
+                                     int32_t cr, int32_t cg, int32_t cb, int32_t ca,
+                                     int32_t uX, int32_t vX,
+                                     int32_t rX, int32_t gX, int32_t bX, int32_t aX,
+                                     int aref,
+                                     uint8x8_t &sr, uint8x8_t &sg,
+                                     uint8x8_t &sb, uint8x8_t &sa,
+                                     uint8x8_t &cov) {
+    // lane offsets {0,1,2,3} and {4,5,6,7} for base + lane*step.
+    static const int32_t kLane0123[4] = {0,1,2,3};
+    static const int32_t kLane4567[4] = {4,5,6,7};
+    int32x4_t l0 = vld1q_s32(kLane0123), l1 = vld1q_s32(kLane4567);
+
+    // Modulating vertex colour, clamped to 0..255 (matches clampi(c>>FXSH,0,255)).
+    // vshrq_n_s32 is an arithmetic shift, identical to the scalar `>>FXSH`.
+    auto col8 = [&](int32_t c, int32_t step) -> uint8x8_t {
+        int32x4_t s = vdupq_n_s32(step);
+        int32x4_t v0 = vaddq_s32(vdupq_n_s32(c), vmulq_s32(l0, s));
+        int32x4_t v1 = vaddq_s32(vdupq_n_s32(c), vmulq_s32(l1, s));
+        v0 = vshrq_n_s32(v0, FXSH); v1 = vshrq_n_s32(v1, FXSH);
+        v0 = vmaxq_s32(v0, vdupq_n_s32(0));   v1 = vmaxq_s32(v1, vdupq_n_s32(0));
+        v0 = vminq_s32(v0, vdupq_n_s32(255)); v1 = vminq_s32(v1, vdupq_n_s32(255));
+        // narrow s32 -> u16 -> u8 (values are 0..255, so plain narrows are exact).
+        uint16x8_t w = vcombine_u16(vmovn_u32(vreinterpretq_u32_s32(v0)),
+                                    vmovn_u32(vreinterpretq_u32_s32(v1)));
+        return vmovn_u16(w);
+    };
+    uint8x8_t ccr, ccg, ccb, cca;
+    if (q.whiteCol) { ccr=ccg=ccb=cca=vdup_n_u8(255); }
+    else { ccr=col8(cr,rX); ccg=col8(cg,gX); ccb=col8(cb,bX); cca=col8(ca,aX); }
+
+    if (q.hasTex) {
+        // Scalar nearest gather: compute 8 texel addresses, load 8 RGBA texels.
+        // (NEON has no gather on ARMv7-A; everything after is vector.)
+        uint8_t txA[8], tgA[8], tbA[8], taA[8];
+        int32_t lu=u, lvv=vv;
+        for (int k=0;k<8;++k) {
+            int tx = (lu >> FXSH) % q.tw; if (tx < 0) tx += q.tw;
+            int ty = (lvv >> FXSH) % q.th; if (ty < 0) ty += q.th;
+            const uint8_t *tp = q.tpix + ((size_t)ty * q.tw + tx) * 4;
+            txA[k]=tp[0]; tgA[k]=tp[1]; tbA[k]=tp[2]; taA[k]=tp[3];
+            lu+=uX; lvv+=vX;
+        }
+        uint8x8_t tr=vld1_u8(txA), tg=vld1_u8(tgA), tb=vld1_u8(tbA), ta=vld1_u8(taA);
+        if (q.whiteCol) { sr=tr; sg=tg; sb=tb; sa=ta; }
+        else {
+            // modulate: div255(texel * colour) per channel, 8-wide.  Same rounding
+            // as scalar div255: t=x+0x80; (t+(t>>8))>>8.
+            auto mod8 = [](uint8x8_t t, uint8x8_t c) -> uint8x8_t {
+                uint16x8_t p = vmull_u8(t, c);
+                p = vaddq_u16(p, vdupq_n_u16(0x80));
+                p = vaddq_u16(p, vshrq_n_u16(p, 8));
+                return vshrn_n_u16(p, 8);
+            };
+            sr=mod8(tr,ccr); sg=mod8(tg,ccg); sb=mod8(tb,ccb); sa=mod8(ta,cca);
+        }
+    } else { sr=ccr; sg=ccg; sb=ccb; sa=cca; }
+
+    // Alpha test: keep where sa > aref.
+    cov = vcgt_u8(sa, vdup_n_u8((uint8_t)aref));
+}
+#endif // __ARM_NEON
 
 // Blit a contiguous, already-coverage-tested span [x0,x1) on one row.  The
 // per-pixel edge test is gone (caller proved coverage); we only sample/modulate,
@@ -176,21 +263,17 @@ static inline void blit_span(const QuadSetup &q, uint8_t *row, int x0, int x1,
                              int32_t bX, int32_t aX) {
     int x = x0;
 #if defined(__ARM_NEON)
-    if (blend == RB_NONE || blend == RB_ALPHA) {
+    // RGBA4444 (q.fmt16) uses the scalar tail below — produce_src8_neon's gather
+    // assumes 4 bytes/texel. fmt16 is an off-by-default memory toggle, rare.
+    if ((blend == RB_NONE || blend == RB_ALPHA) && !q.fmt16) {
         for (; x + 8 <= x1; x += 8) {
-            uint8_t srA[8], sgA[8], sbA[8], saA[8], covarr[8];
-            int32_t lu=u, lvv=vv, lcr=cr, lcg=cg, lcb=cb, lca=ca;
-            for (int k=0;k<8;++k) {
-                int sr,sg,sb,sa;
-                produce_src(q, lu, lvv, lcr, lcg, lcb, lca, sr,sg,sb,sa);
-                covarr[k]=(sa>aref)?0xFF:0x00;
-                srA[k]=(uint8_t)sr; sgA[k]=(uint8_t)sg; sbA[k]=(uint8_t)sb; saA[k]=(uint8_t)sa;
-                lu+=uX; lvv+=vX; lcr+=rX; lcg+=gX; lcb+=bX; lca+=aX;
-            }
-            blend8_alpha_neon(row + (size_t)x*4,
-                              vld1_u8(srA), vld1_u8(sgA), vld1_u8(sbA), vld1_u8(saA),
-                              vld1_u8(covarr), (int)blend);
-            u=lu; vv=lvv; cr=lcr; cg=lcg; cb=lcb; ca=lca;
+            uint8x8_t sr, sg, sb, sa, cov;
+            produce_src8_neon(q, u, vv, cr, cg, cb, ca,
+                              uX, vX, rX, gX, bX, aX, aref,
+                              sr, sg, sb, sa, cov);
+            blend8_alpha_neon(row + (size_t)x*4, sr, sg, sb, sa, cov, (int)blend);
+            // advance accumulators by the 8 pixels just consumed.
+            u+=uX*8; vv+=vX*8; cr+=rX*8; cg+=gX*8; cb+=bX*8; ca+=aX*8;
         }
     }
 #endif
@@ -307,7 +390,9 @@ static void raster_tri_rows(RSurface *dst, const BVtx v[3], const RTexture *tex,
                      v2.r>=1.f && v2.g>=1.f && v2.b>=1.f && v2.a>=1.f);
 
     QuadSetup q;
-    q.hasTex=hasTex; q.tw=tw; q.th=th; q.tpix=tpix; q.whiteCol = whiteCol;
+    q.hasTex=hasTex; q.tw=tw; q.th=th; q.tpix=tpix;
+    q.fmt16 = (hasTex && tex->format == RTEX_RGBA4444) ? 1 : 0;
+    q.whiteCol = whiteCol;
 
     // Edge functions in fixed-point: scale floats by FXONE then round to int64.
     // Per-pixel int64 add; the inside test is a sign compare.  dw/dx,dw/dy are

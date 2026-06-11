@@ -1,0 +1,37 @@
+# Base image for the gmloader-next ARM32 (armhf) cross-build.
+#
+# Bakes in the full toolchain so a build is just the `make` step — no apt at
+# build time. Built host-native (arm64 on Apple Silicon): the
+# arm-linux-gnueabihf cross-compiler targets armhf regardless of host arch, so
+# running native avoids Rosetta/QEMU emulation and is substantially faster than
+# the old `--platform linux/amd64` recipe (which emulated x86 under Rosetta).
+# Verified: produces a byte-size-identical gmloadernext.armhf, gcc 10.2.1.
+#
+# Build the image (once; from the worktree root):
+#   /opt/homebrew/bin/docker build -f Dockerfile.gmloader-build \
+#       -t gmloader-armhf-build:bullseye .
+#
+# Build the binary against the (mounted, not copied) source:
+#   /opt/homebrew/bin/docker run --rm -v "$(pwd):/src" -w /src \
+#       gmloader-armhf-build:bullseye \
+#       make -f Makefile.gmloader ARCH=arm-linux-gnueabihf MISTER_BUILD=1 \
+#         MISTER_NATIVE_VIDEO=1 \
+#         "LLVM_INC=/usr/arm-linux-gnueabihf/include /usr/arm-linux-gnueabihf/include/c++/10/arm-linux-gnueabihf" \
+#         -j"$(nproc)"
+# Output: build/arm-linux-gnueabihf/gmloader/gmloadernext.armhf
+#
+# Do NOT use an arm32v7 base — the loader needs a real arm64/amd64 host; armhf
+# is only ever a cross *target* here, enabled via dpkg --add-architecture.
+FROM debian:bullseye-slim
+
+# armhf multiarch must be enabled before the :armhf packages resolve.
+RUN dpkg --add-architecture armhf \
+ && apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends \
+      build-essential git python3 python3-clang pkg-config make \
+      binutils-arm-linux-gnueabihf gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+      libstdc++-10-dev-armhf-cross linux-libc-dev-armhf-cross \
+      libsdl2-dev:armhf zlib1g-dev:armhf ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src

@@ -4,16 +4,19 @@
 
 Cross-compiles for ARM32 inside Docker. Docker is at `/opt/homebrew/bin/docker`.
 
+The toolchain is baked into a cached base image (`Dockerfile.gmloader-build`),
+so a build is just the `make` step — no per-build apt install. Build the image
+once (host-native arm64; the cross-compiler targets armhf either way — no
+emulation, faster than the old `--platform linux/amd64` recipe):
+
 ```bash
-# Build gmloader ARM32 binary (use linux/amd64, NOT arm32v7 — QEMU not available)
-# Note: build_mister_arm.sh has multiarch setup in wrong order; use inline build:
-/opt/homebrew/bin/docker run --rm --platform linux/amd64 \
-  -v "$(pwd):/src" -w /src debian:bullseye-slim bash -c '
-  apt-get update -qq && dpkg --add-architecture armhf && apt-get update -qq
-  apt-get install -y -qq build-essential git python3 python3-clang pkg-config make \
-    binutils-arm-linux-gnueabihf gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
-    libstdc++-10-dev-armhf-cross linux-libc-dev-armhf-cross \
-    libsdl2-dev:armhf zlib1g-dev:armhf ca-certificates
+/opt/homebrew/bin/docker build -f Dockerfile.gmloader-build -t gmloader-armhf-build:bullseye .
+```
+
+Then build the binary (incremental — `build/` persists in the worktree):
+
+```bash
+/opt/homebrew/bin/docker run --rm -v "$(pwd):/src" -w /src gmloader-armhf-build:bullseye bash -c '
   touch thunks/thunk_gen_dyn.h  # force rebuild of header-dependent files
   make -f Makefile.gmloader ARCH=arm-linux-gnueabihf MISTER_BUILD=1 MISTER_NATIVE_VIDEO=1 \
     "LLVM_INC=/usr/arm-linux-gnueabihf/include /usr/arm-linux-gnueabihf/include/c++/10/arm-linux-gnueabihf" \
@@ -23,6 +26,9 @@ Cross-compiles for ARM32 inside Docker. Docker is at `/opt/homebrew/bin/docker`.
 ```
 
 For `MISTER_NATIVE_VIDEO` builds pass `MISTER_NATIVE_VIDEO=1` to `make`.
+NOTE: on Apple Silicon, `docker build`/`run` build host-native (arm64) even with
+`--platform linux/amd64` (legacy builder ignores it); that's fine and preferred
+here — armhf is only ever a cross *target*. Do not use an arm32v7 base image.
 
 ## Mesa (soft GL for MISTER_NATIVE_VIDEO)
 

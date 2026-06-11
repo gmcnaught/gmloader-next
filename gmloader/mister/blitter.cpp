@@ -31,9 +31,16 @@ static inline uint64_t bl_now_ns() {
 // forces the rasterizer to skip the texture fetch (samples white) to isolate the
 // texture-sampling cost from raster overhead.
 static int      g_prof = 0, g_notex = 0;
+static int      g_tex16 = 0;     // GMLOADER_BLITTER_TEX16: store uploaded textures as
+                                 // packed RGBA4444 (2 bpp) instead of RGBA8888 (4 bpp)
+static int      g_opaque = 1;    // GMLOADER_BLITTER_OPAQUE (default on): downgrade
+                                 // RB_ALPHA/RB_PREMULT to RB_NONE when src is provably
+                                 // opaque, skipping the per-pixel div255 blend
+static int      g_cull = 1;      // GMLOADER_BLITTER_CULL (default on): skip draws that
+                                 // provably can't change a visible pixel (overdraw)
 static int      g_threads = 1;   // GMLOADER_BLITTER_THREADS (rasterizer worker cores)
 static uint64_t g_pf_raster = 0, g_pf_clear = 0, g_pf_tex = 0, g_pf_present = 0;
-static uint32_t g_pf_draws = 0, g_pf_tris = 0, g_pf_frame = 0;
+static uint32_t g_pf_draws = 0, g_pf_tris = 0, g_pf_frame = 0, g_pf_culled = 0;
 
 #ifndef MISTER_WIDTH
 #define MISTER_WIDTH  320
@@ -59,6 +66,9 @@ void Blitter_Init(void) {
     g_own     = g_level >= 2;
     g_prof    = getenv("GMLOADER_BLITTER_PROF") ? 1 : 0;
     g_notex   = getenv("GMLOADER_BLITTER_NOTEX") ? 1 : 0;
+    g_tex16   = getenv("GMLOADER_BLITTER_TEX16") ? 1 : 0;
+    { const char *op = getenv("GMLOADER_BLITTER_OPAQUE"); g_opaque = op ? atoi(op) : 1; }
+    { const char *c  = getenv("GMLOADER_BLITTER_CULL");   g_cull   = c  ? atoi(c)  : 1; }
     { const char *th = getenv("GMLOADER_BLITTER_THREADS");
       g_threads = th ? atoi(th) : 1;
       if (g_threads < 1) g_threads = 1; else if (g_threads > 4) g_threads = 4; }
@@ -72,8 +82,10 @@ void Blitter_Init(void) {
     }
     if (g_enabled) {
         g_defSurf = (uint8_t *)calloc((size_t)g_rw * g_rh, 4);
-        fprintf(stderr, "BLITTER enabled (level %d, own=%d, render %dx%d -> DDR %dx%d)\n",
-                g_level, g_own, g_rw, g_rh, MISTER_WIDTH, MISTER_HEIGHT);
+        fprintf(stderr, "BLITTER enabled (level %d, own=%d, render %dx%d -> DDR %dx%d, "
+                "tex=%s, opaque=%d, cull=%d)\n",
+                g_level, g_own, g_rw, g_rh, MISTER_WIDTH, MISTER_HEIGHT,
+                g_tex16 ? "RGBA4444" : "RGBA8888", g_opaque, g_cull);
     }
 }
 int Blitter_Enabled(void) { return g_enabled; }
@@ -86,7 +98,11 @@ namespace {
 struct Tex {
     int w = 0, h = 0;
     GLenum fmt = 0, type = 0;
-    uint8_t *rgba = nullptr;   // CPU copy (RGBA8888), null if format unsupported
+    uint8_t *rgba = nullptr;   // CPU copy, null if format unsupported. RGBA8888
+                               // (4 bpp) normally; packed RGBA4444 (2 bpp) when
+                               // `packed` (uploaded textures only, GMLOADER_BLITTER_TEX16).
+    int packed = 0;            // 1 => rgba is RGBA4444 (see RTEX_RGBA4444)
+    int opaque = 0;            // 1 if every source alpha byte == 255 (scanned on upload)
     int valid = 0;
 };
 
@@ -143,14 +159,33 @@ uint32_t g_nVap=0, g_nBindBuf=0, g_nBufData=0, g_nGetULoc=0, g_nUniMat=0, g_nEnV
 // Convert an uploaded texture to an RGBA8888 CPU copy (common GM formats only).
 void store_texture(GLuint id, int w, int h, GLenum fmt, GLenum type, const void *px) {
     Tex &t = g_textures[id];
-    free(t.rgba); t.rgba = nullptr; t.valid = 0;
+    free(t.rgba); t.rgba = nullptr; t.valid = 0; t.packed = 0; t.opaque = 0;
     t.w = w; t.h = h; t.fmt = fmt; t.type = type;
     if (!px || w <= 0 || h <= 0) return;            // allocated-but-unfilled (FBO target)
     if (type == GL_UNSIGNED_BYTE && (fmt == GL_RGBA)) {
-        size_t n = (size_t)w * h * 4;
+        size_t n = (size_t)w * h;
         uint64_t _t0 = g_prof ? bl_now_ns() : 0;
-        t.rgba = (uint8_t *)malloc(n);
-        if (t.rgba) { memcpy(t.rgba, px, n); t.valid = 1; }
+        // Scan the source alpha once: a fully-opaque texture lets RB_ALPHA collapse
+        // to a plain copy (RB_NONE) at draw time (see handle_draw). Scanned on the
+        // RGBA8888 source so it holds regardless of the packed/unpacked store below.
+        { const uint8_t *s = (const uint8_t *)px; int op = 1;
+          for (size_t i = 0; i < n; i++) if (s[i*4+3] != 255) { op = 0; break; }
+          t.opaque = op; }
+        if (g_tex16) {
+            // Pack RGBA8888 -> RGBA4444 (2 bpp): keep the top nibble of each
+            // channel. Halves the sampler's per-texel gather; nearest-only.
+            const uint8_t *s = (const uint8_t *)px;
+            uint16_t *d = (uint16_t *)malloc(n * 2);
+            if (d) {
+                for (size_t i = 0; i < n; i++)
+                    d[i] = (uint16_t)(((s[i*4+0] >> 4) << 12) | ((s[i*4+1] >> 4) << 8) |
+                                      ((s[i*4+2] >> 4) << 4)  |  (s[i*4+3] >> 4));
+                t.rgba = (uint8_t *)d; t.valid = 1; t.packed = 1;
+            }
+        } else {
+            t.rgba = (uint8_t *)malloc(n * 4);
+            if (t.rgba) { memcpy(t.rgba, px, n * 4); t.valid = 1; }
+        }
         if (g_prof) g_pf_tex += bl_now_ns() - _t0;
     }
     // other formats (RGB, LUMINANCE, compressed) -> leave invalid; such draws
@@ -247,6 +282,10 @@ bool get_render_target(RSurface *out) {
     if (fit == g_fboColorTex.end()) return false;
     Tex &t = g_textures[fit->second];
     if (t.w <= 0 || t.h <= 0) return false;
+    // A render target must be a full RGBA8888 surface (the rasterizer writes 4
+    // bpp). If this texture was uploaded as packed RGBA4444, drop it and back the
+    // target with a fresh 8888 buffer — never alias a 2 bpp buffer as 4 bpp.
+    if (t.packed) { free(t.rgba); t.rgba = nullptr; t.packed = 0; }
     if (!t.rgba) { t.rgba = (uint8_t *)calloc((size_t)t.w * t.h, 4); t.valid = t.rgba ? 1 : 0; }
     out->rgba = t.rgba; out->w = t.w; out->h = t.h;
     return out->rgba != nullptr;
@@ -258,8 +297,12 @@ void get_rtexture(RTexture *out) {
     if (it != g_textures.end() && it->second.rgba) {
         out->rgba = it->second.rgba; out->w = it->second.w; out->h = it->second.h;
         out->nearest = 1; out->valid = 1;
+        out->format = it->second.packed ? RTEX_RGBA4444 : RTEX_RGBA8888;
+        out->opaque = it->second.opaque;
     } else {
         out->rgba = nullptr; out->w = 0; out->h = 0; out->nearest = 1; out->valid = 0;
+        out->format = RTEX_RGBA8888;
+        out->opaque = 0;
     }
 }
 
@@ -422,16 +465,51 @@ static int handle_draw(const char *kind, GLenum mode, int count,
 
     // Rasterize into our surfaces (owning mode only).
     int rast = 0;
+    const char *cullReason = nullptr;   // non-null => skipped as provably invisible
     if (g_own && decoded == count && mode == GL_TRIANGLES && count >= 3) {
         RSurface rt; RBlend blend;
         if (get_render_target(&rt) && get_rblend(&blend)) {
             RTexture tex; get_rtexture(&tex);
             if (g_notex) tex.valid = 0;   // probe: skip texture fetch -> samples white
             if (tex.valid || g_notex) {
-                uint64_t _t0 = g_prof ? bl_now_ns() : 0;
-                Blitter_RasterDraw(&rt, &s_verts[0], count / 3, &tex, blend, 0.0f, g_threads);
-                if (g_prof) { g_pf_raster += bl_now_ns() - _t0; g_pf_draws++; g_pf_tris += count/3; }
-                rast = 1;
+                // ---- overdraw culling (env GMLOADER_BLITTER_CULL, default on) ----
+                // Cheap per-draw short-circuits that drop draws which provably can't
+                // change a visible pixel of the render target. The bbox is in the
+                // same pixel space (viewport spans [0,w)x[0,h)) the rasterizer clips
+                // to, so an off-target / zero-area bbox covers no pixel. The fully-
+                // transparent test is restricted to RB_ALPHA (the only blend whose
+                // output is exactly dst when src.a==0 — PREMULT/ADD can still add rgb).
+                if (g_cull) {
+                    if (maxx <= 0.0f || minx >= (float)rt.w ||
+                        maxy <= 0.0f || miny >= (float)rt.h)
+                        cullReason = "offtarget";
+                    else if (maxx <= minx || maxy <= miny)
+                        cullReason = "zeroarea";
+                    else if (blend == RB_ALPHA) {
+                        bool allClear = true;
+                        for (const BVtx &bv : s_verts)
+                            if (bv.a > (0.5f / 255.0f)) { allClear = false; break; }
+                        if (allClear) cullReason = "transparent";
+                    }
+                }
+                // Opaque fast-path (env GMLOADER_BLITTER_OPAQUE, default on): an
+                // over/premult blend of a provably-opaque source (every texel
+                // alpha==255 AND every vertex alpha==1) equals a plain copy, so
+                // downgrade to RB_NONE and skip the per-pixel div255 blend math.
+                if (!cullReason && g_opaque &&
+                    (blend == RB_ALPHA || blend == RB_PREMULT) && tex.valid && tex.opaque) {
+                    int vop = 1;
+                    for (int v = 0; v < count; v++) if (s_verts[v].a < 0.998f) { vop = 0; break; }
+                    if (vop) blend = RB_NONE;
+                }
+                if (cullReason) {
+                    if (g_prof) g_pf_culled++;
+                } else {
+                    uint64_t _t0 = g_prof ? bl_now_ns() : 0;
+                    Blitter_RasterDraw(&rt, &s_verts[0], count / 3, &tex, blend, 0.0f, g_threads);
+                    if (g_prof) { g_pf_raster += bl_now_ns() - _t0; g_pf_draws++; g_pf_tris += count/3; }
+                    rast = 1;
+                }
             }
         }
     }
@@ -439,10 +517,11 @@ static int handle_draw(const char *kind, GLenum mode, int count,
     if (g_drawNo <= LOG_FIRST) {
         Tex *bt = g_textures.count(g_boundTex2D) ? &g_textures[g_boundTex2D] : nullptr;
         fprintf(stderr, "BLIT draw#%llu %s rt=%s tex=%u(%dx%d val=%d) blend=%s "
-                "decoded=%d/%d rast=%d screen=[%.0f,%.0f..%.0f,%.0f]\n",
+                "decoded=%d/%d rast=%d cull=%s screen=[%.0f,%.0f..%.0f,%.0f]\n",
                 (unsigned long long)g_drawNo, kind, g_curFBO ? "FBO" : "DEF",
                 g_boundTex2D, bt?bt->w:0, bt?bt->h:0, bt?bt->valid:0, blend_name(),
-                decoded, count, rast, decoded?minx:0, decoded?miny:0, decoded?maxx:0, decoded?maxy:0);
+                decoded, count, rast, cullReason ? cullReason : "-",
+                decoded?minx:0, decoded?miny:0, decoded?maxx:0, decoded?maxy:0);
     }
 
     return g_own ? 1 : 0;   // owning mode: blitter owns the draw, skip GL
@@ -491,13 +570,13 @@ void Blitter_ProfFrameEnd(uint64_t process_ns) {
     uint64_t bl = g_pf_raster + g_pf_clear + g_pf_tex;
     uint64_t logic = process_ns > bl ? process_ns - bl : 0;   // GM VM + non-blitter GL
     if (g_pf_frame % 30 == 0) {
-        fprintf(stderr, "BLITPROF f=%u draws=%u tris=%u | raster=%.1f clear=%.1f "
+        fprintf(stderr, "BLITPROF f=%u draws=%u tris=%u culled=%u | raster=%.1f clear=%.1f "
                 "texup=%.1f present=%.1f logic=%.1f ms%s\n",
-                g_pf_frame, g_pf_draws, g_pf_tris, g_pf_raster/1e6, g_pf_clear/1e6,
+                g_pf_frame, g_pf_draws, g_pf_tris, g_pf_culled, g_pf_raster/1e6, g_pf_clear/1e6,
                 g_pf_tex/1e6, g_pf_present/1e6, logic/1e6, g_notex ? " [NOTEX]" : "");
     }
     g_pf_raster = g_pf_clear = g_pf_tex = g_pf_present = 0;
-    g_pf_draws = g_pf_tris = 0;
+    g_pf_draws = g_pf_tris = g_pf_culled = 0;
 }
 
 #endif // MISTER_NATIVE_VIDEO
