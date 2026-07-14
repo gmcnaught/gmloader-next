@@ -202,7 +202,28 @@ static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     blt_fill(&g_e, 0, 0, w, h, mf_rgb565(r, g, b));
 }
 
-static bool evict_one_lru(void) { return false; }   // Task 4 replaces this
+static bool evict_one_lru(void) {
+    int victim = -1; uint64_t best = ~0ull;
+    for (int i = 0; i < MF_TEX_CACHE_N; i++) {
+        if (g_texcache[i].used && g_texcache[i].lru < best) {
+            best = g_texcache[i].lru; victim = i;
+        }
+    }
+    if (victim < 0) return false;
+    blt_emitter_free(&g_e, g_texcache[victim].ref.off, g_texcache[victim].ref.size);
+    g_texcache[victim].used = false;
+    // The blt_upload attempt that just failed (the one stage_texture is about to
+    // retry) tripped the emitter's sticky per-frame overflow flag (blt_emitter.c
+    // upload16: any failed blt_alloc call sets e->overflow, and nothing but the
+    // next blt_begin_frame ever clears it). That flag is checked unconditionally
+    // in mf_frame_end and drops the WHOLE frame — so without clearing it here, a
+    // successful evict+retry still loses the frame it just rescued. Freeing a
+    // page is precisely what makes that stale failure signal moot; clear it so
+    // the retry that follows is treated as the clean success it is. Safe/
+    // idempotent: if the retry fails too, blt_upload sets overflow=1 again.
+    g_e.overflow = 0;
+    return true;
+}
 
 // Stage a texture page keyed by identity. Cache hit reuses the resident surface
 // (no re-upload); miss converts RGBA->RGB565 into g_texscratch and blt_uploads

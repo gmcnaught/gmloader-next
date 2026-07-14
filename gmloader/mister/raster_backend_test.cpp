@@ -418,6 +418,39 @@ static int case_invalidate(void) {
     return RasterBackend_MFGPU_TestUploadCount() == 2;
 }
 
+// ---- Task 4: LRU eviction under heap pressure --------------------------------
+// Build a WxH opaque texture whose colour encodes `tag` so re-uploads are
+// distinguishable, draw it full-quad, and compare fabric vs SW oracle.
+static int draw_tagged(uint32_t key, int W, int H, uint8_t tag) {
+    static uint8_t buf[512*512*4];
+    for (int i=0;i<W*H;i++){ buf[i*4]=tag; buf[i*4+1]=tag; buf[i*4+2]=tag; buf[i*4+3]=255; }
+    RTexture t = { buf, W, H, 1, 1, 0, 1 };
+    BVtx v[6] = {
+        {  0.f,  0.f, 0,0, 1,1,1,1 }, { 200.f,  0.f, 1,0, 1,1,1,1 }, {  0.f,150.f, 0,1, 1,1,1,1 },
+        { 200.f,  0.f, 1,0, 1,1,1,1 }, { 200.f,150.f, 1,1, 1,1,1,1 }, {  0.f,150.f, 0,1, 1,1,1,1 },
+    };
+    return battery_case_key("tagged", 0,0,0, &t, v, 2, RB_NONE, key);   // Task 1 helper, key-aware
+}
+
+static int case_two_keys(void) {                 // both resident, both correct
+    RasterBackend_MFGPU_TestReinit(0);
+    if (!draw_tagged(1, 64, 64, 40)) return 0;
+    if (!draw_tagged(2, 64, 64, 200)) return 0;
+    // redraw key 1 — must be a cache hit (no third upload)
+    if (!draw_tagged(1, 64, 64, 40)) return 0;
+    return RasterBackend_MFGPU_TestUploadCount() == 2;
+}
+
+static int case_eviction(void) {                       // cap holds 2x 512KB pages (256KB slack)
+    RasterBackend_MFGPU_TestReinit(1280u*1024);        // 1.25MB texture heap
+    if (!draw_tagged(1, 512, 512, 10)) return 0;       // upload1 (free 768KB)
+    if (!draw_tagged(2, 512, 512, 20)) return 0;       // upload2 (free 256KB)
+    if (!draw_tagged(3, 512, 512, 30)) return 0;       // evicts key1, upload3 -> {2,3}
+    if (!draw_tagged(4, 512, 512, 40)) return 0;       // evicts key2, upload4 -> {3,4}
+    if (!draw_tagged(1, 512, 512, 10)) return 0;       // key1 gone -> evicts key3, upload5
+    return RasterBackend_MFGPU_TestUploadCount() == 5; // 4 initial + 1 re-stage; each pixel-correct
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -432,5 +465,9 @@ int main(void){
     else printf("raster_backend mfgpu-cache-hit OK\n");
     if (!case_invalidate()) { printf("FAIL mfgpu-invalidate\n"); ok = 0; }
     else printf("raster_backend mfgpu-invalidate OK\n");
+    if (!case_two_keys()) { printf("FAIL mfgpu-two-keys\n"); ok = 0; }
+    else printf("raster_backend mfgpu-two-keys OK\n");
+    if (!case_eviction()) { printf("FAIL mfgpu-eviction\n"); ok = 0; }
+    else printf("raster_backend mfgpu-eviction OK\n");
     return ok ? 0 : 1;
 }
