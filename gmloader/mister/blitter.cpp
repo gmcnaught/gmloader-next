@@ -12,6 +12,7 @@
 
 #include "blitter.h"
 #include "blitter_raster.h"
+#include "raster_backend.h"
 #include "configuration.h"   // gmloader_config.blitter (default level)
 
 #include <stdio.h>
@@ -75,6 +76,7 @@ void Blitter_Init(void) {
     { const char *th = getenv("GMLOADER_BLITTER_THREADS");
       g_threads = th ? atoi(th) : 1;
       if (g_threads < 1) g_threads = 1; else if (g_threads > 4) g_threads = 4; }
+    RasterBackend_SW_SetThreads(g_threads);   // keep backend_sw in sync with g_threads
     g_rw = MISTER_WIDTH; g_rh = MISTER_HEIGHT;
     if (g_own) {   // render-size override only applies when the blitter presents
         const char *rw = getenv("GMLOADER_RENDER_W"), *rh = getenv("GMLOADER_RENDER_H");
@@ -404,7 +406,7 @@ int Blitter_OnClear(GLbitfield) {
     RSurface rt;
     if (get_render_target(&rt)) {
         uint64_t _t0 = g_prof ? bl_now_ns() : 0;
-        memset(rt.rgba, 0, (size_t)rt.w * rt.h * 4);   // clear to transparent black
+        RasterBackend_Select()->clear(&rt, 0, 0, 0, 0);   // clear to transparent black
         if (g_prof) g_pf_clear += bl_now_ns() - _t0;
     }
     return 1;   // cleared ourselves — caller skips the (slow) GL clear
@@ -509,7 +511,7 @@ static int handle_draw(const char *kind, GLenum mode, int count,
                     if (g_prof) g_pf_culled++;
                 } else {
                     uint64_t _t0 = g_prof ? bl_now_ns() : 0;
-                    Blitter_RasterDraw(&rt, &s_verts[0], count / 3, &tex, blend, 0.0f, g_threads);
+                    RasterBackend_Select()->draw(&rt, &s_verts[0], count / 3, &tex, blend, 0.0f);
                     if (g_prof) { g_pf_raster += bl_now_ns() - _t0; g_pf_draws++; g_pf_tris += count/3; }
                     rast = 1;
                 }
@@ -545,7 +547,18 @@ int Blitter_TryDrawElements(GLenum mode, GLsizei count, GLenum type, const void 
     return handle_draw("elements", mode, count, ip, type);
 }
 
-const uint8_t *Blitter_PresentDefault(void) { return g_own ? g_defSurf : nullptr; }
+const uint8_t *Blitter_PresentDefault(void) {
+    if (g_own) {
+        // Route present through the seam. backend_sw's present is a no-op
+        // today (see raster_backend_sw.cpp) — the real RGB565 conversion
+        // still happens via Blitter_ToRGB565, called directly by main.cpp's
+        // frame loop exactly as before this refactor; this call site only
+        // makes present() reachable through RasterBackend for later backends.
+        RSurface rt = { g_defSurf, g_rw, g_rh };
+        RasterBackend_Select()->present(&rt);
+    }
+    return g_own ? g_defSurf : nullptr;
+}
 
 void Blitter_ToRGB565(const uint8_t *src_rgba, uint16_t *dst) {
     // src is the render-size (g_rw x g_rh) GL bottom-up surface; the DDR buffer
