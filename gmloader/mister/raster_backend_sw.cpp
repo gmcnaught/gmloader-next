@@ -3,6 +3,8 @@
 // direct pass-through to the same functions blitter.cpp called before this
 // seam existed.
 #include "raster_backend.h"
+#include <stdlib.h>
+#include <string.h>
 
 // Mirrors blitter.cpp's g_threads (GMLOADER_BLITTER_THREADS). Set once from
 // Blitter_Init() via RasterBackend_SW_SetThreads() so backend_sw's rasterizer
@@ -39,4 +41,19 @@ static void sw_frame_end(void) {}
 extern "C" const RasterBackend backend_sw = {
     "sw", sw_frame_begin, sw_clear, sw_draw, sw_present, sw_frame_end,
 };
-extern "C" const RasterBackend *RasterBackend_Select(void) { return &backend_sw; }
+
+extern "C" const RasterBackend backend_mfgpu;   // defined in raster_backend_mfgpu.cpp
+
+// Selects the active RasterBackend for the whole process. GMLOADER_RASTER=mfgpu
+// routes draws through the FPGA-fabric backend (backend_mfgpu); anything else
+// (unset, empty, any other value) keeps today's default, backend_sw. Cached on
+// first call since this is invoked per-draw (mf_draw/sw_draw are called every
+// frame) and getenv() is not free.
+extern "C" const RasterBackend *RasterBackend_Select(void) {
+    static const RasterBackend *sel = nullptr;
+    if (!sel) {
+        const char *e = getenv("GMLOADER_RASTER");
+        sel = (e && strcmp(e, "mfgpu") == 0) ? &backend_mfgpu : &backend_sw;
+    }
+    return sel;
+}

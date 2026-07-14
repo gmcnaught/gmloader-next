@@ -304,6 +304,22 @@ static int battery(void) {
     keyed_case("keyed-border",  texBorder, 8, 8, 4);   // 1-texel transparent border
     keyed_case("keyed-checker", texCheck,  4, 4, 8);   // checkerboard alpha + nudge
 
+    // RGBA4444 coverage (Task 7): same 1-texel transparent border shape as
+    // texBorder, but staged in the packed RGBA4444 layout the production GL
+    // decode path uses (uint16 texel R4<<12|G4<<8|B4<<4|A4) -- alpha strictly
+    // {0,15} (fully transparent vs fully opaque in 4-bit). Exercises
+    // mf_texel565's RTEX_RGBA4444 branch (raster_backend_mfgpu.cpp) and the
+    // SW rasterizer's fmt16 path (blitter_raster.cpp), both untested until now.
+    static uint16_t pxKeyed4444[8*8];
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x++) {
+            bool border = (x == 0 || x == 7 || y == 0 || y == 7);
+            unsigned r4 = 0xB, g4 = 0x5, b4 = 0x3, a4 = border ? 0x0 : 0xF;
+            pxKeyed4444[y*8 + x] = (uint16_t)((r4 << 12) | (g4 << 8) | (b4 << 4) | a4);
+        }
+    RTexture texKeyed4444 = { (const uint8_t *)pxKeyed4444, 8, 8, 1, 1, /*RTEX_RGBA4444*/1, /*opaque*/0 };
+    keyed_case("keyed-4444-border", texKeyed4444, 8, 8, 4);   // RGBA4444 1-bit-alpha border
+
     // 10) FBO fallback — a non-default target must delegate to backend_sw (writes
     //    the dst surface directly, byte-identical to the reference rasterizer).
     {

@@ -15,6 +15,11 @@
 #include "raster_backend.h"
 #include "configuration.h"   // gmloader_config.blitter (default level)
 
+// Task 7: lets backend_mfgpu (raster_backend_mfgpu.cpp) tell the default fb's
+// pixels apart from an FBO / render-to-texture target's, so its draw() can
+// route the latter to the SW fallback. No-op when backend_sw is selected.
+extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba);
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,6 +92,7 @@ void Blitter_Init(void) {
     }
     if (g_enabled) {
         g_defSurf = (uint8_t *)calloc((size_t)g_rw * g_rh, 4);
+        RasterBackend_MFGPU_SetDefaultSurface(g_defSurf);
         fprintf(stderr, "BLITTER enabled (level %d, own=%d, render %dx%d -> DDR %dx%d, "
                 "tex=%s, opaque=%d, cull=%d)\n",
                 g_level, g_own, g_rw, g_rh, MISTER_WIDTH, MISTER_HEIGHT,

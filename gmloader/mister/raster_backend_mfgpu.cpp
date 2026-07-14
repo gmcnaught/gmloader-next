@@ -92,6 +92,16 @@ static blt_vtx_t     g_vtxscratch[MF_MAX_VERTS];
 static uint16_t      g_texscratch[MF_TEX_TEXELS];
 static bool          g_inited = false;
 
+// Task 7: the production frame loop (main.cpp) calls clear()/draw()/present()
+// but never frame_begin()/frame_end() (those are a host-test-only convenience —
+// see mf_frame_begin's comment). g_frame_active makes the backend self-contained
+// in that world: the first clear/draw of a frame implicitly opens it
+// (mf_ensure_frame), and present() closes it (runs blt_execute into g_fb565 and
+// resets state so the next clear/draw starts a fresh frame). Host tests that
+// call frame_begin()/clear()/draw()/frame_end() directly are unaffected: those
+// calls just re-set/consume the same flag along the way.
+static bool          g_frame_active = false;
+
 // Host execute target: the fixed-size fabric framebuffer blt_execute composites
 // into. On real hardware this is scanned out directly; on the host it is the
 // oracle the parity tests read back via RasterBackend_MFGPU_TestCopyFB565().
@@ -164,9 +174,17 @@ static void mf_frame_begin(void) {
     blt_heap_reset(&g_e);
     blt_alloc_init(&g_e.alloc, MF_VTX_REGION, sizeof g_srcdram - MF_VTX_REGION);
     blt_begin_frame(&g_e, /*target_buf=*/0, /*clear=*/0, /*clear_color=*/0);
+    g_frame_active = true;
+}
+
+// Task 7: production entry point for clear()/draw() — the frame loop never
+// calls frame_begin() directly, so the first clear/draw of a frame opens it.
+static void mf_ensure_frame(void) {
+    if (!g_frame_active) mf_frame_begin();
 }
 
 static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    mf_ensure_frame();
     (void)a;   // fabric FILL writes opaque RGB565; no alpha channel on the wire
     int w = d->w < BLT_FB_WIDTH  ? d->w : BLT_FB_WIDTH;
     int h = d->h < BLT_FB_HEIGHT ? d->h : BLT_FB_HEIGHT;
@@ -175,6 +193,7 @@ static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
 
 static void mf_draw(RSurface *d, const BVtx *v, int triCount,
                     const RTexture *t, RBlend bl, float ar) {
+    mf_ensure_frame();
     // FBO / non-default render target: the fabric has one scanout FB, so
     // render-to-texture targets fall back to the SW rasterizer (writes d->rgba).
     if (g_defRGBA && d->rgba != g_defRGBA) { backend_sw.draw(d, v, triCount, t, bl, ar); return; }
@@ -254,7 +273,19 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", triCount);
 }
 
-static void mf_present(const RSurface *) { /* Task 6: device scanout */ }
+static void mf_frame_end(void);   // forward decl: defined below, called from mf_present
+
+// Task 7: production entry point for present() — the frame loop calls
+// clear()/draw() then present() (never frame_end() directly). Execute the
+// accumulated ring into g_fb565 (mf_frame_end already does the blt_execute)
+// and close the frame so the next clear/draw starts fresh. If no clear/draw
+// happened this "frame" (g_frame_active false), there is nothing to execute.
+static void mf_present(const RSurface *) {
+    if (g_frame_active) {
+        mf_frame_end();
+        g_frame_active = false;
+    }
+}
 
 static void mf_frame_end(void) {
     blt_end_frame(&g_e);
@@ -272,6 +303,18 @@ static void mf_frame_end(void) {
     // passing the full size keeps both offset ranges in-bounds.
     blt_surface_heap_t heap = { g_srcdram, sizeof g_srcdram, nullptr, nullptr };
     blt_execute(g_fb565, &heap, g_cmds, n);
+}
+
+// Task 7 device wiring: the fabric framebuffer, for main.cpp to hand straight
+// to NativeVideoWriter_WriteFrame after present() (g_fb565 is already RGB565 —
+// no Blitter_ToRGB565 conversion needed). w/h are BLT_FB_WIDTH x BLT_FB_HEIGHT
+// (320x240, refmodel/blitter_ref.h), the fixed fabric scanout geometry — same
+// as MISTER_WIDTH/MISTER_HEIGHT today, so callers can use either pair, but the
+// row stride must always be computed from *this* w (BLT_FB_WIDTH), not assumed.
+extern "C" const uint16_t *RasterBackend_MFGPU_GetFB565(int *w, int *h) {
+    if (w) *w = BLT_FB_WIDTH;
+    if (h) *h = BLT_FB_HEIGHT;
+    return g_fb565;
 }
 
 // ---- Host validation only — NOT part of the RasterBackend vtable ----------

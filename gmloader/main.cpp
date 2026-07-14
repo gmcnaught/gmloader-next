@@ -26,8 +26,17 @@
 #include "mister/frame_capture.h"
 #include "mister/draw_trace.h"
 #include "mister/blitter.h"
+#include "mister/raster_backend.h"
 // Global handle to bundled libGLES_sw.so — also used by egl.cpp and gles2.cpp via extern
 void* g_gles_handle = nullptr;
+
+// Task 7: GMLOADER_RASTER=mfgpu device wiring. backend_mfgpu / RasterBackend_Select
+// live in raster_backend_{mfgpu,sw}.cpp; RasterBackend_MFGPU_GetFB565 hands back
+// the fabric's already-RGB565 scanout buffer so it can go straight to
+// NativeVideoWriter_WriteFrame, skipping Blitter_ToRGB565 (see the present block
+// below).
+extern "C" const RasterBackend backend_mfgpu;
+extern "C" const uint16_t *RasterBackend_MFGPU_GetFB565(int *w, int *h);
 #endif
 
 
@@ -565,11 +574,22 @@ int main(int argc, char *argv[])
         if (RunnerJNILib::canFlip(env, 0)) {
           const uint8_t* _blit = Blitter_PresentDefault();
           if (_blit && NativeVideoWriter_IsActive()) {
-            // Blitter owns the frame: convert (with row flip) straight to DDR,
-            // skipping glReadPixels entirely.
-            static uint16_t rgb565_blit[MISTER_WIDTH * MISTER_HEIGHT];
-            Blitter_ToRGB565(_blit, rgb565_blit);
-            NativeVideoWriter_WriteFrame(rgb565_blit, MISTER_WIDTH, MISTER_HEIGHT, MISTER_WIDTH * 2);
+            if (RasterBackend_Select() == &backend_mfgpu) {
+              // Task 7: fabric backend. present() (called inside
+              // Blitter_PresentDefault() above) already executed the frame's
+              // ring into g_fb565, which is RGB565 already (BLT_FB_WIDTH x
+              // BLT_FB_HEIGHT == MISTER_WIDTH x MISTER_HEIGHT) — hand it to
+              // the DDR writer directly, skipping Blitter_ToRGB565.
+              int fb_w, fb_h;
+              const uint16_t* fb565 = RasterBackend_MFGPU_GetFB565(&fb_w, &fb_h);
+              NativeVideoWriter_WriteFrame(fb565, MISTER_WIDTH, MISTER_HEIGHT, MISTER_WIDTH * 2);
+            } else {
+              // Blitter owns the frame: convert (with row flip) straight to DDR,
+              // skipping glReadPixels entirely.
+              static uint16_t rgb565_blit[MISTER_WIDTH * MISTER_HEIGHT];
+              Blitter_ToRGB565(_blit, rgb565_blit);
+              NativeVideoWriter_WriteFrame(rgb565_blit, MISTER_WIDTH, MISTER_HEIGHT, MISTER_WIDTH * 2);
+            }
           } else {
             FrameCapture_ReadFrame();
 
