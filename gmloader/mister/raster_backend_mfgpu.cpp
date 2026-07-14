@@ -87,10 +87,14 @@ enum {
     MF_TEX_CACHE_N = 64,                         // resident-page table size
 };
 static uint8_t       g_ring[MF_RING_CAP];
+// Deliberate ~40MB static footprint (32MB texture heap here + 8MB conversion
+// scratch below): safe and unremarkable on the MiSTer ARM's DDR3, not a
+// mistake to "optimize away".
 static uint8_t       g_srcdram[MF_SRCDRAM_CAP];
 static blt_emitter_t g_e;
 static blt_cmd_t     g_cmds[MF_MAX_CMDS];
 static blt_vtx_t     g_vtxscratch[MF_MAX_VERTS];
+// See g_srcdram above: this is the other half of the ~40MB deliberate footprint.
 static uint16_t      g_texscratch[MF_TEX_TEXELS];
 static bool          g_inited = false;
 
@@ -113,8 +117,21 @@ static uint64_t   g_lru_clock   = 0;
 static uint32_t   g_upload_count = 0;   // real blt_upload calls since reinit (test hook)
 static uint32_t   g_tex_heap_cap = 0;   // 0 => full MF_TEX_HEAP; else test override
 
-// Free the least-recently-used cached entry. Returns false if none to evict.
-// Real body lands in Task 4; a stub here keeps stage_texture compiling.
+// Snapshot of g_lru_clock taken at the start of the current frame (see
+// mf_frame_begin). Any cache entry whose .lru is ABOVE this floor was
+// touched (hit or staged) during THIS frame, and is therefore "pinned":
+// blt_trilist already emitted a command referencing its heap offset, and
+// that command isn't consumed until blt_execute runs in mf_frame_end, so
+// freeing/reusing the offset before then would alias an already-emitted
+// draw onto different pixels. evict_one_lru() only considers entries with
+// .lru <= floor (untouched this frame) as eviction candidates.
+static uint64_t   g_lru_frame_floor = 0;
+
+// Free the least-recently-used cached entry that is NOT pinned by this
+// frame (see g_lru_frame_floor above). Returns false if no unpinned entry
+// is available to evict (the caller's upload then legitimately fails and
+// the draw is dropped — correct degradation when a single frame's texture
+// working set exceeds the heap).
 static bool evict_one_lru(void);
 
 // Host execute target: the fixed-size fabric framebuffer blt_execute composites
@@ -176,12 +193,17 @@ static void mf_init_once(void) {
     blt_alloc_init(&g_e.alloc, MF_VTX_REGION, cap);       // texture allocator (persistent)
     blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_REGION);     // per-frame vertex buffer
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
-    g_lru_clock = 0; g_upload_count = 0;
+    g_lru_clock = 0; g_upload_count = 0; g_lru_frame_floor = 0;
     g_inited = true;
 }
 
 static void mf_frame_begin(void) {
     mf_init_once();
+    // Snapshot the pin floor for this frame: any g_texcache entry touched
+    // (hit or staged) from here through mf_frame_end gets .lru > this value
+    // and is thus protected from eviction until the NEXT frame begins (see
+    // g_lru_frame_floor and evict_one_lru).
+    g_lru_frame_floor = g_lru_clock;
     // Textures persist across frames now (cache in g_texcache). Only the vtx
     // cursor + command list reset here (blt_begin_frame). No blt_heap_reset.
     blt_begin_frame(&g_e, /*target_buf=*/0, /*clear=*/0, /*clear_color=*/0);
@@ -203,13 +225,21 @@ static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
 }
 
 static bool evict_one_lru(void) {
+    // Pin-this-frame invariant: an entry with .lru > g_lru_frame_floor was
+    // hit or staged during the CURRENT frame, so a blt_trilist command
+    // already emitted this frame may reference its heap offset — that
+    // command isn't consumed until blt_execute runs at frame end. Freeing
+    // such an entry now would let a later stage_texture's retry reuse the
+    // same offset with different pixels, so the earlier (already-emitted)
+    // draw would sample the wrong texture when the frame finally executes.
+    // Only entries from a PRIOR frame (.lru <= floor) are eviction-eligible.
     int victim = -1; uint64_t best = ~0ull;
     for (int i = 0; i < MF_TEX_CACHE_N; i++) {
-        if (g_texcache[i].used && g_texcache[i].lru < best) {
+        if (g_texcache[i].used && g_texcache[i].lru <= g_lru_frame_floor && g_texcache[i].lru < best) {
             best = g_texcache[i].lru; victim = i;
         }
     }
-    if (victim < 0) return false;
+    if (victim < 0) return false;   // nothing unpinned to evict
     blt_emitter_free(&g_e, g_texcache[victim].ref.off, g_texcache[victim].ref.size);
     g_texcache[victim].used = false;
     return true;
@@ -271,6 +301,8 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
     if (triCount <= 0) return;
 
     // ── stage the texture page as RGB565 ──────────────────────────────────────
+    // Key 0 is reserved for the untextured 1x1 opaque-white page; a real GL
+    // texture name is never 0 (0 means "no texture bound"), so no collision.
     uint32_t stage_key = (t && t->valid && t->rgba) ? tex_key : 0u;   // all untextured share key 0
     bool has_key = false;
     blt_surface_ref_t tex = stage_texture(stage_key, t, &has_key);
@@ -399,8 +431,8 @@ extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_inited = false; g_frame_active = false;
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap
     mf_init_once();                    // re-wires emitter, clears cache + counter
+    g_lru_frame_floor = 0;             // start clean: nothing pinned before frame 1
 }
-
 
 // Free the cached entry for GL texture `id` so the next draw re-stages it. Called
 // by blitter.cpp on TexImage2D re-upload and DeleteTexture — exactly when the SW

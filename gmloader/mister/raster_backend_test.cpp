@@ -362,11 +362,12 @@ static int battery(void) {
 
 // ---- Task 2: persistent identity-keyed texture cache -------------------------
 
-// (A) A 256x256 opaque page is well within the new 32MB persistent texture heap
-// (the old ~500KB/frame scratch heap would have dropped it) and must still match
-// the SW oracle within +/-1 LSB 565.
+// (A) A 1024x1024 opaque page (1024*1024*2 = 2MB RGB565, once staged) is a
+// genuinely large page: it exceeds the OLD ~1MB/frame scratch heap (which
+// would have dropped it) but sits comfortably in the new 32MB persistent
+// texture heap, and must still match the SW oracle within +/-1 LSB 565.
 static int case_large_page(void) {
-    enum { TW = 256, TH = 256 };
+    enum { TW = 1024, TH = 1024 };
     static uint8_t tex[TW*TH*4];
     for (int y=0;y<TH;y++) for (int x=0;x<TW;x++){ uint8_t*p=tex+((y*TW+x)*4); p[0]=(uint8_t)x; p[1]=(uint8_t)y; p[2]=128; p[3]=255; }
     RTexture t = { tex, TW, TH, 1, 1, /*RGBA8888*/0, 1 };
@@ -415,7 +416,24 @@ static int case_invalidate(void) {
     RasterBackend_MFGPU_InvalidateTex(K);
     px[0] = 250;
     backend_mfgpu.frame_begin(); backend_mfgpu.draw(&s_mf, v, 1, &t, RB_NONE, 0.f, K); backend_mfgpu.frame_end();
-    return RasterBackend_MFGPU_TestUploadCount() == 2;
+    if (RasterBackend_MFGPU_TestUploadCount() != 2) return 0;
+
+    // Airtight: the count alone doesn't prove the NEW pixels actually made it
+    // to the fabric framebuffer (a stale cached page would also re-upload if
+    // the count logic were wrong elsewhere) — read back and check the
+    // rendered pixel reflects the changed texel (250,20,30) not the original
+    // (10,20,30). (6,6) is inside the triangle (2,2)-(28,4)-(4,28).
+    static uint16_t mf565[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, mf565);
+    uint16_t px565 = mf565[6 * BW + 6];
+    int r5 = (px565 >> 11) & 0x1F, g5 = (px565 >> 5) & 0x3F, b5 = px565 & 0x1F;
+    int er5 = 250 >> 3, eg5 = 20 >> 2, eb5 = 30 >> 3;
+    if (abs(r5 - er5) > 1 || abs(g5 - eg5) > 1 || abs(b5 - eb5) > 1) {
+        printf("  FAIL invalidate-pixel got 565=(%d,%d,%d) expected ~(%d,%d,%d)\n",
+               r5, g5, b5, er5, eg5, eb5);
+        return 0;
+    }
+    return 1;
 }
 
 // ---- Task 4: LRU eviction under heap pressure --------------------------------
@@ -451,6 +469,82 @@ static int case_eviction(void) {                       // cap holds 2x 512KB pag
     return RasterBackend_MFGPU_TestUploadCount() == 5; // 4 initial + 1 re-stage; each pixel-correct
 }
 
+// ---- Fix wave: pin-on-emit eviction (no intra-frame use-after-free/alias) ----
+// A single frame draws two DISTINCT textures into non-overlapping screen
+// regions, with the texture heap capped to hold only ONE of the two pages.
+// texA is staged+emitted first (pinning it for the rest of THIS frame);
+// texB's stage_texture must then fail to evict texA (still pinned) to make
+// room, so texB's upload fails. texA's region must never show texB's colour
+// (what an unguarded evict_one_lru would alias it to, since both draws would
+// share one heap offset and blt_execute only runs at frame end) — see the
+// long comment inline below for what it shows instead (either texA's own
+// colour, or a safe whole-frame drop via the pre-existing overflow net).
+static int case_intra_frame_no_alias(void) {
+    enum { TW = 512, TH = 512 };
+    static uint8_t texA_px[TW*TH*4], texB_px[TW*TH*4];
+    for (int i = 0; i < TW*TH; i++) {
+        texA_px[i*4+0] = 60;  texA_px[i*4+1] = 60;  texA_px[i*4+2] = 60;  texA_px[i*4+3] = 255;
+        texB_px[i*4+0] = 180; texB_px[i*4+1] = 180; texB_px[i*4+2] = 180; texB_px[i*4+3] = 255;
+    }
+    RTexture texA = { texA_px, TW, TH, 1, 1, /*RGBA8888*/0, 1 };
+    RTexture texB = { texB_px, TW, TH, 1, 1, /*RGBA8888*/0, 1 };
+
+    static uint8_t  rgba_mf[BW*BH*4];
+    static uint16_t mf565[BW*BH];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+
+    // 768KB holds exactly ONE 512x512 RGB565 page (512*512*2 = 512KB) but not
+    // two (1MB) — forces texB to need texA's slot within the same frame.
+    RasterBackend_MFGPU_TestReinit(768u*1024);
+
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.clear(&s_mf, 0, 0, 0, 255);
+
+    // texA: LEFT region, x in [0,100], full height.
+    BVtx vA[6] = {
+        {   0.f,      0.f, 0,0, 1,1,1,1 }, { 100.f,      0.f, 1,0, 1,1,1,1 }, {   0.f, (float)BH, 0,1, 1,1,1,1 },
+        { 100.f,      0.f, 1,0, 1,1,1,1 }, { 100.f, (float)BH, 1,1, 1,1,1,1 }, {   0.f, (float)BH, 0,1, 1,1,1,1 },
+    };
+    backend_mfgpu.draw(&s_mf, vA, 2, &texA, RB_NONE, 0.f, 101);   // stages+pins texA this frame
+
+    // texB: RIGHT region, x in [150,250], full height. Must NOT be able to
+    // evict texA's still-pinned page to make room.
+    BVtx vB[6] = {
+        { 150.f,      0.f, 0,0, 1,1,1,1 }, { 250.f,      0.f, 1,0, 1,1,1,1 }, { 150.f, (float)BH, 0,1, 1,1,1,1 },
+        { 250.f,      0.f, 1,0, 1,1,1,1 }, { 250.f, (float)BH, 1,1, 1,1,1,1 }, { 150.f, (float)BH, 0,1, 1,1,1,1 },
+    };
+    backend_mfgpu.draw(&s_mf, vB, 2, &texB, RB_NONE, 0.f, 102);   // expected to fail-to-stage, drop
+
+    backend_mfgpu.frame_end();
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, mf565);
+
+    // Sample well inside the LEFT (texA) region.
+    //
+    // With the fix, texB's stage_texture can never free texA's pinned page,
+    // so its retry-upload permanently fails; that trips the PRE-EXISTING
+    // (Task 4) emitter-overflow safety net, which drops the WHOLE frame
+    // (mf_frame_end sees g_e.overflow and leaves g_fb565 zeroed) rather than
+    // risk executing a partially-corrupt command list — so the left region
+    // reads black (r5==0), never texB's aliased colour. Without the fix,
+    // evict_one_lru frees texA's still-referenced offset, texB's retry
+    // succeeds (no overflow), the frame renders, and texA's ALREADY-EMITTED
+    // trilist command samples texB's pixels at the reused offset -> the left
+    // region reads ~tag180 (r5==22). Either way the assertion below is the
+    // real invariant this test protects: the aliased colour must never reach
+    // the framebuffer.
+    uint16_t px = mf565[(BH / 2) * BW + 50];
+    int r5 = (px >> 11) & 0x1F;
+    // tag 60 -> r5==7; black (safe frame-drop) -> r5==0; tag 180 (aliased,
+    // the bug) -> r5==22. <=12 passes for the first two, fails only for the
+    // aliasing case.
+    if (r5 > 12) {
+        printf("  FAIL intra-frame-no-alias left region r5=%d (expected <=12, texA not aliased to texB)\n", r5);
+        return 0;
+    }
+    return 1;
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -469,5 +563,7 @@ int main(void){
     else printf("raster_backend mfgpu-two-keys OK\n");
     if (!case_eviction()) { printf("FAIL mfgpu-eviction\n"); ok = 0; }
     else printf("raster_backend mfgpu-eviction OK\n");
+    if (!case_intra_frame_no_alias()) { printf("FAIL mfgpu-intra-frame-no-alias\n"); ok = 0; }
+    else printf("raster_backend mfgpu-intra-frame-no-alias OK\n");
     return ok ? 0 : 1;
 }
