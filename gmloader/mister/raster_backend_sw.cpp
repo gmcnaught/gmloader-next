@@ -19,7 +19,8 @@ static void sw_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     Blitter_ClearSurface(d, r, g, b, a);
 }
 
-static void sw_draw(RSurface *d, const BVtx *v, int n, const RTexture *t, RBlend bl, float ar) {
+static void sw_draw(RSurface *d, const BVtx *v, int n, const RTexture *t, RBlend bl, float ar, uint32_t tex_key) {
+    (void)tex_key;   // SW rasterizer keys nothing on texture identity
     Blitter_RasterDraw(d, v, n, t, bl, ar, sw_threads);
 }
 

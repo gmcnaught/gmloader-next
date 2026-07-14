@@ -20,7 +20,8 @@ typedef struct RasterBackend {
     void (*frame_begin)(void);
     void (*clear)(RSurface *dst, uint8_t r, uint8_t g, uint8_t b, uint8_t a);
     void (*draw)(RSurface *dst, const BVtx *verts, int triCount,
-                 const RTexture *tex, RBlend blend, float alphaRef);
+                 const RTexture *tex, RBlend blend, float alphaRef,
+                 uint32_t tex_key);
     void (*present)(const RSurface *defSurf);
     void (*frame_end)(void);
 } RasterBackend;

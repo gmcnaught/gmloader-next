@@ -34,6 +34,11 @@ extern "C" const RasterBackend backend_mfgpu;
 extern "C" void RasterBackend_MFGPU_TestCopyFB565(int w, int h, uint16_t *out);
 extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba);
 
+// Task 1: tiny monotonic key so each battery case gets a distinct tex_key —
+// no cross-case cache collision once Task 2 adds caching (tex_key is inert
+// this task, but every draw call site now threads one through).
+static uint32_t next_key(void){ static uint32_t k = 1; return k++; }
+
 // Mirrors Blitter_ToRGB565's per-pixel packing formula (gmloader/mister/
 // blitter.cpp) without linking that file: it lives inside #ifdef
 // MISTER_NATIVE_VIDEO and depends on GL-decode globals (g_rw/g_rh) plus the
@@ -98,7 +103,7 @@ static int one_case(void) {
         { 4.f, 28.f, 0.f, 1.f, 1,1,1,1 },
     };
     Blitter_RasterDraw(&sa, v, 1, &t, RB_NONE, 0.f, 1);          /* reference */
-    RasterBackend_Select()->draw(&sb, v, 1, &t, RB_NONE, 0.f);   /* through seam */
+    RasterBackend_Select()->draw(&sb, v, 1, &t, RB_NONE, 0.f, next_key());   /* through seam */
     return memcmp(a, b, sizeof a) == 0;
 }
 
@@ -129,8 +134,9 @@ enum { BW = 288, BH = 216 };
 // Render one case both ways into a BW x BH target and compare in RGB565.
 //   SW    : backend_sw.clear(bg) + backend_sw.draw -> RGBA8888
 //   fabric: backend_mfgpu {frame_begin, clear(bg), draw, frame_end} -> RGB565
-static int battery_case(const char *name, uint8_t br, uint8_t bg, uint8_t bb,
-                        const RTexture *tex, const BVtx *v, int triCount, RBlend blend) {
+static int battery_case_key(const char *name, uint8_t br, uint8_t bg, uint8_t bb,
+                            const RTexture *tex, const BVtx *v, int triCount,
+                            RBlend blend, uint32_t key) {
     static uint8_t  rgba_sw[BW*BH*4];
     static uint8_t  rgba_mf[BW*BH*4];   // identity handle for the default-fb check
     static uint16_t mf565[BW*BH];
@@ -138,16 +144,20 @@ static int battery_case(const char *name, uint8_t br, uint8_t bg, uint8_t bb,
     RSurface s_mf = { rgba_mf, BW, BH };
 
     backend_sw.clear(&s_sw, br, bg, bb, 255);
-    backend_sw.draw(&s_sw, v, triCount, tex, blend, 0.f);
+    backend_sw.draw(&s_sw, v, triCount, tex, blend, 0.f, key);
 
     RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);   // this surface IS the default fb
     backend_mfgpu.frame_begin();
     backend_mfgpu.clear(&s_mf, br, bg, bb, 255);
-    backend_mfgpu.draw(&s_mf, v, triCount, tex, blend, 0.f);
+    backend_mfgpu.draw(&s_mf, v, triCount, tex, blend, 0.f, key);
     backend_mfgpu.frame_end();
     RasterBackend_MFGPU_TestCopyFB565(BW, BH, mf565);
 
     return compare565(name, &s_sw, mf565);
+}
+static int battery_case(const char *name, uint8_t br, uint8_t bg, uint8_t bb,
+                        const RTexture *tex, const BVtx *v, int triCount, RBlend blend) {
+    return battery_case_key(name, br, bg, bb, tex, v, triCount, blend, next_key());
 }
 
 static int battery(void) {
@@ -336,7 +346,7 @@ static int battery(void) {
         // A default surface that is NOT this fbo -> mf_draw takes the SW fallback.
         static uint8_t other; RasterBackend_MFGPU_SetDefaultSurface(&other);
         backend_mfgpu.frame_begin();
-        backend_mfgpu.draw(&s_fbo, v, 1, &untex, RB_NONE, 0.f);
+        backend_mfgpu.draw(&s_fbo, v, 1, &untex, RB_NONE, 0.f, next_key());
         backend_mfgpu.frame_end();
         if (memcmp(ref, fbo, sizeof ref) == 0) printf("  OK   %-16s (SW-identical)\n", "fbo-fallback");
         else { printf("  FAIL %-16s FBO target not routed to SW\n", "fbo-fallback"); ok = 0; }

@@ -517,7 +517,7 @@ static int handle_draw(const char *kind, GLenum mode, int count,
                     if (g_prof) g_pf_culled++;
                 } else {
                     uint64_t _t0 = g_prof ? bl_now_ns() : 0;
-                    RasterBackend_Select()->draw(&rt, &s_verts[0], count / 3, &tex, blend, 0.0f);
+                    RasterBackend_Select()->draw(&rt, &s_verts[0], count / 3, &tex, blend, 0.0f, g_boundTex2D);
                     if (g_prof) { g_pf_raster += bl_now_ns() - _t0; g_pf_draws++; g_pf_tris += count/3; }
                     rast = 1;
                 }

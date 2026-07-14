@@ -193,14 +193,15 @@ static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
 }
 
 static void mf_draw(RSurface *d, const BVtx *v, int triCount,
-                    const RTexture *t, RBlend bl, float ar) {
+                    const RTexture *t, RBlend bl, float ar, uint32_t tex_key) {
+    (void)tex_key;
     mf_ensure_frame();
     // FBO / non-default render target: the fabric has one scanout FB, so
     // render-to-texture targets fall back to the SW rasterizer (writes d->rgba).
-    if (g_defRGBA && d->rgba != g_defRGBA) { backend_sw.draw(d, v, triCount, t, bl, ar); return; }
+    if (g_defRGBA && d->rgba != g_defRGBA) { backend_sw.draw(d, v, triCount, t, bl, ar, tex_key); return; }
     // Premultiplied-alpha source-over (dst = src + dst*(1-a)) has no exact fabric
     // blend; keep it on SW for bring-up (see raster_backend_convert.h).
-    if (bl == RB_PREMULT)        { backend_sw.draw(d, v, triCount, t, bl, ar); return; }
+    if (bl == RB_PREMULT)        { backend_sw.draw(d, v, triCount, t, bl, ar, tex_key); return; }
     if (triCount <= 0) return;
 
     // ── stage the texture page as RGB565 ──────────────────────────────────────
