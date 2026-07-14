@@ -34,6 +34,11 @@ const RasterBackend *RasterBackend_Select(void);
  * so backend_sw's rasterizer uses the same worker-thread count the direct
  * Blitter_RasterDraw call used before this refactor. Call once at init. */
 void RasterBackend_SW_SetThreads(int n);
+
+
+/* mfgpu back-end only: drop the cached staging of GL texture `id` (on GL
+ * re-upload/delete). No-op when backend_sw is selected or nothing is cached. */
+void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
 #ifdef __cplusplus
 }
 #endif

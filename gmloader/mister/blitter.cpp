@@ -323,6 +323,7 @@ void get_rtexture(RTexture *out) {
 void Blitter_OnTexImage2D(GLuint tex, int w, int h, GLenum fmt, GLenum type, const void *px) {
     if (!g_enabled) return;
     store_texture(tex ? tex : g_boundTex2D, w, h, fmt, type, px);
+    RasterBackend_MFGPU_InvalidateTex(tex ? tex : g_boundTex2D);
 }
 void Blitter_OnTexSubImage2D(GLuint, int, int, int, int, GLenum, GLenum, const void *) {
     // step 1: ignore (full re-decode not needed for logging); step 2 will patch.
@@ -334,6 +335,7 @@ void Blitter_OnBindTexture(GLenum target, GLuint tex) {
 void Blitter_OnDeleteTexture(GLuint tex) {
     auto it = g_textures.find(tex);
     if (it != g_textures.end()) { free(it->second.rgba); g_textures.erase(it); }
+    RasterBackend_MFGPU_InvalidateTex(tex);
 }
 
 void Blitter_OnBufferData(GLenum target, uint32_t size, const void *data) {

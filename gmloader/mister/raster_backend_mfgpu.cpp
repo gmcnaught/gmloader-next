@@ -388,6 +388,19 @@ extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     mf_init_once();                    // re-wires emitter, clears cache + counter
 }
 
+
+// Free the cached entry for GL texture `id` so the next draw re-stages it. Called
+// by blitter.cpp on TexImage2D re-upload and DeleteTexture — exactly when the SW
+// oracle's CPU pixels change, so the cache never diverges from SW.
+extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id) {
+    if (!g_inited) return;
+    for (int i = 0; i < MF_TEX_CACHE_N; i++)
+        if (g_texcache[i].used && g_texcache[i].key == id) {
+            blt_emitter_free(&g_e, g_texcache[i].ref.off, g_texcache[i].ref.size);
+            g_texcache[i].used = false;
+        }
+}
+
 extern "C" const RasterBackend backend_mfgpu = {
     "mfgpu", mf_frame_begin, mf_clear, mf_draw, mf_present, mf_frame_end,
 };

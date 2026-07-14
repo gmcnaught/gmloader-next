@@ -37,6 +37,8 @@ extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba);
 extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void);
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes);
 
+extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
+
 // Task 1: tiny monotonic key so each battery case gets a distinct tex_key —
 // no cross-case cache collision once Task 2 adds caching (tex_key is inert
 // this task, but every draw call site now threads one through).
@@ -397,6 +399,25 @@ static int case_cache_hit(void) {
     return RasterBackend_MFGPU_TestUploadCount() == 1;   // uploaded once, reused once
 }
 
+
+static int case_invalidate(void) {
+    static uint8_t px[4] = { 10,20,30,255 };
+    RTexture t = { px, 1, 1, 1, 1, 0, 1 };
+    BVtx v[3] = { {2,2,0,0,1,1,1,1}, {28,4,1,0,1,1,1,1}, {4,28,0,1,1,1,1,1} };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_TestReinit(0);
+    const uint32_t K = 77;
+    // frame 1: stage (upload #1)
+    backend_mfgpu.frame_begin(); backend_mfgpu.draw(&s_mf, v, 1, &t, RB_NONE, 0.f, K); backend_mfgpu.frame_end();
+    // invalidate + change pixels, frame 2: must re-upload (upload #2)
+    RasterBackend_MFGPU_InvalidateTex(K);
+    px[0] = 250;
+    backend_mfgpu.frame_begin(); backend_mfgpu.draw(&s_mf, v, 1, &t, RB_NONE, 0.f, K); backend_mfgpu.frame_end();
+    return RasterBackend_MFGPU_TestUploadCount() == 2;
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -409,5 +430,7 @@ int main(void){
     else printf("raster_backend mfgpu-cache-large-page OK\n");
     if (!case_cache_hit()) { printf("FAIL mfgpu-cache-hit\n"); ok = 0; }
     else printf("raster_backend mfgpu-cache-hit OK\n");
+    if (!case_invalidate()) { printf("FAIL mfgpu-invalidate\n"); ok = 0; }
+    else printf("raster_backend mfgpu-invalidate OK\n");
     return ok ? 0 : 1;
 }
