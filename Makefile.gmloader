@@ -100,7 +100,7 @@ ifeq ($(MISTER_BUILD),1)
 CFLAGS   += -DMISTER_NATIVE_VIDEO=1 -DMISTER_WIDTH=320 -DMISTER_HEIGHT=240
 CXXFLAGS += -DMISTER_NATIVE_VIDEO=1 -DMISTER_WIDTH=320 -DMISTER_HEIGHT=240
 LDFLAGS  += -L$(CURDIR)/3rdparty/gles2-sw -lGLES_sw -Wl,-rpath,'$$ORIGIN'
-MISTER_SRCS = gmloader/mister/native_video_writer.c gmloader/mister/frame_capture.cpp gmloader/mister/draw_trace.cpp gmloader/mister/blitter.cpp gmloader/mister/blitter_raster.cpp gmloader/mister/raster_backend_sw.cpp
+MISTER_SRCS = gmloader/mister/native_video_writer.c gmloader/mister/frame_capture.cpp gmloader/mister/draw_trace.cpp gmloader/mister/blitter.cpp gmloader/mister/blitter_raster.cpp gmloader/mister/raster_backend_sw.cpp gmloader/mister/raster_backend_mfgpu.cpp
 endif
 
 # Used by generate_libc.py to generate the function tables that are exported to the
@@ -169,7 +169,10 @@ ${LIBC_TABS} &: ${LIBC_SRCS} thunks/libc/symtab thunks/libc/symtab_exclude thunk
 # ---- host-side unit tests (no ARM cross-compile needed) --------------------
 .PHONY: raster-backend-test
 raster-backend-test:
-	c++ -std=c++17 -Igmloader/mister \
+	c++ -std=c++17 -Igmloader/mister $(MFGPU_INC) \
 	  gmloader/mister/raster_backend_test.cpp \
 	  gmloader/mister/raster_backend_sw.cpp \
-	  gmloader/mister/blitter_raster.cpp -o /tmp/rbt && /tmp/rbt
+	  gmloader/mister/raster_backend_mfgpu.cpp \
+	  gmloader/mister/blitter_raster.cpp \
+	  $(MFGPU_SRC) \
+	  -lm -o /tmp/rbt && /tmp/rbt
