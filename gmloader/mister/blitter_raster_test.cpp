@@ -53,6 +53,8 @@ static RTexture make_tex2x2() {
     t.w = 2; t.h = 2;
     t.nearest = 1;
     t.valid = 1;
+    t.format = RTEX_RGBA8888;
+    t.opaque = 1;   // all four texels have alpha 255
     return t;
 }
 
@@ -97,6 +99,35 @@ static void test_textured_quad() {
     ok &= px_eq(s,  4, 12,   0,   0, 255, 255);  // blue
     ok &= px_eq(s, 12, 12, 255, 255, 255, 255);  // white
     report("textured quad: quadrant centres match texels", ok);
+}
+
+// ---- Case 1b: same quad sampled from a packed RGBA4444 texture --------------
+// Colours are nibble-aligned (0x00 / 0xFF) so the 8->4->8 round-trip is exact;
+// this checks the packed-format sampler decode (GMLOADER_BLITTER_TEX16 path).
+static void test_textured_quad_rgba4444() {
+    // Pack the same 2x2 fixture as RGBA4444: (R<<12)|(G<<8)|(B<<4)|A, top nibble.
+    uint16_t tex16[4];
+    for (int i = 0; i < 4; ++i) {
+        const uint8_t *s = g_tex2x2 + i * 4;
+        tex16[i] = (uint16_t)(((s[0] >> 4) << 12) | ((s[1] >> 4) << 8) |
+                              ((s[2] >> 4) << 4)  |  (s[3] >> 4));
+    }
+    RTexture tex;
+    tex.rgba = (const uint8_t *)tex16;
+    tex.w = 2; tex.h = 2; tex.nearest = 1; tex.valid = 1;
+    tex.format = RTEX_RGBA4444;
+    tex.opaque = 1;
+
+    uint8_t buf[16 * 16 * 4];
+    RSurface s = make_surface(buf, 16, 16);
+    draw_fullscreen_quad(s, &tex, RB_NONE, -1.0f, 1, 1, 1, 1);
+
+    bool ok = true;
+    ok &= px_eq(s,  4,  4, 255,   0,   0, 255);  // red
+    ok &= px_eq(s, 12,  4,   0, 255,   0, 255);  // green
+    ok &= px_eq(s,  4, 12,   0,   0, 255, 255);  // blue
+    ok &= px_eq(s, 12, 12, 255, 255, 255, 255);  // white
+    report("RGBA4444 quad: packed-texel decode matches RGBA8888", ok);
 }
 
 // ---- Case 2: RB_ALPHA blend over a known background -------------------------
@@ -184,12 +215,42 @@ static void test_degenerate() {
     report("robustness: zero-area + NaN tris are no-ops", ok);
 }
 
+// ---- Case 7: opaque fast-path equivalence -----------------------------------
+// The blitter's opaque fast-path (blitter.cpp) downgrades an RB_ALPHA draw to
+// RB_NONE when the source is provably opaque (all texel alpha==255 AND all vertex
+// alpha==1). This proves the downgrade is pixel-identical: an opaque source drawn
+// under RB_ALPHA must match the same draw forced to RB_NONE.
+static void test_opaque_fastpath_equiv() {
+    uint8_t bufA[16 * 16 * 4], bufN[16 * 16 * 4];
+    // Non-trivial background so a wrong blend (reading dst) would diverge.
+    RSurface sA; sA.rgba = bufA; sA.w = 16; sA.h = 16;
+    RSurface sN; sN.rgba = bufN; sN.w = 16; sN.h = 16;
+    Blitter_ClearSurface(&sA, 30, 60, 90, 120);
+    Blitter_ClearSurface(&sN, 30, 60, 90, 120);
+
+    RTexture tex = make_tex2x2();   // opaque (all alpha 255)
+
+    // Opaque vertex colour (a==1). RB_ALPHA over the bg, vs RB_NONE plain copy.
+    draw_fullscreen_quad(sA, &tex, RB_ALPHA, -1.0f, 1, 1, 1, 1);
+    draw_fullscreen_quad(sN, &tex, RB_NONE,  -1.0f, 1, 1, 1, 1);
+
+    bool ok = true;
+    for (int y = 0; y < 16 && ok; ++y)
+        for (int x = 0; x < 16 && ok; ++x) {
+            const uint8_t *a = px(sA, x, y), *n = px(sN, x, y);
+            ok &= a[0]==n[0] && a[1]==n[1] && a[2]==n[2] && a[3]==n[3];
+        }
+    report("opaque fast-path: RB_ALPHA opaque source == RB_NONE", ok);
+}
+
 int main() {
     test_textured_quad();
+    test_textured_quad_rgba4444();
     test_alpha_blend();
     test_alpha_test_discard();
     test_clipping();
     test_degenerate();
+    test_opaque_fastpath_equiv();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

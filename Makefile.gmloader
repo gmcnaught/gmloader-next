@@ -24,9 +24,15 @@ LIBS:=\
 	$(shell ${PKG_CONFIG} sdl2 --libs) \
 	$(shell ${PKG_CONFIG} zlib --libs)
 
+MFGPU_DIR := 3rdparty/mfgpu
+MFGPU_SRC := $(MFGPU_DIR)/refmodel/blitter_ref.c $(MFGPU_DIR)/refmodel/blt_tri.c \
+             $(MFGPU_DIR)/host/blt_emitter.c $(MFGPU_DIR)/host/blt_alloc.c \
+             $(MFGPU_DIR)/libmfgpu/mfgpu.c $(MFGPU_DIR)/libmfgpu/mfgpu_xform.c
+MFGPU_INC := -I$(MFGPU_DIR)/libmfgpu -I$(MFGPU_DIR)/host -I$(MFGPU_DIR)/refmodel
+
 # General compilation flags
 OPTM?=-O2 -ggdb
-COMMONFLAGS:=-Wno-strict-aliasing -Werror=return-type -I. -I./thunks/ -I./loader/ -I./gmloader/ -I./build/${ARCH}/thunks/libc -I./jni/ -I./3rdparty/json/include -I./3rdparty/stb -I./3rdparty/lua -I./3rdparty/libzip/lib -I./3rdparty/libzip-config ${OPTM} -MMD
+COMMONFLAGS:=-Wno-strict-aliasing -Werror=return-type -I. -I./thunks/ -I./loader/ -I./gmloader/ -I./build/${ARCH}/thunks/libc -I./jni/ -I./3rdparty/json/include -I./3rdparty/stb -I./3rdparty/lua -I./3rdparty/libzip/lib -I./3rdparty/libzip-config ${MFGPU_INC} ${OPTM} -MMD
 CFLAGS:=$(shell ${PKG_CONFIG} sdl2 --cflags) ${COMMONFLAGS}
 CXXFLAGS:=-std=gnu++2a -fuse-cxa-atexit $(shell ${PKG_CONFIG} sdl2 --cflags) ${COMMONFLAGS}
 
@@ -94,7 +100,7 @@ ifeq ($(MISTER_BUILD),1)
 CFLAGS   += -DMISTER_NATIVE_VIDEO=1 -DMISTER_WIDTH=320 -DMISTER_HEIGHT=240
 CXXFLAGS += -DMISTER_NATIVE_VIDEO=1 -DMISTER_WIDTH=320 -DMISTER_HEIGHT=240
 LDFLAGS  += -L$(CURDIR)/3rdparty/gles2-sw -lGLES_sw -Wl,-rpath,'$$ORIGIN'
-MISTER_SRCS = gmloader/mister/native_video_writer.c gmloader/mister/frame_capture.cpp gmloader/mister/draw_trace.cpp gmloader/mister/blitter.cpp gmloader/mister/blitter_raster.cpp
+MISTER_SRCS = gmloader/mister/native_video_writer.c gmloader/mister/frame_capture.cpp gmloader/mister/draw_trace.cpp gmloader/mister/blitter.cpp gmloader/mister/blitter_raster.cpp gmloader/mister/raster_backend_sw.cpp gmloader/mister/raster_backend_mfgpu.cpp
 endif
 
 # Used by generate_libc.py to generate the function tables that are exported to the
@@ -110,6 +116,7 @@ JNI_OBJS+=$(patsubst %.cpp,build/%.cpp.o,$(wildcard jni/*.cpp))
 GMLOADER_OBJS:=$(patsubst %.cpp,build/%.cpp.o,$(wildcard gmloader/*.cpp))
 GMLOADER_OBJS+=$(patsubst %.cpp,build/%.cpp.o,$(wildcard gmloader/classes/*.cpp))
 GMLOADER_OBJS+=$(patsubst %.cpp,build/%.cpp.o,$(wildcard gmloader/stubs/*.cpp))
+MFGPU_OBJS:=$(patsubst %.c,build/%.c.o,$(MFGPU_SRC))
 
 ifeq ($(MISTER_BUILD),1)
 MISTER_OBJS:=$(patsubst %.cpp,build/%.cpp.o,$(filter %.cpp,$(MISTER_SRCS)))
@@ -121,6 +128,7 @@ GENERIC_OBJ:=\
 	${THUNK_OBJS} \
 	${JNI_OBJS} \
 	${GMLOADER_OBJS} \
+	${MFGPU_OBJS} \
 	${MISTER_OBJS}
 
 OBJ=$(patsubst build/%,build/${ARCH}/%,${GENERIC_OBJ})
@@ -157,3 +165,14 @@ ${LIBC_TABS} &: ${LIBC_SRCS} thunks/libc/symtab thunks/libc/symtab_exclude thunk
 
 # Include all build dependencies too
 -include $(OBJ:%.o=%.d)
+
+# ---- host-side unit tests (no ARM cross-compile needed) --------------------
+.PHONY: raster-backend-test
+raster-backend-test:
+	c++ -std=c++17 -Igmloader/mister $(MFGPU_INC) \
+	  gmloader/mister/raster_backend_test.cpp \
+	  gmloader/mister/raster_backend_sw.cpp \
+	  gmloader/mister/raster_backend_mfgpu.cpp \
+	  gmloader/mister/blitter_raster.cpp \
+	  $(MFGPU_SRC) \
+	  -lm -o /tmp/rbt && /tmp/rbt

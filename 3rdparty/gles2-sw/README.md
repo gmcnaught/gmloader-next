@@ -3,11 +3,18 @@
 This directory holds a pre-built software OpenGL ES 2.0 implementation
 (`libGLES_sw.so`) targeting ARM32 (Cortex-A9, `arm-linux-gnueabihf`).
 
-## Why is the binary not in this repo?
+## Interim: the stub binary IS vendored (as of PR #11)
 
-`libGLES_sw.so` is a large, platform-specific binary (~20–80 MB depending on
-the source) and is not appropriate for version control. The `.gitignore` in
-this directory prevents it from being accidentally committed.
+The `libGLES_sw.so` currently checked in here is a small (~85 KB) prebuilt
+ARM32 software-GLES **stub** — enough to satisfy the MiSTer link
+(`-lGLES_sw`) so CI (`build-mister-arm`) can build without a separate
+provisioning step. The `.gitignore` still ignores `*.so` generally but
+un-ignores this one file (`!libGLES_sw.so`).
+
+**Follow-up (tracked separately):** build the software-GLES renderer in CI as a
+standalone artifact (Mesa llvmpipe / SwiftShader per the options below) and drop
+the vendored copy. A full renderer is ~20–80 MB and is not appropriate for
+long-term version control; the vendored stub is a stopgap only.
 
 ## How to obtain libGLES_sw.so
 

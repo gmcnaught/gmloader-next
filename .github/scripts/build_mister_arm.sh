@@ -26,7 +26,8 @@ apt-get install -y -qq \
     libsdl2-dev:armhf \
     libzip-dev:armhf \
     zlib1g-dev:armhf \
-    ca-certificates
+    ca-certificates \
+    file
 # Note: libbsd is compiled from submodule sources (3rdparty/libbsd),
 # and libzip is compiled from submodule sources (3rdparty/libzip),
 # so their -dev packages above are optional fallbacks.
@@ -57,7 +58,8 @@ BINARY=build/${ARCH}/gmloader/gmloadernext.armhf
 
 echo "=== Binary info ==="
 ls -lh "${BINARY}"
-file "${BINARY}"
+# Diagnostic only — never fail the build if `file` is unavailable.
+file "${BINARY}" || echo "(file utility unavailable; skipping type info)"
 
 echo "=== Stripping binary ==="
 ${ARCH}-strip "${BINARY}"

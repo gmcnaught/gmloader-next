@@ -9,6 +9,7 @@ void from_json(const json& j, gml_config& c) {
     get_if_exists("save_dir", save_dir);
     get_if_exists("apk_path", apk_path);
     get_if_exists("shader_dir", shader_dir);
+    get_if_exists("controller_db", controller_db);
     get_if_exists("show_cursor", show_cursor);
     get_if_exists("disable_controller", disable_controller);
     get_if_exists("disable_depth", disable_depth);
@@ -18,12 +19,14 @@ void from_json(const json& j, gml_config& c) {
     get_if_exists("disable_texhack", disable_texhack);
     get_if_exists("rumble_scale", rumble_scale);
     get_if_exists("force_platform", force_platform);
+    get_if_exists("blitter", blitter);
 }
 
 void gml_config::init_defaults(){
     apk_path = "game.apk";
     save_dir = "";
     shader_dir = "";
+    controller_db = "";
     show_cursor = true;
     disable_controller = false;
     disable_depth = false;
@@ -33,6 +36,7 @@ void gml_config::init_defaults(){
     disable_texhack = true; /* Disabled by default until properly tested. */
     rumble_scale = 1.0;
     force_platform = "os_android";
+    blitter = 0;
 }
 
 int gml_config::parse_file(const char* path) {
@@ -60,6 +64,7 @@ void gml_config::show_config(){
     printf("config: save_dir = %s\n", save_dir.c_str());
     printf("config: apk_path = %s\n", apk_path.c_str());
     printf("config: shader_dir = %s\n", shader_dir.c_str());
+    printf("config: controller_db = %s\n", controller_db.c_str());
     printf("config: show_cursor = %d\n", show_cursor);
     printf("config: disable_controller = %d\n", disable_controller);
     printf("config: disable_depth = %d\n", disable_depth);
@@ -69,4 +74,5 @@ void gml_config::show_config(){
     printf("config: disable_texhack = %d\n", disable_texhack);
     printf("config: rumble_scale = %f\n", rumble_scale);
     printf("config: force_platform = %s\n", force_platform.c_str());
+    printf("config: blitter = %d\n", blitter);
 }

@@ -23,13 +23,25 @@ struct RSurface {
 };
 
 // ---- Source texture ---------------------------------------------------------
-// CPU copy of a texture's pixels (RGBA8888). When valid==0 (or tex==nullptr) the
-// sampler returns opaque white, so an untextured draw is just the vertex colour.
+// CPU copy of a texture's pixels. When valid==0 (or tex==nullptr) the sampler
+// returns opaque white, so an untextured draw is just the vertex colour.
+//   format RTEX_RGBA8888: `rgba` is 4 bytes/texel R,G,B,A.
+//   format RTEX_RGBA4444: `rgba` is 2 bytes/texel, one uint16 per texel packed
+//                         (R<<12)|(G<<8)|(B<<4)|A; each nibble is expanded back to
+//                         8-bit by replication when sampled. Halves the per-texel
+//                         gather bandwidth / cache footprint (see Blitter footprint
+//                         notes). Nearest-only.
+enum {
+    RTEX_RGBA8888 = 0,
+    RTEX_RGBA4444 = 1,
+};
 struct RTexture {
     const uint8_t *rgba;
     int            w, h;
     int            nearest;   // 1 = nearest filter (only mode implemented; linear TODO)
     int            valid;     // pixels present and usable
+    int            format;    // RTEX_RGBA8888 | RTEX_RGBA4444
+    int            opaque;    // 1 = every texel alpha == 255 (enables blend fast-path)
 };
 
 // ---- Blend modes ------------------------------------------------------------

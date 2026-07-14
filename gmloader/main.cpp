@@ -26,8 +26,17 @@
 #include "mister/frame_capture.h"
 #include "mister/draw_trace.h"
 #include "mister/blitter.h"
+#include "mister/raster_backend.h"
 // Global handle to bundled libGLES_sw.so — also used by egl.cpp and gles2.cpp via extern
 void* g_gles_handle = nullptr;
+
+// Task 7: GMLOADER_RASTER=mfgpu device wiring. backend_mfgpu / RasterBackend_Select
+// live in raster_backend_{mfgpu,sw}.cpp; RasterBackend_MFGPU_GetFB565 hands back
+// the fabric's already-RGB565 scanout buffer so it can go straight to
+// NativeVideoWriter_WriteFrame, skipping Blitter_ToRGB565 (see the present block
+// below).
+extern "C" const RasterBackend backend_mfgpu;
+extern "C" const uint16_t *RasterBackend_MFGPU_GetFB565(int *w, int *h);
 #endif
 
 
@@ -310,6 +319,29 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    // Load an SDL controller-mapping DB so pads not in SDL's built-in list are
+    // recognized as GameControllers (update_inputs only handles the GameController
+    // API — an unmapped pad would never raise CONTROLLERDEVICEADDED). Try the
+    // configured path first, then conventional locations next to the binary and in
+    // save_dir. SDL also auto-applies the SDL_GAMECONTROLLERCONFIG env var on init.
+    {
+        std::string candidates[] = {
+            gmloader_config.controller_db,
+            "gamecontrollerdb.txt",
+            (fs::path(gmloader_config.save_dir) / "gamecontrollerdb.txt").string(),
+        };
+        for (const std::string &p : candidates) {
+            if (p.empty() || !fs::exists(p)) continue;
+            int n = SDL_GameControllerAddMappingsFromFile(p.c_str());
+            if (n < 0) {
+                warning("Controller DB '%s' failed to load: %s\n", p.c_str(), SDL_GetError());
+            } else {
+                warning("Loaded %d controller mapping(s) from %s\n", n, p.c_str());
+            }
+            break;   // first existing file wins
+        }
+    }
+
     if(gmloader_config.show_cursor == 0) {
         if (SDL_ShowCursor(SDL_DISABLE) < 0) {
             warning("Cannot disable cursor: %s\n", SDL_GetError());
@@ -542,11 +574,27 @@ int main(int argc, char *argv[])
         if (RunnerJNILib::canFlip(env, 0)) {
           const uint8_t* _blit = Blitter_PresentDefault();
           if (_blit && NativeVideoWriter_IsActive()) {
-            // Blitter owns the frame: convert (with row flip) straight to DDR,
-            // skipping glReadPixels entirely.
-            static uint16_t rgb565_blit[MISTER_WIDTH * MISTER_HEIGHT];
-            Blitter_ToRGB565(_blit, rgb565_blit);
-            NativeVideoWriter_WriteFrame(rgb565_blit, MISTER_WIDTH, MISTER_HEIGHT, MISTER_WIDTH * 2);
+            if (RasterBackend_Select() == &backend_mfgpu) {
+              // Task 7: fabric backend. present() (called inside
+              // Blitter_PresentDefault() above) already executed the frame's
+              // ring into g_fb565, which is RGB565 already (BLT_FB_WIDTH x
+              // BLT_FB_HEIGHT == MISTER_WIDTH x MISTER_HEIGHT) — hand it to
+              // the DDR writer directly, skipping Blitter_ToRGB565.
+              int fb_w = 0, fb_h = 0;
+              const uint16_t* fb565 = RasterBackend_MFGPU_GetFB565(&fb_w, &fb_h);
+              // Row stride comes from the fabric framebuffer's ACTUAL width (fb_w),
+              // not an assumed MISTER_WIDTH, so a future BLT_FB_WIDTH != MISTER_WIDTH
+              // cannot silently shear the image. Visible area is clamped to the fb.
+              const int vis_w = (fb_w < MISTER_WIDTH) ? fb_w : MISTER_WIDTH;
+              const int vis_h = (fb_h < MISTER_HEIGHT) ? fb_h : MISTER_HEIGHT;
+              NativeVideoWriter_WriteFrame(fb565, vis_w, vis_h, fb_w * 2);
+            } else {
+              // Blitter owns the frame: convert (with row flip) straight to DDR,
+              // skipping glReadPixels entirely.
+              static uint16_t rgb565_blit[MISTER_WIDTH * MISTER_HEIGHT];
+              Blitter_ToRGB565(_blit, rgb565_blit);
+              NativeVideoWriter_WriteFrame(rgb565_blit, MISTER_WIDTH, MISTER_HEIGHT, MISTER_WIDTH * 2);
+            }
           } else {
             FrameCapture_ReadFrame();
 

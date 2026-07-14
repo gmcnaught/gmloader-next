@@ -1,6 +1,8 @@
 {
     "save_dir" : "saves",
     "apk_path" : "mygame.apk",
+    "controller_db" : "gamecontrollerdb.txt",
+    "blitter" : 2,
     "show_cursor" : false,
     "disable_controller" : false,
     "disable_depth" : false,
