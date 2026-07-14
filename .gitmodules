@@ -19,3 +19,6 @@
 [submodule "3rdparty/SDL_kitchensink"]
 	path = 3rdparty/SDL_kitchensink
 	url = https://github.com/katajakasa/SDL_kitchensink
+[submodule "3rdparty/mfgpu"]
+	path = 3rdparty/mfgpu
+	url = git@github.com:gmcnaught/mister-fpga-blitter.git
