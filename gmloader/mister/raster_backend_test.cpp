@@ -172,6 +172,32 @@ static int battery(void) {
         }
     RTexture tex4 = { px16, 4, 4, 1, 1, 0, 1 };
 
+    // Task 6: hard-edged (alpha in {0,255}) textures for the colorkey battery.
+    // 8x8 with a 1-texel transparent border (interior opaque).
+    static uint8_t pxBorder[8*8*4];
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x++) {
+            uint8_t *p = pxBorder + (y*8 + x) * 4;
+            bool border = (x == 0 || x == 7 || y == 0 || y == 7);
+            if (border) { p[0]=0;   p[1]=0;   p[2]=0;   p[3]=0;   }
+            else        { p[0]=180; p[1]=90;  p[2]=40;  p[3]=255; }
+        }
+    RTexture texBorder = { pxBorder, 8, 8, 1, 1, /*RTEX_RGBA8888*/0, /*opaque*/0 };
+
+    // 4x4 checkerboard alpha (opaque texels on (x+y) even). Cell (0,0) is pure
+    // magenta (255,0,255) -> converts exactly to MF_COLORKEY (0xF81F), so this
+    // case also exercises the opaque/colorkey-collision nudge in the staging.
+    static uint8_t pxCheck[4*4*4];
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) {
+            uint8_t *p = pxCheck + (y*4 + x) * 4;
+            bool opaque = ((x + y) % 2) == 0;
+            if (!opaque)          { p[0]=0;   p[1]=0;   p[2]=0;   p[3]=0;   }
+            else if (x==0 && y==0){ p[0]=255; p[1]=0;   p[2]=255; p[3]=255; }
+            else                  { p[0]=90;  p[1]=140; p[2]=200; p[3]=255; }
+        }
+    RTexture texCheck = { pxCheck, 4, 4, 1, 1, /*RTEX_RGBA8888*/0, /*opaque*/0 };
+
     // 1) opaque tri — flat-tinted white passthrough, coverage over a bg.
     {
         BVtx v[3] = {
@@ -242,7 +268,43 @@ static int battery(void) {
         ok &= battery_case("tex-NxM", 5,5,5, &tex4, v, 2, RB_NONE);
     }
 
-    // 8) FBO fallback — a non-default target must delegate to backend_sw (writes
+    // 8/9) keyed textures — hard-edged cutout (alpha in {0,255}); vertex alpha
+    //    is fully opaque so these must take the BLT_BLEND_COLORKEY path.
+    //
+    //    Each texel is drawn as its own flat-shaded screen cell with a UV
+    //    CONSTANT across all 6 vertices of its 2 triangles (not interpolated
+    //    corner-to-corner). This sidesteps a pre-existing, already-documented
+    //    divergence between the two rasterizers' nearest-sample rounding (the
+    //    golden fabric rounds-to-nearest-texel via a +HALF bias in
+    //    tex_nearest(), the SW oracle floors — see the tex-NxM case's "diagonal
+    //    neighbour" note above): for a texture interpolated smoothly across a
+    //    quad that's a sub-LSB rounding difference, but for a *binary* alpha
+    //    edge it would flip a whole texel's classification (opaque vs keyed)
+    //    over roughly half of that texel's screen footprint. u=(tx+0.25)/tw
+    //    sits inside both conventions' agreement window [tx,tx+0.5) for any
+    //    texel index tx, so every quad deterministically samples the texel
+    //    it's meant to, on both rasterizers.
+    auto keyed_case = [&](const char *name, const RTexture &tex, int tw, int th, int cell) {
+        static BVtx v[64*6];
+        int n = 0;
+        for (int ty = 0; ty < th; ty++) {
+            for (int tx = 0; tx < tw; tx++) {
+                float u = (tx + 0.25f) / (float)tw, uv = (ty + 0.25f) / (float)th;
+                float x0 = 40.f + tx*cell, y0 = 40.f + ty*cell;
+                float x1 = x0 + cell,       y1 = y0 + cell;
+                BVtx q[6] = {
+                    { x0,y0, u,uv, 1,1,1,1 }, { x1,y0, u,uv, 1,1,1,1 }, { x1,y1, u,uv, 1,1,1,1 },
+                    { x0,y0, u,uv, 1,1,1,1 }, { x1,y1, u,uv, 1,1,1,1 }, { x0,y1, u,uv, 1,1,1,1 },
+                };
+                for (int i = 0; i < 6; i++) v[n++] = q[i];
+            }
+        }
+        ok &= battery_case(name, 5,5,5, &tex, v, n/3, RB_NONE);
+    };
+    keyed_case("keyed-border",  texBorder, 8, 8, 4);   // 1-texel transparent border
+    keyed_case("keyed-checker", texCheck,  4, 4, 8);   // checkerboard alpha + nudge
+
+    // 10) FBO fallback — a non-default target must delegate to backend_sw (writes
     //    the dst surface directly, byte-identical to the reference rasterizer).
     {
         enum { W = 64, H = 64 };

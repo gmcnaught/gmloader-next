@@ -47,6 +47,21 @@
 // uses a 1x1 opaque-white page, and alpha compositing rides BLT_BLEND_CONST_ALPHA
 // with header alpha=255 (effective alpha = interpolated vtx.a). See
 // raster_backend_convert.h for the full rationale.
+//
+// ── COLORKEY STAGING FOR HARD-EDGED (1-BIT) ALPHA (Task 6) ────────────────────
+// The one hole in "no per-texel alpha": blt_tri.c DOES have BLT_BLEND_COLORKEY
+// (skip a texel that == the header colorkey). mf_texel565() folds any texel
+// with alpha<128 into the sentinel MF_COLORKEY (0xF81F, magenta), nudging any
+// opaque texel that happens to convert to that exact value off by one green
+// LSB so it can never collide. mf_draw() then emits BLT_BLEND_COLORKEY instead
+// of the Task 5 blend when the staged texture used the key (has_key) AND the
+// draw's vertex alpha is fully opaque (min vtx.a*255 >= 254) — that is exactly
+// the case (256-color palette sprites, e.g. Maldita Castilla) where the SW
+// oracle's per-texel-alpha result and the fabric's colorkey result are
+// pixel-identical (mod 565 rounding). A faded cutout (vtx.a < 254 on a keyed
+// texture) can't combine colorkey + const-alpha in one TRILIST pass, so it
+// falls back to CONST_ALPHA (no cutout, see the comment at the call site);
+// real per-texel alpha is a future RTL item.
 #include "raster_backend.h"
 #include "raster_backend_convert.h"
 extern "C" {
@@ -93,18 +108,40 @@ static inline uint16_t mf_rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
 }
 
-// Convert one RTexture texel to RGB565 (alpha dropped; the tri path is opaque).
-static inline uint16_t mf_texel565(const RTexture *t, int x, int y) {
+// Sentinel RGB565 value (magenta) used to mark "this texel is transparent" for
+// BLT_BLEND_COLORKEY staging (Task 6). The golden rasterizer (blt_tri.c) skips
+// any texel that compares == the header colorkey, so a hard-edged (alpha in
+// {0,255}) 1-bit-alpha texture round-trips through colorkey exactly.
+static const uint16_t MF_COLORKEY = 0xF81F;
+
+// Convert one RTexture texel to RGB565, folding hard-edged alpha into the
+// BLT_BLEND_COLORKEY sentinel (Task 6). Soft/intermediate alpha still has no
+// fabric representation (no per-texel alpha in a triangle list) and is treated
+// as opaque, same as Task 5.
+//   alpha < 128            -> emit MF_COLORKEY (this texel is "hole" for a
+//                              colorkey draw; harmless dead colour otherwise).
+//   alpha >= 128            -> convert RGB->565; if that exact value collides
+//                              with MF_COLORKEY, nudge it off by one green LSB
+//                              so an opaque texel can never be mistaken for the
+//                              key (out_has_key still only set by real holes).
+static inline uint16_t mf_texel565(const RTexture *t, int x, int y, bool *out_has_key) {
+    uint8_t r, g, b, a;
     if (t->format == RTEX_RGBA4444) {
         const uint16_t *p16 = (const uint16_t *)t->rgba;
         uint16_t p = p16[(size_t)y * t->w + x];        // packed (R4<<12|G4<<8|B4<<4|A4)
-        unsigned r4 = (p >> 12) & 0xF, g4 = (p >> 8) & 0xF, b4 = (p >> 4) & 0xF;
-        return mf_rgb565((uint8_t)((r4 << 4) | r4),
-                         (uint8_t)((g4 << 4) | g4),
-                         (uint8_t)((b4 << 4) | b4));   // nibble replicate -> 8-bit
+        unsigned r4 = (p >> 12) & 0xF, g4 = (p >> 8) & 0xF, b4 = (p >> 4) & 0xF, a4 = p & 0xF;
+        r = (uint8_t)((r4 << 4) | r4);
+        g = (uint8_t)((g4 << 4) | g4);
+        b = (uint8_t)((b4 << 4) | b4);                  // nibble replicate -> 8-bit
+        a = (uint8_t)((a4 << 4) | a4);
+    } else {
+        const uint8_t *p = t->rgba + ((size_t)y * t->w + x) * 4;  // RTEX_RGBA8888
+        r = p[0]; g = p[1]; b = p[2]; a = p[3];
     }
-    const uint8_t *p = t->rgba + ((size_t)y * t->w + x) * 4;  // RTEX_RGBA8888
-    return mf_rgb565(p[0], p[1], p[2]);
+    if (a < 128) { *out_has_key = true; return MF_COLORKEY; }
+    uint16_t result = mf_rgb565(r, g, b);
+    if (result == MF_COLORKEY) result ^= 0x0020;   // opaque texel must never == the key
+    return result;
 }
 
 static void mf_init_once(void) {
@@ -155,10 +192,11 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
                 tw, th, MF_TEX_TEXELS);
         return;
     }
+    bool has_key = false;
     if (textured) {
         for (int y = 0; y < th; y++)
             for (int x = 0; x < tw; x++)
-                g_texscratch[(size_t)y * tw + x] = mf_texel565(t, x, y);
+                g_texscratch[(size_t)y * tw + x] = mf_texel565(t, x, y, &has_key);
     } else {
         g_texscratch[0] = 0xFFFF;   // 1x1 opaque white -> vertex color passthrough
     }
@@ -175,8 +213,11 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
                 triCount, MF_MAX_VERTS);
         return;
     }
-    for (int i = 0; i < nverts; i++)
+    float min_vtx_a = 1.0f;
+    for (int i = 0; i < nverts; i++) {
         g_vtxscratch[i] = bvtx_to_blt(&v[i], tw, th);
+        if (v[i].a < min_vtx_a) min_vtx_a = v[i].a;
+    }
     uint32_t eoff = blt_push_tris(&g_e, g_vtxscratch, triCount);
     if (eoff == 0xFFFFFFFFu) {
         fprintf(stderr, "backend_mfgpu: vertex push overflow (%d tris) - draw dropped\n", triCount);
@@ -185,7 +226,30 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
 
     // ── emit the TRILIST header (header alpha 255: CONST_ALPHA rides vtx.a) ────
     (void)ar;   // the fabric tri path has no alpha-test; GM's threshold is ~0
-    if (blt_trilist(&g_e, tex, rblend_to_blt(bl), /*colorkey=*/0, /*alpha=*/255,
+    //
+    // Colorkey-aware blend selection (Task 6): a texture that staged any texel
+    // as MF_COLORKEY (has_key) is a hard-edged (alpha in {0,255}) cutout — if
+    // the draw is also fully opaque at the vertex level (min_vtx_a*255 >= 254),
+    // BLT_BLEND_COLORKEY reproduces the SW oracle's per-texel-alpha cutout
+    // exactly (mod 565 rounding). Otherwise fall back to the Task 5 path.
+    //
+    // KNOWN LIMITATION: a *faded* cutout sprite (keyed texture drawn with
+    // vtx.a < 254, e.g. a fade-out) cannot combine colorkey + const-alpha in a
+    // single fabric TRILIST pass (blt_tri.c's blend switch is one case, not a
+    // pipeline) — it falls back to CONST_ALPHA below, which composites the key
+    // colour's pixels too (no cutout) while fading. Soft/faded transparency
+    // needs real per-texel alpha in the fabric raster path; that's a future RTL
+    // item, out of scope here.
+    uint8_t blend_mode;
+    uint16_t colorkey;
+    if (has_key && min_vtx_a * 255.0f >= 254.0f) {
+        blend_mode = BLT_BLEND_COLORKEY;
+        colorkey = MF_COLORKEY;
+    } else {
+        blend_mode = rblend_to_blt(bl);
+        colorkey = 0;
+    }
+    if (blt_trilist(&g_e, tex, blend_mode, colorkey, /*alpha=*/255,
                     eoff, triCount) != 0)
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", triCount);
 }
