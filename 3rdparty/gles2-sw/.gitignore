@@ -1,2 +1,8 @@
 *.so
 *.so.*
+
+# Interim: vendor the prebuilt ARM32 software-GLES stub so the MiSTer CI link
+# (-lGLES_sw) resolves without a separate provisioning step. It is a small
+# (~85 KB) stub, not the full Mesa/SwiftShader build. Follow-up: build it in CI
+# as a standalone artifact and drop this exception.
+!libGLES_sw.so
