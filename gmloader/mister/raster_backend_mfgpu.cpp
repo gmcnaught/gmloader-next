@@ -11,7 +11,8 @@
 //             BLT_OP_TRILIST fabric command (blt_push_tris + blt_trilist) over
 //             an RGB565 texture page. FBO / non-default targets and RB_PREMULT
 //             fall back to backend_sw (see notes below).
-//   present : no-op placeholder (fabric scanout is hardware; Task 6).
+//   present : executes the accumulated ring (blt_execute -> g_fb565) and closes
+//             the frame; main.cpp then scans g_fb565 out via NativeVideoWriter (Task 7).
 //
 // The fabric framebuffer geometry is FIXED at BLT_FB_WIDTH x BLT_FB_HEIGHT
 // (320x240, refmodel/blitter_ref.h) — that is the wire contract, not a
