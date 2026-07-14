@@ -19,16 +19,15 @@
 // per-draw parameter. clear() targets are clamped to that size; the engine's
 // render surface is comfortably inside it.
 //
-// ── FRAME MODEL (Task 4 review fix) ──────────────────────────────────────────
-// blt_emitter_init / blt_vtx_buf_init are ONE-TIME startup (they wire the ring,
-// heap and vertex buffer). Only blt_begin_frame resets per-frame state (command
-// list + vertex cursor). mf_init_once() does the one-time wiring; mf_frame_begin
-// reclaims the previous frame's transient texture uploads (blt_heap_reset) then
-// calls blt_begin_frame. Re-running blt_emitter_init every frame (the Task-4
-// skeleton) would wipe any persistently-staged surfaces mid-run — wrong once the
-// per-draw upload is replaced by cached/perm-staged texture pages (a later perf
-// task). For bring-up every draw re-uploads its texture, so the heap is reset
-// each frame.
+// ── FRAME MODEL (Task 2 update: persistent texture cache) ────────────────────
+// blt_emitter_init / blt_vtx_buf_init / blt_alloc_init are ONE-TIME startup
+// (they wire the ring, texture heap and vertex buffer). Only blt_begin_frame
+// resets per-frame state (command list + vertex cursor). mf_init_once() does
+// the one-time wiring; mf_frame_begin no longer resets the texture heap
+// (no blt_heap_reset) — staged texture pages are cached by identity in
+// g_texcache and persist across frames (see stage_texture below), so a draw
+// that reuses a texture id reuses its already-uploaded page instead of
+// re-uploading every frame.
 //
 // ── ONE SOURCE-DDR BUFFER ────────────────────────────────────────────────────
 // blt_execute resolves BOTH the TRILIST vertices (heap->base + entry_off) and
@@ -78,12 +77,14 @@ extern "C" const RasterBackend backend_sw;   /* FBO / RB_PREMULT fallback */
 // One frame's worth of host-side emitter buffers. Static/file-scope is fine for
 // this single-threaded backend; Task 6 points these at the real DDR ring/heap.
 enum {
-    MF_RING_CAP   = 64 * 1024,
-    MF_SRCDRAM_CAP= 1 * 1024 * 1024,   // shared vertex + texture source DDR
-    MF_VTX_REGION = 96 * 1024,         // low slice of g_srcdram: TRILIST vertices
-    MF_MAX_CMDS   = MF_RING_CAP / BLT_CMD_BYTES,
-    MF_MAX_VERTS  = 8192,              // per-draw vertex-conversion scratch
-    MF_TEX_TEXELS = MF_SRCDRAM_CAP / 2 // per-draw RGB565 texture scratch (texels)
+    MF_RING_CAP    = 64 * 1024,
+    MF_VTX_REGION  = 128 * 1024,                 // per-frame TRILIST vertex buffer
+    MF_TEX_HEAP    = 32u * 1024 * 1024,          // persistent texture pages (32MB)
+    MF_SRCDRAM_CAP = MF_VTX_REGION + MF_TEX_HEAP,
+    MF_MAX_CMDS    = MF_RING_CAP / BLT_CMD_BYTES,
+    MF_MAX_VERTS   = 8192,
+    MF_TEX_TEXELS  = 2048 * 2048,                // scratch = largest single page (8MB)
+    MF_TEX_CACHE_N = 64,                         // resident-page table size
 };
 static uint8_t       g_ring[MF_RING_CAP];
 static uint8_t       g_srcdram[MF_SRCDRAM_CAP];
@@ -102,6 +103,19 @@ static bool          g_inited = false;
 // call frame_begin()/clear()/draw()/frame_end() directly are unaffected: those
 // calls just re-set/consume the same flag along the way.
 static bool          g_frame_active = false;
+
+// Persistent resident-texture cache. Keyed by GL texture id (tex_key). Survives
+// across frames (mf_frame_begin no longer resets the heap); entries are freed on
+// GL invalidate/delete (Task 3) or LRU eviction under heap pressure (Task 4).
+struct MfTexEntry { uint32_t key; bool used; bool has_key; blt_surface_ref_t ref; uint64_t lru; };
+static MfTexEntry g_texcache[MF_TEX_CACHE_N];
+static uint64_t   g_lru_clock   = 0;
+static uint32_t   g_upload_count = 0;   // real blt_upload calls since reinit (test hook)
+static uint32_t   g_tex_heap_cap = 0;   // 0 => full MF_TEX_HEAP; else test override
+
+// Free the least-recently-used cached entry. Returns false if none to evict.
+// Real body lands in Task 4; a stub here keeps stage_texture compiling.
+static bool evict_one_lru(void);
 
 // Host execute target: the fixed-size fabric framebuffer blt_execute composites
 // into. On real hardware this is scanned out directly; on the host it is the
@@ -158,22 +172,18 @@ static inline uint16_t mf_texel565(const RTexture *t, int x, int y, bool *out_ha
 static void mf_init_once(void) {
     if (g_inited) return;
     blt_emitter_init(&g_e, g_ring, sizeof g_ring, g_srcdram, sizeof g_srcdram);
-    // Reserve the low MF_VTX_REGION bytes for the per-frame vertex buffer; the
-    // texture allocator owns the rest. Re-init the allocator with a non-zero base
-    // so uploaded texture offsets never collide with vertex-entry offsets when
-    // both are resolved from the single g_srcdram base by blt_execute.
-    blt_alloc_init(&g_e.alloc, MF_VTX_REGION, sizeof g_srcdram - MF_VTX_REGION);
-    blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_REGION);
+    uint32_t cap = g_tex_heap_cap ? g_tex_heap_cap : MF_TEX_HEAP;
+    blt_alloc_init(&g_e.alloc, MF_VTX_REGION, cap);       // texture allocator (persistent)
+    blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_REGION);     // per-frame vertex buffer
+    for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
+    g_lru_clock = 0; g_upload_count = 0;
     g_inited = true;
 }
 
 static void mf_frame_begin(void) {
     mf_init_once();
-    // Reclaim the previous frame's transient per-draw texture uploads. (No
-    // persistent staging yet; when texture pages are cached/perm-staged this
-    // becomes a targeted free instead of a whole-heap reset.)
-    blt_heap_reset(&g_e);
-    blt_alloc_init(&g_e.alloc, MF_VTX_REGION, sizeof g_srcdram - MF_VTX_REGION);
+    // Textures persist across frames now (cache in g_texcache). Only the vtx
+    // cursor + command list reset here (blt_begin_frame). No blt_heap_reset.
     blt_begin_frame(&g_e, /*target_buf=*/0, /*clear=*/0, /*clear_color=*/0);
     g_frame_active = true;
 }
@@ -192,9 +202,52 @@ static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     blt_fill(&g_e, 0, 0, w, h, mf_rgb565(r, g, b));
 }
 
+static bool evict_one_lru(void) { return false; }   // Task 4 replaces this
+
+// Stage a texture page keyed by identity. Cache hit reuses the resident surface
+// (no re-upload); miss converts RGBA->RGB565 into g_texscratch and blt_uploads
+// once. Returns a ref with .valid==0 if the page cannot fit even after eviction
+// (caller drops the draw). *out_has_key := did any texel fold to the colorkey.
+static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *out_has_key) {
+    for (int i = 0; i < MF_TEX_CACHE_N; i++)
+        if (g_texcache[i].used && g_texcache[i].key == key) {
+            g_texcache[i].lru = ++g_lru_clock;
+            *out_has_key = g_texcache[i].has_key;
+            return g_texcache[i].ref;
+        }
+    // miss: convert into scratch
+    int tw, th; bool textured = (t && t->valid && t->rgba);
+    if (textured) { tw = t->w; th = t->h; } else { tw = 1; th = 1; }
+    if (tw <= 0 || th <= 0 || (size_t)tw * th > MF_TEX_TEXELS) {
+        blt_surface_ref_t bad; bad.valid = 0; *out_has_key = false; return bad;
+    }
+    bool has_key = false;
+    if (textured) {
+        for (int y = 0; y < th; y++)
+            for (int x = 0; x < tw; x++)
+                g_texscratch[(size_t)y * tw + x] = mf_texel565(t, x, y, &has_key);
+    } else {
+        g_texscratch[0] = 0xFFFF;   // 1x1 opaque white
+    }
+    blt_surface_ref_t ref = blt_upload(&g_e, g_texscratch, tw, th, tw * 2);
+    while (!ref.valid && evict_one_lru()) ref = blt_upload(&g_e, g_texscratch, tw, th, tw * 2);
+    if (!ref.valid) { *out_has_key = false; return ref; }
+    g_upload_count++;
+    // insert into a free slot, evicting the LRU slot if the table is full
+    int slot = -1; uint64_t best = ~0ull;
+    for (int i = 0; i < MF_TEX_CACHE_N; i++) {
+        if (!g_texcache[i].used) { slot = i; break; }
+        if (g_texcache[i].lru < best) { best = g_texcache[i].lru; slot = i; }
+    }
+    if (g_texcache[slot].used)
+        blt_emitter_free(&g_e, g_texcache[slot].ref.off, g_texcache[slot].ref.size);
+    g_texcache[slot] = MfTexEntry{ key, true, has_key, ref, ++g_lru_clock };
+    *out_has_key = has_key;
+    return ref;
+}
+
 static void mf_draw(RSurface *d, const BVtx *v, int triCount,
                     const RTexture *t, RBlend bl, float ar, uint32_t tex_key) {
-    (void)tex_key;
     mf_ensure_frame();
     // FBO / non-default render target: the fabric has one scanout FB, so
     // render-to-texture targets fall back to the SW rasterizer (writes d->rgba).
@@ -205,27 +258,14 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
     if (triCount <= 0) return;
 
     // ── stage the texture page as RGB565 ──────────────────────────────────────
-    int tw, th;
-    const bool textured = (t && t->valid && t->rgba);
-    if (textured) { tw = t->w; th = t->h; } else { tw = 1; th = 1; }
-    if (tw <= 0 || th <= 0 || (size_t)tw * th > MF_TEX_TEXELS) {
-        fprintf(stderr, "backend_mfgpu: texture %dx%d exceeds scratch (%d texels) - draw dropped\n",
-                tw, th, MF_TEX_TEXELS);
-        return;
-    }
+    uint32_t stage_key = (t && t->valid && t->rgba) ? tex_key : 0u;   // all untextured share key 0
     bool has_key = false;
-    if (textured) {
-        for (int y = 0; y < th; y++)
-            for (int x = 0; x < tw; x++)
-                g_texscratch[(size_t)y * tw + x] = mf_texel565(t, x, y, &has_key);
-    } else {
-        g_texscratch[0] = 0xFFFF;   // 1x1 opaque white -> vertex color passthrough
-    }
-    blt_surface_ref_t tex = blt_upload(&g_e, g_texscratch, tw, th, tw * 2);
+    blt_surface_ref_t tex = stage_texture(stage_key, t, &has_key);
     if (!tex.valid) {
-        fprintf(stderr, "backend_mfgpu: texture upload overflow (%dx%d) - draw dropped\n", tw, th);
+        fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
         return;
     }
+    int tw = tex.w, th = tex.h;   // staged page dims (1x1 for untextured)
 
     // ── convert + push the vertices ───────────────────────────────────────────
     int nverts = triCount * 3;
@@ -336,6 +376,16 @@ extern "C" void RasterBackend_MFGPU_TestCopyFB565(int w, int h, uint16_t *out) {
 // default RSurface's rgba pointer (NULL restores "everything is default fb").
 extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba) {
     g_defRGBA = rgba;
+}
+
+// Task 2 host hooks: count real blt_uploads (cache-hit-vs-miss proof) and force
+// a clean re-init with an optional capped texture-heap size (0 = full MF_TEX_HEAP;
+// nonzero lets the Task 4 eviction test shrink the allocator on purpose).
+extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void) { return g_upload_count; }
+extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
+    g_inited = false; g_frame_active = false;
+    g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap
+    mf_init_once();                    // re-wires emitter, clears cache + counter
 }
 
 extern "C" const RasterBackend backend_mfgpu = {

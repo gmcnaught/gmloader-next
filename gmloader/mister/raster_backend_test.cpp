@@ -33,6 +33,9 @@ extern "C" const RasterBackend backend_sw;
 extern "C" const RasterBackend backend_mfgpu;
 extern "C" void RasterBackend_MFGPU_TestCopyFB565(int w, int h, uint16_t *out);
 extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba);
+// Task 2: cache introspection/reset hooks (host-test-only, not part of the vtable).
+extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void);
+extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes);
 
 // Task 1: tiny monotonic key so each battery case gets a distinct tex_key —
 // no cross-case cache collision once Task 2 adds caching (tex_key is inert
@@ -355,6 +358,45 @@ static int battery(void) {
     return ok;
 }
 
+// ---- Task 2: persistent identity-keyed texture cache -------------------------
+
+// (A) A 256x256 opaque page is well within the new 32MB persistent texture heap
+// (the old ~500KB/frame scratch heap would have dropped it) and must still match
+// the SW oracle within +/-1 LSB 565.
+static int case_large_page(void) {
+    enum { TW = 256, TH = 256 };
+    static uint8_t tex[TW*TH*4];
+    for (int y=0;y<TH;y++) for (int x=0;x<TW;x++){ uint8_t*p=tex+((y*TW+x)*4); p[0]=(uint8_t)x; p[1]=(uint8_t)y; p[2]=128; p[3]=255; }
+    RTexture t = { tex, TW, TH, 1, 1, /*RGBA8888*/0, 1 };
+    BVtx v[6] = {
+        {  0.f,  0.f, 0,0, 1,1,1,1 }, { 240.f,  0.f, 1,0, 1,1,1,1 }, {  0.f,180.f, 0,1, 1,1,1,1 },
+        { 240.f,  0.f, 1,0, 1,1,1,1 }, { 240.f,180.f, 1,1, 1,1,1,1 }, {  0.f,180.f, 0,1, 1,1,1,1 },
+    };
+    RasterBackend_MFGPU_TestReinit(0);
+    return battery_case_key("large_page", 0,0,0, &t, v, 2, RB_NONE, next_key());  // ±1 LSB
+}
+
+// (B) Cache hit = single upload: the same key drawn across two frames must upload
+// exactly once. Needs direct frame control (two frames, one key), so it sets up
+// its own default surface exactly as battery_case_key does.
+static int case_cache_hit(void) {
+    static const uint8_t px[4] = { 200,100,50,255 };
+    RTexture t = { px, 1, 1, 1, 1, 0, 1 };
+    BVtx v[3] = { {2,2,0,0,1,1,1,1}, {28,4,1,0,1,1,1,1}, {4,28,0,1,1,1,1,1} };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_TestReinit(0);
+    const uint32_t K = 4242;
+    for (int f=0; f<2; f++) {                 // two frames, same key
+        backend_mfgpu.frame_begin();
+        backend_mfgpu.clear(&s_mf, 0,0,0,255);
+        backend_mfgpu.draw(&s_mf, v, 1, &t, RB_NONE, 0.f, K);
+        backend_mfgpu.frame_end();
+    }
+    return RasterBackend_MFGPU_TestUploadCount() == 1;   // uploaded once, reused once
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -363,5 +405,9 @@ int main(void){
     else printf("raster_backend mfgpu-clear-parity OK\n");
     if (!battery()) { printf("FAIL mfgpu-trilist-battery\n"); ok = 0; }
     else printf("raster_backend mfgpu-trilist-battery OK\n");
+    if (!case_large_page()) { printf("FAIL mfgpu-cache-large-page\n"); ok = 0; }
+    else printf("raster_backend mfgpu-cache-large-page OK\n");
+    if (!case_cache_hit()) { printf("FAIL mfgpu-cache-hit\n"); ok = 0; }
+    else printf("raster_backend mfgpu-cache-hit OK\n");
     return ok ? 0 : 1;
 }
