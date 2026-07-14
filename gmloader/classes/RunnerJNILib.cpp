@@ -83,6 +83,12 @@ void RunnerJNILib::MoveTaskToBack(JNIEnv *env, jclass clz)
     warning("MoveTaskToBack called.\n");
 }
 
+int RunnerJNILib::GetDefaultFrameBuffer(JNIEnv *env, jclass clz)
+{
+    (void)env; (void)clz;
+    return 0; /* window default framebuffer (FBO 0) */
+}
+
 int RunnerJNILib::OsGetInfo(JNIEnv *env, jclass clz)
 {
     static String osinfo_arr[] = {
@@ -199,6 +205,7 @@ jdouble RunnerJNILib::VideoIsLooping(JNIEnv *env, jclass clz)
 
 const ManagedMethod RunnerJNILibManagedMethods[] = {
     REGISTER_STATIC_METHOD(RunnerJNILib, OsGetInfo, "()I"),
+    REGISTER_STATIC_METHOD(RunnerJNILib, GetDefaultFrameBuffer, "()I"),
     REGISTER_STATIC_METHOD(RunnerJNILib, GamepadAxesValues, "(I)[F"),
     REGISTER_STATIC_METHOD(RunnerJNILib, MoveTaskToBack, "()V"),
     #ifdef VIDEO_SUPPORT

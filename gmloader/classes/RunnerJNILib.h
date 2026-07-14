@@ -29,6 +29,7 @@ public:
     static jfloatArray GamepadAxesValues(JNIEnv *env, jclass clz, void *ins, jint deviceIndex, jstring test);
     static void MoveTaskToBack(JNIEnv *env, jclass clz);
     static int OsGetInfo(JNIEnv *env, jclass clz);
+    static int GetDefaultFrameBuffer(JNIEnv *env, jclass clz);
 
     // Video functions
     static void VideoOpen(JNIEnv *env, jclass clz, jstring path);
