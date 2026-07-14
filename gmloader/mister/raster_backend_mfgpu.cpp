@@ -212,16 +212,6 @@ static bool evict_one_lru(void) {
     if (victim < 0) return false;
     blt_emitter_free(&g_e, g_texcache[victim].ref.off, g_texcache[victim].ref.size);
     g_texcache[victim].used = false;
-    // The blt_upload attempt that just failed (the one stage_texture is about to
-    // retry) tripped the emitter's sticky per-frame overflow flag (blt_emitter.c
-    // upload16: any failed blt_alloc call sets e->overflow, and nothing but the
-    // next blt_begin_frame ever clears it). That flag is checked unconditionally
-    // in mf_frame_end and drops the WHOLE frame — so without clearing it here, a
-    // successful evict+retry still loses the frame it just rescued. Freeing a
-    // page is precisely what makes that stale failure signal moot; clear it so
-    // the retry that follows is treated as the clean success it is. Safe/
-    // idempotent: if the retry fails too, blt_upload sets overflow=1 again.
-    g_e.overflow = 0;
     return true;
 }
 
@@ -250,9 +240,11 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
     } else {
         g_texscratch[0] = 0xFFFF;   // 1x1 opaque white
     }
+    bool ov_before = g_e.overflow;                    // preserve any overflow already set this frame
     blt_surface_ref_t ref = blt_upload(&g_e, g_texscratch, tw, th, tw * 2);
     while (!ref.valid && evict_one_lru()) ref = blt_upload(&g_e, g_texscratch, tw, th, tw * 2);
-    if (!ref.valid) { *out_has_key = false; return ref; }
+    if (!ref.valid) { *out_has_key = false; return ref; }  // last blt_upload left overflow set -> frame drops, correct
+    g_e.overflow = ov_before;                         // our transient failed-then-succeeded uploads did NOT overflow the frame
     g_upload_count++;
     // insert into a free slot, evicting the LRU slot if the table is full
     int slot = -1; uint64_t best = ~0ull;
