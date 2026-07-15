@@ -1,0 +1,228 @@
+/*
+ *  fabric_probe.c — standalone armhf contract probe (go/no-go for the Maldita
+ *  fabric-offload plan: docs/superpowers/plans/2026-07-14-maldita-fabric-offload.md,
+ *  maldita.castilla-mister repo, Task 1).
+ *
+ *  Submits ONE minimal frame straight to the real FPGA fabric's DDR command
+ *  ring: a blue clear, one 8x8 opaque magenta texture staged DDR3->SDRAM, one
+ *  centered textured triangle sampling it, then bumps the doorbell and polls
+ *  C_DONE. Proves an external (non-Solarus) producer can drive the fabric
+ *  before any production backend work is built on top of it.
+ *
+ *  This is a standalone tool — NOT wired into gmloader-next's main build. It
+ *  links the vendored 3rdparty/mfgpu host emitter (blt_emitter.c/blt_alloc.c)
+ *  directly against the real DDR3 physical region via mmap, mirroring
+ *  gmloader/mister/native_video_writer.c's open()/O_SYNC/mmap() pattern
+ *  exactly (see tools/Makefile.fabric_probe for the cross-build).
+ *
+ *  DDR map + control-block field layout: 3rdparty/mfgpu/docs/blitter-protocol.md
+ *  §2-3 (mirrors 3rdparty/mfgpu/rtl/blitter_defs.vh's *_QW simulation constants
+ *  at their real physical addresses).
+ *
+ *  Deploy + run on device / verify on screen: the plan's Task 1 Steps 3-4
+ *  (controller-run — no MiSTer in this dev environment; the build gate here
+ *  is a clean armhf link).
+ *
+ *  GPL-3.0 (matches 3rdparty/mfgpu).
+ */
+#include "blt_emitter.h"
+
+#include <fcntl.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+
+/* ---- Real DDR physical map (blitter-protocol.md §2, "16 MiB region at
+ * 0x3B000000"). BLTCTRL is 8 qwords (0x40 bytes) of control-block fields;
+ * RING starts immediately after (the "offset-7 aliasing lesson" in the
+ * protocol doc: the ring truly begins at control qword 8). SRC and the
+ * later TL_BUF/FRT/CFT regions (not used by this probe) bound the SRC heap's
+ * usable capacity. */
+#define MF_PHYS_BASE   0x3B000000UL
+#define MF_MAP_SIZE    0x01000000UL   /* 16 MiB — the whole dedicated blitter region */
+#define MF_RING_OFF    0x00000040UL   /* BLTCTRL (8 qwords) precedes the ring         */
+#define MF_SRC_OFF     0x00080000UL
+#define MF_TLBUF_OFF   0x00F40000UL   /* TL_BUF; bounds SRC_CAP so we never step on it */
+#define MF_RING_CAP    (MF_SRC_OFF   - MF_RING_OFF)   /* ~512 KiB (0x7FFC0)  */
+#define MF_SRC_CAP     (MF_TLBUF_OFF - MF_SRC_OFF)    /* ~14.8 MiB           */
+
+/* [hardware contract, confirmed in 3rdparty/mfgpu/rtl/blitter_top.sv:329 —
+ * "entry_qw_base <= SRC_QW + ({c_dst_y, c_dst_x} >> 3)"] BLT_OP_TRILIST vertex
+ * entries are fetched from the SAME SRC heap base as texture pages — there is
+ * NO separate vertex-buffer DDR region. So the vertex buffer must be carved
+ * out of the front of SRC and the texture allocator re-based after it, or a
+ * texture upload and the vertex push would alias the same bytes. This mirrors
+ * gmloader/mister/raster_backend_mfgpu.cpp's MF_VTX_REGION split exactly
+ * (that file's "ONE SOURCE-DDR BUFFER" comment). */
+#define MF_VTX_REGION  (128UL * 1024UL)
+
+/* Control-block field offsets (qwords from BLTCTRL; ARM writes the low 32
+ * bits of each 8-byte qword slot — the upper 32 bits are reserved/zero).
+ * Matches 3rdparty/mfgpu/rtl/blitter_defs.vh's C_* defines and the task
+ * brief's Global Constraints verbatim. */
+enum {
+    C_SUBMIT   = 0,
+    C_CMDCOUNT = 1,
+    C_TARGET   = 2,
+    C_CLEAR    = 3,
+    C_FLAGS    = 4,
+    C_DONE     = 5,
+    C_STATUS   = 6,
+    C_SRCSEL   = 7,
+};
+
+/* [OPEN QUESTION — design doc "Open questions for the implementation plan":
+ * SDRAM base/size for blt_sdram_init are genuinely device-determined, not
+ * confirmed here. SDRAM is a second, non-host-addressable bus (the host only
+ * allocates logical offsets that the FABRIC's own STAGE DMA resolves;
+ * blitter-protocol.md §2). 64 MiB matches the design doc's "SDRAM = 64 MB
+ * module" statement; base 0 is this probe's assumption for a single texture.
+ * Confirm/adjust on device before Task 3/5 (multi-texture residency). */
+#define MF_SDRAM_BASE  0x00000000UL
+#define MF_SDRAM_SIZE  (64UL * 1024UL * 1024UL)
+
+#define MF_DONE_TIMEOUT_MS 500
+
+static inline uint16_t mf_rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+/* Control-block field access. Each field is a full 8-byte qword slot; only
+ * the low 32 bits are meaningful (blitter-protocol.md §3, "one u32 per qword
+ * slot"), so address as byte offset (qword_index * 8). */
+static inline void ctrl_write32(volatile uint8_t *ctrl, int qword, uint32_t val) {
+    volatile uint32_t *p = (volatile uint32_t *)(ctrl + (size_t)qword * 8u);
+    *p = val;
+}
+static inline uint32_t ctrl_read32(volatile uint8_t *ctrl, int qword) {
+    volatile uint32_t *p = (volatile uint32_t *)(ctrl + (size_t)qword * 8u);
+    return *p;
+}
+
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+int main(void) {
+    /* ---- mmap the real DDR blitter region — mirrors native_video_writer.c's
+     * open()/O_SYNC/mmap() pattern exactly (gmloader/mister/native_video_writer.c). */
+    int fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (fd < 0) { perror("fabric_probe: open /dev/mem"); return 1; }
+
+    volatile uint8_t *base = (volatile uint8_t *)mmap(
+        NULL, (size_t)MF_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+        (off_t)MF_PHYS_BASE);
+    if (base == MAP_FAILED) {
+        perror("fabric_probe: mmap");
+        close(fd);
+        return 1;
+    }
+
+    volatile uint8_t *ctrl   = base;                     /* BLTCTRL, 0x3B000000 */
+    void             *ring_ptr = (void *)(base + MF_RING_OFF); /* RING, 0x3B000040 */
+    void             *src_ptr  = (void *)(base + MF_SRC_OFF);  /* SRC,  0x3B080000 */
+
+    /* Zero the control block up front (reserved qword halves + the
+     * fabric-owned C_DONE/C_STATUS start clean). */
+    memset((void *)ctrl, 0, (size_t)MF_RING_OFF);
+
+    /* ---- Bind the emitter to the mmap'd ring + source heap ---------------- */
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring_ptr, (size_t)MF_RING_CAP, src_ptr, (size_t)MF_SRC_CAP);
+    /* Re-base the texture allocator after the reserved vertex region (see the
+     * MF_VTX_REGION comment above) and bind the TRILIST vertex buffer to the
+     * front of the SAME SRC heap. */
+    blt_alloc_init(&e.alloc, (uint32_t)MF_VTX_REGION,
+                   (uint32_t)(MF_SRC_CAP - MF_VTX_REGION));
+    blt_vtx_buf_init(&e, src_ptr, (size_t)MF_VTX_REGION);
+    blt_sdram_init(&e, (uint32_t)MF_SDRAM_BASE, (uint32_t)MF_SDRAM_SIZE);
+
+    /* ---- Build the one-frame scene ---------------------------------------- */
+    blt_begin_frame(&e, /*target_buf=*/0, /*clear=*/1, mf_rgb565(0, 0, 160)); /* blue */
+
+    uint16_t tex_px[8 * 8];
+    uint16_t magenta = mf_rgb565(255, 0, 255);
+    for (int i = 0; i < 8 * 8; i++) tex_px[i] = magenta;
+
+    blt_surface_ref_t tex = blt_upload(&e, tex_px, 8, 8, 8 * 2);
+    if (!tex.valid) {
+        fprintf(stderr, "fabric_probe: blt_upload overflow\n");
+        munmap((void *)base, MF_MAP_SIZE);
+        close(fd);
+        return 1;
+    }
+    if (blt_stage_surface(&e, &tex) != 0) {
+        fprintf(stderr, "fabric_probe: blt_stage_surface failed (overflow=%d)\n", e.overflow);
+        munmap((void *)base, MF_MAP_SIZE);
+        close(fd);
+        return 1;
+    }
+
+    /* One centered triangle. blt_vtx_t = {x,y (12.4 signed px), u,v (12.4
+     * unsigned texels), rgba, _rsvd}. White vertex color -> texture unmodified. */
+    blt_vtx_t tris[3] = {
+        { (int16_t)(160 << 4), (int16_t)(48  << 4), (uint16_t)(4 << 4), (uint16_t)(0 << 4), BLT_RGBA(255, 255, 255, 255), 0 },
+        { (int16_t)(224 << 4), (int16_t)(176 << 4), (uint16_t)(7 << 4), (uint16_t)(7 << 4), BLT_RGBA(255, 255, 255, 255), 0 },
+        { (int16_t)(96  << 4), (int16_t)(176 << 4), (uint16_t)(0 << 4), (uint16_t)(7 << 4), BLT_RGBA(255, 255, 255, 255), 0 },
+    };
+    uint32_t entry_off = blt_push_tris(&e, tris, 1);
+    if (entry_off == 0xFFFFFFFFu) {
+        fprintf(stderr, "fabric_probe: blt_push_tris overflow\n");
+        munmap((void *)base, MF_MAP_SIZE);
+        close(fd);
+        return 1;
+    }
+    if (blt_trilist(&e, tex, BLT_BLEND_COPY, /*colorkey=*/0, /*alpha=*/255, entry_off, 1) != 0) {
+        fprintf(stderr, "fabric_probe: blt_trilist emit failed\n");
+        munmap((void *)base, MF_MAP_SIZE);
+        close(fd);
+        return 1;
+    }
+    blt_end_frame(&e);
+    if (e.overflow) {
+        fprintf(stderr, "fabric_probe: emitter overflow — not submitting\n");
+        munmap((void *)base, MF_MAP_SIZE);
+        close(fd);
+        return 1;
+    }
+
+    /* ---- Publish -----------------------------------------------------------
+     * Ring + source-heap bytes already landed in DDR: the emitter wrote
+     * directly through the mmap'd ring_ptr/src_ptr above (blt_upload,
+     * blt_stage_surface, blt_push_tris, blt_trilist all copy/pack straight
+     * into those buffers — no separate publish step for them). Now publish
+     * the control-block mirror, THEN the doorbell (submit_seq) LAST, after a
+     * memory barrier, so the doorbell can never be observed before the data
+     * it describes. */
+    ctrl_write32(ctrl, C_CMDCOUNT, (uint32_t)e.cmd_count);
+    ctrl_write32(ctrl, C_TARGET,   (uint32_t)e.target_buf);
+    ctrl_write32(ctrl, C_CLEAR,    (uint32_t)e.clear_color);
+    ctrl_write32(ctrl, C_FLAGS,    (uint32_t)e.flags);
+    ctrl_write32(ctrl, C_SRCSEL,   (uint32_t)e.sdram_src); /* [open question, design doc] */
+
+    __sync_synchronize();                        /* data before doorbell */
+    ctrl_write32(ctrl, C_SUBMIT, e.submit_seq);   /* doorbell LAST        */
+
+    /* ---- Poll C_DONE (~500 ms timeout) -------------------------------------- */
+    long t0 = now_ms();
+    uint32_t done = 0;
+    bool timed_out = true;
+    while (now_ms() - t0 < MF_DONE_TIMEOUT_MS) {
+        done = ctrl_read32(ctrl, C_DONE);
+        if (done == e.submit_seq) { timed_out = false; break; }
+    }
+    uint32_t status = ctrl_read32(ctrl, C_STATUS);
+
+    printf("fabric_probe: submit_seq=%u C_DONE=%u C_STATUS=%u %s\n",
+           e.submit_seq, done, status, timed_out ? "TIMEOUT" : "OK");
+
+    munmap((void *)base, MF_MAP_SIZE);
+    close(fd);
+    return timed_out ? 2 : (status != 0 ? 3 : 0);
+}

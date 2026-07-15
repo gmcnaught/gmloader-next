@@ -1,0 +1,46 @@
+# Makefile.fabric_probe — standalone armhf cross-build of the Maldita
+# fabric-offload contract probe (Task 1,
+# docs/superpowers/plans/2026-07-14-maldita-fabric-offload.md in
+# maldita.castilla-mister). Builds tools/fabric_probe.c against the vendored
+# 3rdparty/mfgpu HOST emitter only (blt_emitter.c/blt_alloc.c) — the probe
+# never calls blt_execute()/blt_raster_tri(), so refmodel/*.c and
+# libmfgpu/*.c are not needed to link it; it talks straight to the real DDR
+# ring instead of a software oracle.
+#
+# Build (from the gmloader-next repo root, same image as Dockerfile.gmloader-build):
+#   docker run --rm -v "$PWD:/src" -w /src gmloader-armhf-build:bullseye \
+#       make -f tools/Makefile.fabric_probe
+# Output: tools/fabric_probe.armhf
+
+ARCH  ?= arm-linux-gnueabihf
+CROSS ?= $(ARCH)-
+CC    := $(CROSS)gcc
+
+MFGPU_DIR := 3rdparty/mfgpu
+# blt_emitter.h pulls in blitter_ref.h (opcodes/blt_cmd_t/blt_vtx_t) and
+# blt_alloc.h (both headers only, no .o needed for blitter_ref.h itself).
+MFGPU_INC := -I$(MFGPU_DIR)/host -I$(MFGPU_DIR)/refmodel
+
+# gnu11 (not strict c11): fabric_probe.c needs POSIX clock_gettime/CLOCK_MONOTONIC
+# and mmap/open, which -std=c11 hides behind glibc's __STRICT_ANSI__ feature-test
+# gate unless _POSIX_C_SOURCE is set explicitly. gnu11 exposes them without that.
+CFLAGS ?= -O2 -std=gnu11 -Wall -Wextra $(MFGPU_INC)
+# Tune instruction scheduling for the DE10-Nano's Cortex-A9 (matches
+# Makefile.gmloader's armhf tuning; no ISA/ABI change).
+ifeq ($(ARCH),arm-linux-gnueabihf)
+CFLAGS += -mtune=cortex-a9
+endif
+
+SRCS := tools/fabric_probe.c \
+        $(MFGPU_DIR)/host/blt_emitter.c \
+        $(MFGPU_DIR)/host/blt_alloc.c
+OUT  := tools/fabric_probe.armhf
+
+.PHONY: all clean
+all: $(OUT)
+
+$(OUT): $(SRCS)
+	$(CC) $(CFLAGS) -o $@ $(SRCS)
+
+clean:
+	rm -f $(OUT)
