@@ -115,6 +115,7 @@ struct MfTexEntry { uint32_t key; bool used; bool has_key; blt_surface_ref_t ref
 static MfTexEntry g_texcache[MF_TEX_CACHE_N];
 static uint64_t   g_lru_clock   = 0;
 static uint32_t   g_upload_count = 0;   // real blt_upload calls since reinit (test hook)
+static uint32_t   g_stage_count  = 0;   // BLT_OP_STAGE emits since reinit (FO Task 3 test hook)
 static uint32_t   g_tex_heap_cap = 0;   // 0 => full MF_TEX_HEAP; else test override
 
 // Snapshot of g_lru_clock taken at the start of the current frame (see
@@ -193,7 +194,7 @@ static void mf_init_once(void) {
     blt_alloc_init(&g_e.alloc, MF_VTX_REGION, cap);       // texture allocator (persistent)
     blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_REGION);     // per-frame vertex buffer
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
-    g_lru_clock = 0; g_upload_count = 0; g_lru_frame_floor = 0;
+    g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
     g_inited = true;
 }
 
@@ -276,6 +277,18 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
     if (!ref.valid) { *out_has_key = false; return ref; }  // last blt_upload left overflow set -> frame drops, correct
     g_e.overflow = ov_before;                         // our transient failed-then-succeeded uploads did NOT overflow the frame
     g_upload_count++;
+    // Fabric-offload Task 3: stage this freshly-uploaded page DDR3->SDRAM at the
+    // SAME offset (SDRAM[off] = DDR[off]) so the fabric's TRILIST texel fetch —
+    // which samples SDRAM unconditionally at src_off == ref.off — resolves. Emitted
+    // unconditionally (host + device): the refmodel skips OP_STAGE as a no-op (see
+    // case_stage_noop), so the host oracle stays ±1 LSB. Same-offset by design, NOT
+    // blt_stage_surface (its decoupled sdram_off != src_off would render black on HW).
+    // Tied to the upload (miss only) => each resident page is staged exactly once;
+    // cache hits reuse the SDRAM-resident copy with no re-STAGE.
+    if (blt_stage(&g_e, ref.off, (uint32_t)ref.stride * ref.h) != 0)
+        fprintf(stderr, "backend_mfgpu: blt_stage overflow (off=%u) - draw may drop\n", ref.off);
+    else
+        g_stage_count++;
     // insert into a free slot, evicting the LRU slot if the table is full
     int slot = -1; uint64_t best = ~0ull;
     for (int i = 0; i < MF_TEX_CACHE_N; i++) {
@@ -427,6 +440,8 @@ extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba) {
 // a clean re-init with an optional capped texture-heap size (0 = full MF_TEX_HEAP;
 // nonzero lets the Task 4 eviction test shrink the allocator on purpose).
 extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void) { return g_upload_count; }
+// FO Task 3 host hook: BLT_OP_STAGE emits since reinit (proves stage-once-per-page).
+extern "C" uint32_t RasterBackend_MFGPU_TestStageCount(void) { return g_stage_count; }
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_inited = false; g_frame_active = false;
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap

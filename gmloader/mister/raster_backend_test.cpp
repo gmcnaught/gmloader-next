@@ -44,6 +44,7 @@ extern "C" void RasterBackend_MFGPU_TestCopyFB565(int w, int h, uint16_t *out);
 extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba);
 // Task 2: cache introspection/reset hooks (host-test-only, not part of the vtable).
 extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestStageCount(void);   // FO Task 3
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes);
 
 extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
@@ -554,6 +555,35 @@ static int case_intra_frame_no_alias(void) {
     return 1;
 }
 
+// ── Fabric-offload Task 3: SDRAM residency — stage once per page ──────────────
+// A texture drawn across two frames must emit exactly ONE BLT_OP_STAGE (staged
+// into SDRAM on the first-frame miss, reused on the second-frame cache hit) and
+// one blt_upload, and render within ±1 LSB of the SW oracle both frames.
+static int case_sdram_residency(void) {
+    static const uint8_t px[4] = { 60, 180, 240, 255 };
+    RTexture t = { px, 1, 1, 1, 1, 0, 1 };
+    BVtx v[3] = { {2,2,0,0,1,1,1,1}, {28,4,1,0,1,1,1,1}, {4,28,0,1,1,1,1,1} };
+    static uint8_t  rgba_sw[BW*BH*4];
+    static uint8_t  rgba_mf[BW*BH*4];
+    static uint16_t mf565[BW*BH];
+    RSurface s_sw = { rgba_sw, BW, BH };
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_TestReinit(0);
+    const uint32_t K = 909;
+    backend_sw.clear(&s_sw, 0, 0, 0, 255);
+    backend_sw.draw(&s_sw, v, 1, &t, RB_NONE, 0.f, K);   // deterministic oracle
+    for (int f = 0; f < 2; f++) {
+        backend_mfgpu.frame_begin();
+        backend_mfgpu.clear(&s_mf, 0, 0, 0, 255);
+        backend_mfgpu.draw(&s_mf, v, 1, &t, RB_NONE, 0.f, K);
+        backend_mfgpu.frame_end();
+        RasterBackend_MFGPU_TestCopyFB565(BW, BH, mf565);
+        if (!rgb565_within1(&s_sw, mf565)) { printf("  sdram_residency: frame %d mismatch\n", f); return 0; }
+    }
+    return RasterBackend_MFGPU_TestUploadCount() == 1 && RasterBackend_MFGPU_TestStageCount() == 1;
+}
+
 // ── Fabric-offload Task 2: BLT_OP_STAGE is a refmodel no-op ───────────────────
 // With same-offset staging (SDRAM[off] = DDR[off], user-confirmed hardware
 // contract), the fabric's TRILIST texel fetch reads SDRAM[src_off] == a copy of
@@ -631,5 +661,7 @@ int main(void){
     else printf("raster_backend mfgpu-intra-frame-no-alias OK\n");
     if (!case_stage_noop()) { printf("FAIL mfgpu-stage-noop\n"); ok = 0; }
     else printf("raster_backend mfgpu-stage-noop OK\n");
+    if (!case_sdram_residency()) { printf("FAIL mfgpu-sdram-residency\n"); ok = 0; }
+    else printf("raster_backend mfgpu-sdram-residency OK\n");
     return ok ? 0 : 1;
 }
