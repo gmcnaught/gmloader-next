@@ -75,16 +75,14 @@ enum {
     C_SRCSEL   = 7,
 };
 
-/* [OPEN QUESTION — design doc "Open questions for the implementation plan":
- * SDRAM base/size for blt_sdram_init are genuinely device-determined, not
- * confirmed here. SDRAM is a second, non-host-addressable bus (the host only
- * allocates logical offsets that the FABRIC's own STAGE DMA resolves;
- * blitter-protocol.md §2). 64 MiB matches the design doc's "SDRAM = 64 MB
- * module" statement; base 0 is this probe's assumption for a single texture.
- * Confirm/adjust on device before Task 3/5 (multi-texture residency). */
-#define MF_SDRAM_BASE  0x00000000UL
-#define MF_SDRAM_SIZE  (64UL * 1024UL * 1024UL)
-
+/* SAME-OFFSET STAGING (user-confirmed hardware contract): stage each source to
+ * the SAME SDRAM byte offset as its DDR3 heap offset (SDRAM[off] = DDR[off]) via
+ * blt_stage(off,size). The core's OP_TRILIST texel fetch samples SDRAM
+ * unconditionally at src_off == tex.off (blitter_top.sv:919-923), and blt_trilist
+ * writes src_off = tex.off — so a decoupled sdram_off (blt_stage_surface +
+ * blt_sdram_init) would be sampled at the WRONG address and render black. With
+ * same-offset staging no SDRAM allocator (blt_sdram_init) and no C_SRCSEL master
+ * enable are needed. */
 #define MF_DONE_TIMEOUT_MS 500
 
 static inline uint16_t mf_rgb565(uint8_t r, uint8_t g, uint8_t b) {
@@ -141,7 +139,8 @@ int main(void) {
     blt_alloc_init(&e.alloc, (uint32_t)MF_VTX_REGION,
                    (uint32_t)(MF_SRC_CAP - MF_VTX_REGION));
     blt_vtx_buf_init(&e, src_ptr, (size_t)MF_VTX_REGION);
-    blt_sdram_init(&e, (uint32_t)MF_SDRAM_BASE, (uint32_t)MF_SDRAM_SIZE);
+    /* No blt_sdram_init: same-offset staging needs no SDRAM allocator (see the
+     * MF_DONE_TIMEOUT_MS comment block above). e.sdram_src stays 0. */
 
     /* ---- Build the one-frame scene ---------------------------------------- */
     blt_begin_frame(&e, /*target_buf=*/0, /*clear=*/1, mf_rgb565(0, 0, 160)); /* blue */
@@ -157,8 +156,8 @@ int main(void) {
         close(fd);
         return 1;
     }
-    if (blt_stage_surface(&e, &tex) != 0) {
-        fprintf(stderr, "fabric_probe: blt_stage_surface failed (overflow=%d)\n", e.overflow);
+    if (blt_stage(&e, tex.off, (uint32_t)tex.stride * tex.h) != 0) {   /* same-offset */
+        fprintf(stderr, "fabric_probe: blt_stage failed (overflow=%d)\n", e.overflow);
         munmap((void *)base, MF_MAP_SIZE);
         close(fd);
         return 1;
@@ -204,7 +203,8 @@ int main(void) {
     ctrl_write32(ctrl, C_TARGET,   (uint32_t)e.target_buf);
     ctrl_write32(ctrl, C_CLEAR,    (uint32_t)e.clear_color);
     ctrl_write32(ctrl, C_FLAGS,    (uint32_t)e.flags);
-    ctrl_write32(ctrl, C_SRCSEL,   (uint32_t)e.sdram_src); /* [open question, design doc] */
+    ctrl_write32(ctrl, C_SRCSEL,   (uint32_t)e.sdram_src); /* 0: TRILIST texel fetch is
+                                                            * unconditional-SDRAM; C_SRCSEL unused */
 
     __sync_synchronize();                        /* data before doorbell */
     ctrl_write32(ctrl, C_SUBMIT, e.submit_seq);   /* doorbell LAST        */
