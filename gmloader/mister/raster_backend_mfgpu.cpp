@@ -210,7 +210,7 @@ enum {
     MF_DEV_RING_CAP  = MF_DEV_SRC_OFF   - MF_DEV_RING_OFF,
     MF_DEV_SRC_CAP   = MF_DEV_TLBUF_OFF - MF_DEV_SRC_OFF,
     MF_C_SUBMIT = 0, MF_C_CMDCOUNT = 1, MF_C_TARGET = 2, MF_C_CLEAR = 3,
-    MF_C_FLAGS = 4, MF_C_DONE = 5, MF_C_STATUS = 6,
+    MF_C_FLAGS = 4, MF_C_DONE = 5, MF_C_STATUS = 6, MF_C_SRCSEL = 7,
     MF_DEV_DONE_TIMEOUT_MS = 200,
 };
 static volatile uint8_t *g_dev_base = nullptr;   // mmap of 0x3B000000
@@ -224,6 +224,9 @@ static inline void mf_ctrl_wr(int qw, uint32_t v) {
 }
 static inline uint32_t mf_ctrl_rd(int qw) {
     return *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u);
+}
+static inline uint32_t mf_ctrl_rd_hi(int qw) {
+    return *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u + 4u);   // high u32 of the qword
 }
 // Open /dev/mem + mmap the DDR blitter region once (mirrors native_video_writer.c).
 static bool mf_ddr_map(void) {
@@ -262,18 +265,34 @@ static int mf_nowait_on(void) {
     if (v < 0) { const char *e = getenv("GMLOADER_MFSUBMIT_NOWAIT"); v = (e && *e) ? 1 : 0; }
     return v;
 }
+// clk_sys = 98.4375 MHz (PLL outclk_0 / DDRAM_CLK). Fabric perf counters are in
+// clk_sys cycles: C_DONE high word = perf_frame_cyc (total fabric-busy: new-submit
+// detect → done write), C_STATUS high word = perf_pipe_cyc (composite pipeline busy).
+// Reading them isolates fabric COMPUTE from the host-observed doorbell→done wait: if
+// compute << wait, the 3-vsync latency is notice/DDR-visibility, not the fabric.
+#define MF_CLK_SYS_MHZ 98.4375
 static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     if (!mf_stat_on()) return;
     struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
     double us = (now.tv_sec - t0->tv_sec) * 1e6 + (now.tv_nsec - t0->tv_nsec) / 1e3;
+    // Fabric per-state cycle counters (clk_sys), from the profiling RTL:
+    //   frame   = C_DONE.hi   perf_frame_cyc   (total fabric-busy: detect->done)
+    //   texwait = C_STATUS.hi perf_texwait_cyc (S_TRI_GOTTEX p0_ok stall — texel fetch)
+    //   tri     = C_SRCSEL.hi perf_tri_cyc     (all S_TRI_* states)
+    // Derived: dpath = tri-texwait (rasterizer datapath), ovhd = frame-tri (ring/clear/setup).
+    double frame_ms = (double)mf_ctrl_rd_hi(MF_C_DONE)   / (MF_CLK_SYS_MHZ * 1000.0);
+    double texw_ms  = (double)mf_ctrl_rd_hi(MF_C_STATUS) / (MF_CLK_SYS_MHZ * 1000.0);
+    double tri_ms   = (double)mf_ctrl_rd_hi(MF_C_SRCSEL) / (MF_CLK_SYS_MHZ * 1000.0);
     static unsigned n = 0, to = 0; static double lo = 1e12, hi = 0, sum = 0; static long it_sum = 0;
-    n++; to += timeout ? 1u : 0u; sum += us; it_sum += iters;
+    static double fsum = 0, tsum = 0, xsum = 0;
+    n++; to += timeout ? 1u : 0u; sum += us; it_sum += iters; fsum += frame_ms; tsum += tri_ms; xsum += texw_ms;
     if (us < lo) lo = us; if (us > hi) hi = us;
     if (n % 30 == 0) {
-        fprintf(stderr, "MFSUBMIT n=%u wait_ms[last=%.2f min=%.2f max=%.2f avg=%.2f] "
-                "spin_iters_avg=%ld timeouts=%u\n",
-                n, us/1e3, lo/1e3, hi/1e3, (sum/30.0)/1e3, it_sum/30, to);
-        lo = 1e12; hi = 0; sum = 0; it_sum = 0; to = 0;
+        double f=fsum/30.0, t=tsum/30.0, x=xsum/30.0;
+        fprintf(stderr, "MFSUBMIT n=%u wait_ms[avg=%.2f] fabric_ms[frame=%.2f tri=%.2f "
+                "texwait=%.2f dpath=%.2f ovhd=%.2f] spin_avg=%ld to=%u\n",
+                n, (sum/30.0)/1e3, f, t, x, t-x, f-t, it_sum/30, to);
+        lo = 1e12; hi = 0; sum = 0; it_sum = 0; to = 0; fsum = 0; tsum = 0; xsum = 0;
     }
 }
 
