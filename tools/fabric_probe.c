@@ -31,6 +31,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -107,7 +108,7 @@ static long now_ms(void) {
     return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     /* ---- mmap the real DDR blitter region — mirrors native_video_writer.c's
      * open()/O_SYNC/mmap() pattern exactly (gmloader/mister/native_video_writer.c). */
     int fd = open("/dev/mem", O_RDWR | O_SYNC);
@@ -221,6 +222,28 @@ int main(void) {
 
     printf("fabric_probe: submit_seq=%u C_DONE=%u C_STATUS=%u %s\n",
            e.submit_seq, done, status, timed_out ? "TIMEOUT" : "OK");
+
+    /* ---- Hold the frame on screen (defeat the stale-frame watchdog) ---------
+     * openbor_video_reader blanks VGA to black if VCTRL's frame counter does not
+     * advance for ~29 vblanks (~0.5s) — openbor_video_reader.sv:710-715. A ONE-SHOT
+     * submit therefore flashes the frame for ~0.5s and then goes black. Re-walk the
+     * SAME ring (still resident in DDR) every 200ms so the counter keeps moving and
+     * the frame stays visible — exactly what the real gmloader path does at 60fps.
+     * Duration from argv[1] seconds (default 30; 0 = until Ctrl-C). */
+    if (!timed_out) {
+        long hold_sec = (argc > 1) ? atol(argv[1]) : 30;
+        if (hold_sec) printf("fabric_probe: holding frame ~%lds (re-submit every 200ms; Ctrl-C to stop)\n", hold_sec);
+        else          printf("fabric_probe: holding frame until Ctrl-C (re-submit every 200ms)\n");
+        uint32_t seq = e.submit_seq;
+        long hstart = now_ms();
+        while (hold_sec == 0 || now_ms() - hstart < hold_sec * 1000L) {
+            __sync_synchronize();
+            ctrl_write32(ctrl, C_SUBMIT, ++seq);                    /* re-walk the same ring */
+            long tp = now_ms();
+            while (now_ms() - tp < 50 && ctrl_read32(ctrl, C_DONE) != seq) { }
+            usleep(200000);                                         /* 200ms < ~0.5s watchdog */
+        }
+    }
 
     munmap((void *)base, MF_MAP_SIZE);
     close(fd);
