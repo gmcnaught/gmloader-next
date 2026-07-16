@@ -187,12 +187,107 @@ static inline uint16_t mf_texel565(const RTexture *t, int x, int y, bool *out_ha
     return result;
 }
 
+#ifdef MISTER_NATIVE_VIDEO
+// ── Device fabric transport (FO Task 4; in-place DDR model, mirrors fabric_probe.c)
+// On device the emitter binds DIRECTLY to the mmap'd DDR command region: blt_upload/
+// blt_stage/blt_push_tris/blt_trilist write straight into DDR, so mf_frame_end only
+// publishes the control block + rings the doorbell + polls C_DONE — no blt_execute,
+// no per-frame copy. The Maldita core composites into on-chip BRAM and scans itself
+// out. Layout + handshake: 3rdparty/mfgpu/docs/blitter-protocol.md §2-3, verified vs
+// the milestone-a RTL. (MISTER_NATIVE_VIDEO is the device-build macro — the host
+// raster-backend-test target does NOT define it, so it keeps the blt_execute oracle.)
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <time.h>
+enum {
+    MF_DEV_PHYS_BASE = 0x3B000000u,
+    MF_DEV_MAP_SIZE  = 0x01000000u,   // 16 MiB dedicated blitter region
+    MF_DEV_RING_OFF  = 0x00000040u,   // BLTCTRL (8 qwords) precedes the ring
+    MF_DEV_SRC_OFF   = 0x00080000u,   // SRC_QW = 0x3B080000 (DDR3 source heap)
+    MF_DEV_TLBUF_OFF = 0x00F40000u,   // bounds the usable SRC heap (~14.8 MiB)
+    MF_DEV_RING_CAP  = MF_DEV_SRC_OFF   - MF_DEV_RING_OFF,
+    MF_DEV_SRC_CAP   = MF_DEV_TLBUF_OFF - MF_DEV_SRC_OFF,
+    MF_C_SUBMIT = 0, MF_C_CMDCOUNT = 1, MF_C_TARGET = 2, MF_C_CLEAR = 3,
+    MF_C_FLAGS = 4, MF_C_DONE = 5, MF_C_STATUS = 6,
+    MF_DEV_DONE_TIMEOUT_MS = 200,
+};
+static volatile uint8_t *g_dev_base = nullptr;   // mmap of 0x3B000000
+static volatile uint8_t *g_dev_ctrl = nullptr;   // = base (control block)
+static uint8_t          *g_dev_ring = nullptr;   // = base + RING_OFF
+static uint8_t          *g_dev_src  = nullptr;   // = base + SRC_OFF
+static bool              g_dev_ok   = false;     // mmap ok -> submits reach the fabric
+
+static inline void mf_ctrl_wr(int qw, uint32_t v) {
+    *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u) = v;   // low u32 of each 8B qword
+}
+static inline uint32_t mf_ctrl_rd(int qw) {
+    return *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u);
+}
+// Open /dev/mem + mmap the DDR blitter region once (mirrors native_video_writer.c).
+static bool mf_ddr_map(void) {
+    if (g_dev_base) return g_dev_ok;
+    int fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (fd < 0) { fprintf(stderr, "backend_mfgpu: open /dev/mem failed\n"); return false; }
+    void *m = mmap(nullptr, MF_DEV_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   fd, (off_t)MF_DEV_PHYS_BASE);
+    close(fd);   // the mapping outlives the fd
+    if (m == MAP_FAILED) { fprintf(stderr, "backend_mfgpu: mmap 0x3B000000 failed\n"); return false; }
+    g_dev_base = (volatile uint8_t *)m;
+    g_dev_ctrl = g_dev_base;
+    g_dev_ring = (uint8_t *)(g_dev_base + MF_DEV_RING_OFF);
+    g_dev_src  = (uint8_t *)(g_dev_base + MF_DEV_SRC_OFF);
+    memset((void *)g_dev_ctrl, 0, MF_DEV_RING_OFF);   // zero the control block
+    g_dev_ok = true;
+    return true;
+}
+// Publish the emitter's control-block mirror, ring the doorbell (submit_seq LAST,
+// after a barrier), poll C_DONE. Ring + heap are already resident in DDR (the
+// emitter was bound to g_dev_ring/g_dev_src), so there is nothing to copy. This
+// core's C_STATUS is OSD-mirror, not an error latch — completion == C_DONE match,
+// failure == timeout.
+static void mf_device_submit(void) {
+    mf_ctrl_wr(MF_C_CMDCOUNT, (uint32_t)g_e.cmd_count);
+    mf_ctrl_wr(MF_C_TARGET,   (uint32_t)g_e.target_buf);
+    mf_ctrl_wr(MF_C_CLEAR,    (uint32_t)g_e.clear_color);
+    mf_ctrl_wr(MF_C_FLAGS,    (uint32_t)g_e.flags);
+    __sync_synchronize();                       // data before doorbell
+    mf_ctrl_wr(MF_C_SUBMIT, g_e.submit_seq);    // doorbell LAST
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        if (mf_ctrl_rd(MF_C_DONE) == g_e.submit_seq) return;   // fabric consumed it
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        long ms = (now.tv_sec - t0.tv_sec) * 1000L + (now.tv_nsec - t0.tv_nsec) / 1000000L;
+        if (ms >= MF_DEV_DONE_TIMEOUT_MS) {
+            fprintf(stderr, "backend_mfgpu: fabric submit timeout (submit=%u done=%u status=%u)\n",
+                    g_e.submit_seq, mf_ctrl_rd(MF_C_DONE), mf_ctrl_rd(MF_C_STATUS));
+            return;
+        }
+    }
+}
+#endif // MISTER_NATIVE_VIDEO
+
 static void mf_init_once(void) {
     if (g_inited) return;
+#ifdef MISTER_NATIVE_VIDEO
+    if (mf_ddr_map()) {
+        // In-place: the emitter builds ring + heap directly in the mmap'd DDR.
+        blt_emitter_init(&g_e, g_dev_ring, MF_DEV_RING_CAP, g_dev_src, MF_DEV_SRC_CAP);
+        blt_alloc_init(&g_e.alloc, MF_VTX_REGION, MF_DEV_SRC_CAP - MF_VTX_REGION);
+        blt_vtx_buf_init(&g_e, g_dev_src, MF_VTX_REGION);
+    } else {
+        // No /dev/mem: bind host RAM so the emitter never faults; g_dev_ok is false
+        // so mf_frame_end drops (never submits to a null map).
+        blt_emitter_init(&g_e, g_ring, sizeof g_ring, g_srcdram, sizeof g_srcdram);
+        blt_alloc_init(&g_e.alloc, MF_VTX_REGION, MF_TEX_HEAP);
+        blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_REGION);
+    }
+#else
     blt_emitter_init(&g_e, g_ring, sizeof g_ring, g_srcdram, sizeof g_srcdram);
     uint32_t cap = g_tex_heap_cap ? g_tex_heap_cap : MF_TEX_HEAP;
     blt_alloc_init(&g_e.alloc, MF_VTX_REGION, cap);       // texture allocator (persistent)
     blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_REGION);     // per-frame vertex buffer
+#endif
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
     g_inited = true;
@@ -389,6 +484,19 @@ static void mf_present(const RSurface *) {
 
 static void mf_frame_end(void) {
     blt_end_frame(&g_e);
+#ifdef MISTER_NATIVE_VIDEO
+    // Device: the ring + heap are already resident in the mmap'd DDR (the emitter
+    // was bound to g_dev_ring/g_dev_src). Publish the control block, ring the
+    // doorbell, and poll C_DONE — the fabric composites into on-chip BRAM and scans
+    // itself out. No blt_execute, no g_fb565 on the hot path.
+    if (g_e.overflow) {
+        fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped\n");
+        return;
+    }
+    if (g_dev_ok) mf_device_submit();
+    else          fprintf(stderr, "backend_mfgpu: device DDR unmapped - frame dropped\n");
+#else
+    // Host oracle: software-execute the ring into g_fb565 (parity tests read it back).
     memset(g_fb565, 0, sizeof g_fb565);
     if (g_e.overflow) {
         fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped\n");
@@ -403,6 +511,7 @@ static void mf_frame_end(void) {
     // passing the full size keeps both offset ranges in-bounds.
     blt_surface_heap_t heap = { g_srcdram, sizeof g_srcdram, nullptr, nullptr };
     blt_execute(g_fb565, &heap, g_cmds, n);
+#endif
 }
 
 // Task 7 device wiring: the fabric framebuffer, for main.cpp to hand straight

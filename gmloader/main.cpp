@@ -575,19 +575,13 @@ int main(int argc, char *argv[])
           const uint8_t* _blit = Blitter_PresentDefault();
           if (_blit && NativeVideoWriter_IsActive()) {
             if (RasterBackend_Select() == &backend_mfgpu) {
-              // Task 7: fabric backend. present() (called inside
-              // Blitter_PresentDefault() above) already executed the frame's
-              // ring into g_fb565, which is RGB565 already (BLT_FB_WIDTH x
-              // BLT_FB_HEIGHT == MISTER_WIDTH x MISTER_HEIGHT) — hand it to
-              // the DDR writer directly, skipping Blitter_ToRGB565.
-              int fb_w = 0, fb_h = 0;
-              const uint16_t* fb565 = RasterBackend_MFGPU_GetFB565(&fb_w, &fb_h);
-              // Row stride comes from the fabric framebuffer's ACTUAL width (fb_w),
-              // not an assumed MISTER_WIDTH, so a future BLT_FB_WIDTH != MISTER_WIDTH
-              // cannot silently shear the image. Visible area is clamped to the fb.
-              const int vis_w = (fb_w < MISTER_WIDTH) ? fb_w : MISTER_WIDTH;
-              const int vis_h = (fb_h < MISTER_HEIGHT) ? fb_h : MISTER_HEIGHT;
-              NativeVideoWriter_WriteFrame(fb565, vis_w, vis_h, fb_w * 2);
+              // Fabric-offload (FO Task 4): backend_mfgpu's present() already
+              // submitted this frame's ring to the FPGA fabric (publish + doorbell +
+              // poll C_DONE), and the Maldita core composites it into on-chip BRAM
+              // and scans itself out. So there is NOTHING to hand to
+              // NativeVideoWriter here — the 0x3A DDR writer is the *software*
+              // producer, unused on the fabric path (no blt_execute, no g_fb565).
+              (void)0;
             } else {
               // Blitter owns the frame: convert (with row flip) straight to DDR,
               // skipping glReadPixels entirely.
