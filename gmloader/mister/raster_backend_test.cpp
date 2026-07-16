@@ -25,6 +25,15 @@
 #include <stdio.h>
 #include <stdint.h>
 
+// Fabric-offload Task 2: exercise the refmodel's BLT_OP_STAGE handling directly
+// (not via the vtable). blt_emitter.h pulls in blitter_ref.h (blt_cmd_t/blt_vtx_t/
+// BLT_*/blt_execute/blt_surface_heap_t) + blt_alloc.h; blt_wire.h gives
+// blt_unpack_cmd + BLT_CMD_BYTES.
+extern "C" {
+#include "blt_emitter.h"
+#include "blt_wire.h"
+}
+
 // backend_mfgpu (Task 4/5) + its host-only hooks. Declared here rather than via
 // raster_backend.h because these are not part of the vtable seam — they exist
 // solely so this host test can read the fixed-size fabric framebuffer
@@ -545,6 +554,61 @@ static int case_intra_frame_no_alias(void) {
     return 1;
 }
 
+// ── Fabric-offload Task 2: BLT_OP_STAGE is a refmodel no-op ───────────────────
+// With same-offset staging (SDRAM[off] = DDR[off], user-confirmed hardware
+// contract), the fabric's TRILIST texel fetch reads SDRAM[src_off] == a copy of
+// DDR[src_off]. The host refmodel has no SDRAM: blt_execute skips OP_STAGE
+// (blitter_ref.c) and reads texels straight from the DDR heap at src_off. So a
+// ring that STAGEs a texture before its TRILIST must render byte-IDENTICALLY to
+// the same ring without the STAGE. This locks that contract, so Task 3 can emit
+// blt_stage unconditionally and keep the host oracle honest.
+static int stage_noop_fb_nonempty(const uint16_t *fb) {
+    for (int i = 0; i < BLT_FB_PIXELS; i++) if (fb[i]) return 1;
+    return 0;
+}
+static void stage_noop_build_exec(int with_stage, uint16_t *fb) {
+    enum { VTX_REGION = 128 * 1024, HEAP = 1 << 20 };
+    static uint8_t  ring[8192];
+    static uint8_t  srcdram[HEAP];
+    static blt_cmd_t cmds[256];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof ring, srcdram, sizeof srcdram);
+    blt_alloc_init(&e.alloc, VTX_REGION, (uint32_t)(HEAP - VTX_REGION));
+    blt_vtx_buf_init(&e, srcdram, VTX_REGION);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    uint16_t tex[8 * 8];
+    for (int i = 0; i < 8 * 8; i++) tex[i] = 0xF81F;   // opaque magenta
+    blt_surface_ref_t ref = blt_upload(&e, tex, 8, 8, 8 * 2);
+
+    if (with_stage) blt_stage(&e, ref.off, (uint32_t)ref.stride * ref.h);  // same-offset
+
+    blt_vtx_t tris[3] = {   // integer coords -> identical coverage both ways
+        { (int16_t)(160 << 4), (int16_t)(60 << 4),  (uint16_t)(4 << 4), (uint16_t)(0 << 4), BLT_RGBA(255,255,255,255), 0 },
+        { (int16_t)(220 << 4), (int16_t)(170 << 4), (uint16_t)(7 << 4), (uint16_t)(7 << 4), BLT_RGBA(255,255,255,255), 0 },
+        { (int16_t)(100 << 4), (int16_t)(170 << 4), (uint16_t)(0 << 4), (uint16_t)(7 << 4), BLT_RGBA(255,255,255,255), 0 },
+    };
+    uint32_t eoff = blt_push_tris(&e, tris, 1);
+    blt_trilist(&e, ref, BLT_BLEND_COPY, /*colorkey=*/0, /*alpha=*/255, eoff, 1);
+    blt_end_frame(&e);
+
+    int n = e.cmd_count;
+    if (n > (int)(sizeof cmds / sizeof cmds[0])) n = (int)(sizeof cmds / sizeof cmds[0]);
+    for (int i = 0; i < n; i++)
+        blt_unpack_cmd(ring + (size_t)i * BLT_CMD_BYTES, &cmds[i]);
+    memset(fb, 0, (size_t)BLT_FB_PIXELS * sizeof(uint16_t));
+    blt_surface_heap_t heap = { srcdram, sizeof srcdram, NULL, NULL };
+    blt_execute(fb, &heap, cmds, n);
+}
+static int case_stage_noop(void) {
+    static uint16_t fb_plain[BLT_FB_PIXELS];
+    static uint16_t fb_staged[BLT_FB_PIXELS];
+    stage_noop_build_exec(/*with_stage=*/0, fb_plain);
+    stage_noop_build_exec(/*with_stage=*/1, fb_staged);
+    if (!stage_noop_fb_nonempty(fb_plain)) { printf("  stage_noop: triangle did not render\n"); return 0; }
+    return memcmp(fb_plain, fb_staged, sizeof fb_plain) == 0;
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -565,5 +629,7 @@ int main(void){
     else printf("raster_backend mfgpu-eviction OK\n");
     if (!case_intra_frame_no_alias()) { printf("FAIL mfgpu-intra-frame-no-alias\n"); ok = 0; }
     else printf("raster_backend mfgpu-intra-frame-no-alias OK\n");
+    if (!case_stage_noop()) { printf("FAIL mfgpu-stage-noop\n"); ok = 0; }
+    else printf("raster_backend mfgpu-stage-noop OK\n");
     return ok ? 0 : 1;
 }
