@@ -200,6 +200,7 @@ static inline uint16_t mf_texel565(const RTexture *t, int x, int y, bool *out_ha
 #include <unistd.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <stdlib.h>   // getenv (GMLOADER_MFSUBMIT_STAT instrumentation)
 enum {
     MF_DEV_PHYS_BASE = 0x3B000000u,
     MF_DEV_MAP_SIZE  = 0x01000000u,   // 16 MiB dedicated blitter region
@@ -241,6 +242,41 @@ static bool mf_ddr_map(void) {
     g_dev_ok = true;
     return true;
 }
+// Instrumentation (perf profiling of the "capture" bucket): characterize the
+// C_DONE busy-wait — how long we blocked, how many spin iterations that cost,
+// and whether it exited on match vs timeout. min≈max over a 30-submit window ⇒
+// the wait is quantized (vsync-locked fabric completion) rather than jittery.
+// Enable with GMLOADER_MFSUBMIT_STAT=1. Zero cost when unset.
+static int mf_stat_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_MFSUBMIT_STAT"); v = (e && *e) ? 1 : 0; }
+    return v;
+}
+// Fire-and-forget probe (GMLOADER_MFSUBMIT_NOWAIT=1): ring the doorbell and
+// return WITHOUT polling C_DONE, to measure the throughput ceiling when the host
+// stops serially waiting out the fabric's ~3-vsync completion latency. Unsafe for
+// production (the in-place DDR ring can be re-emitted while the fabric still reads
+// it → tearing) — a measurement knob only. Zero cost when unset.
+static int mf_nowait_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_MFSUBMIT_NOWAIT"); v = (e && *e) ? 1 : 0; }
+    return v;
+}
+static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
+    if (!mf_stat_on()) return;
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    double us = (now.tv_sec - t0->tv_sec) * 1e6 + (now.tv_nsec - t0->tv_nsec) / 1e3;
+    static unsigned n = 0, to = 0; static double lo = 1e12, hi = 0, sum = 0; static long it_sum = 0;
+    n++; to += timeout ? 1u : 0u; sum += us; it_sum += iters;
+    if (us < lo) lo = us; if (us > hi) hi = us;
+    if (n % 30 == 0) {
+        fprintf(stderr, "MFSUBMIT n=%u wait_ms[last=%.2f min=%.2f max=%.2f avg=%.2f] "
+                "spin_iters_avg=%ld timeouts=%u\n",
+                n, us/1e3, lo/1e3, hi/1e3, (sum/30.0)/1e3, it_sum/30, to);
+        lo = 1e12; hi = 0; sum = 0; it_sum = 0; to = 0;
+    }
+}
+
 // Publish the emitter's control-block mirror, ring the doorbell (submit_seq LAST,
 // after a barrier), poll C_DONE. Ring + heap are already resident in DDR (the
 // emitter was bound to g_dev_ring/g_dev_src), so there is nothing to copy. This
@@ -254,13 +290,20 @@ static void mf_device_submit(void) {
     __sync_synchronize();                       // data before doorbell
     mf_ctrl_wr(MF_C_SUBMIT, g_e.submit_seq);    // doorbell LAST
     struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (mf_nowait_on()) { mf_submit_stat(&t0, 0, /*timeout=*/0); return; }  // probe: no poll
+    long iters = 0;
     for (;;) {
-        if (mf_ctrl_rd(MF_C_DONE) == g_e.submit_seq) return;   // fabric consumed it
+        if (mf_ctrl_rd(MF_C_DONE) == g_e.submit_seq) {   // fabric consumed it
+            mf_submit_stat(&t0, iters, /*timeout=*/0);
+            return;
+        }
+        iters++;
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         long ms = (now.tv_sec - t0.tv_sec) * 1000L + (now.tv_nsec - t0.tv_nsec) / 1000000L;
         if (ms >= MF_DEV_DONE_TIMEOUT_MS) {
             fprintf(stderr, "backend_mfgpu: fabric submit timeout (submit=%u done=%u status=%u)\n",
                     g_e.submit_seq, mf_ctrl_rd(MF_C_DONE), mf_ctrl_rd(MF_C_STATUS));
+            mf_submit_stat(&t0, iters, /*timeout=*/1);
             return;
         }
     }
