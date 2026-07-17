@@ -121,6 +121,31 @@ static void test_appsurf_detect_updates() {
            Blitter_AppSurfaceFBO() == 11u && Blitter_AppSurfaceTex() == 12u);
 }
 
+// ---- Case 4 (reviewer-found regression): a deleted FBO's stale
+// g_fboColorTex attachment record must not survive to false-match a later
+// GL id reuse. FBO 20's color attachment is tex 21; tex 21 is deleted (GL
+// apps commonly recreate surfaces -- Task 1's Appendix A found this exact
+// game recycles names across room/surface transitions); id 21 is then
+// reused as FBO 22's attachment. A fullscreen draw sampling tex 21 must
+// detect FBO 22 (the live attachment), not the deleted FBO 20 -- without
+// the prune in Blitter_OnDeleteTexture, std::map's key-ordered iteration
+// (20 < 22) would hit the stale {20:21} entry first and misdetect FBO 20.
+static void test_appsurf_detect_ignores_deleted_fbo_attachment() {
+    Blitter_OnBindFramebuffer(GL_FRAMEBUFFER, 20);
+    Blitter_OnFramebufferTexture2D(GL_COLOR_ATTACHMENT0, 21);
+    Blitter_OnDeleteTexture(21);   // FBO 20 is defunct; should prune {20:21}
+
+    Blitter_OnBindFramebuffer(GL_FRAMEBUFFER, 22);
+    Blitter_OnFramebufferTexture2D(GL_COLOR_ATTACHMENT0, 21);   // id 21 reused
+
+    Blitter_OnBindFramebuffer(GL_FRAMEBUFFER, 0);
+    Blitter_OnBindTexture(GL_TEXTURE_2D, 21);
+    draw_quad(/*program=*/1, /*posAttrIdx=*/0, FULLSCREEN);
+
+    report("a deleted FBO's stale attachment does not shadow a reused id's live FBO",
+           Blitter_AppSurfaceFBO() == 22u && Blitter_AppSurfaceTex() == 21u);
+}
+
 int main() {
     setenv("GMLOADER_BLITTER", "1", 1);   // level 1: shadow+decode; no GL fallback needed
     Blitter_Init();
@@ -128,6 +153,7 @@ int main() {
     test_appsurf_detect_partial_draw_ignored();
     test_appsurf_detect();
     test_appsurf_detect_updates();
+    test_appsurf_detect_ignores_deleted_fbo_attachment();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

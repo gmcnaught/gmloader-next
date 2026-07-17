@@ -354,6 +354,21 @@ void Blitter_OnBindTexture(GLenum target, GLuint tex) {
 void Blitter_OnDeleteTexture(GLuint tex) {
     auto it = g_textures.find(tex);
     if (it != g_textures.end()) { free(it->second.rgba); g_textures.erase(it); }
+    // [app-surface render target, step 1] Prune any g_fboColorTex entry
+    // recording this now-deleted texture as an FBO's color attachment.
+    // g_fboColorTex entries are otherwise never removed (there's no
+    // Blitter_OnDeleteFramebuffer hook), so without this, a later GL id
+    // reuse of `tex` (Task 1 found this game recycles names across room/
+    // surface transitions) could false-match handle_draw()'s app-surface
+    // detection scan against a defunct FBO's stale attachment record --
+    // exactly the class of stale-render-target bug this whole plan exists
+    // to fix, just one step removed. Detection is intentionally
+    // non-latching (Task 4), so a false match here could even clobber a
+    // previously-correct detection.
+    for (auto fit = g_fboColorTex.begin(); fit != g_fboColorTex.end(); ) {
+        if (fit->second == tex) fit = g_fboColorTex.erase(fit);
+        else ++fit;
+    }
     RasterBackend_MFGPU_InvalidateTex(tex);
 }
 
