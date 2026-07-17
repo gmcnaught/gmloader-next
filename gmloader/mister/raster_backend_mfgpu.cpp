@@ -526,7 +526,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         colorkey = 0;
     }
     if (blt_trilist(&g_e, tex, blend_mode, colorkey, /*alpha=*/255,
-                    eoff, triCount) != 0)
+                    eoff, triCount, /*flags=*/0) != 0)
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", triCount);
 }
 

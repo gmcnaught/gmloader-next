@@ -619,7 +619,7 @@ static void stage_noop_build_exec(int with_stage, uint16_t *fb) {
         { (int16_t)(100 << 4), (int16_t)(170 << 4), (uint16_t)(0 << 4), (uint16_t)(7 << 4), BLT_RGBA(255,255,255,255), 0 },
     };
     uint32_t eoff = blt_push_tris(&e, tris, 1);
-    blt_trilist(&e, ref, BLT_BLEND_COPY, /*colorkey=*/0, /*alpha=*/255, eoff, 1);
+    blt_trilist(&e, ref, BLT_BLEND_COPY, /*colorkey=*/0, /*alpha=*/255, eoff, 1, /*flags=*/0);
     blt_end_frame(&e);
 
     int n = e.cmd_count;

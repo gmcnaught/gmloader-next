@@ -178,7 +178,7 @@ int main(int argc, char **argv) {
         close(fd);
         return 1;
     }
-    if (blt_trilist(&e, tex, BLT_BLEND_COPY, /*colorkey=*/0, /*alpha=*/255, entry_off, 1) != 0) {
+    if (blt_trilist(&e, tex, BLT_BLEND_COPY, /*colorkey=*/0, /*alpha=*/255, entry_off, 1, /*flags=*/0) != 0) {
         fprintf(stderr, "fabric_probe: blt_trilist emit failed\n");
         munmap((void *)base, MF_MAP_SIZE);
         close(fd);
