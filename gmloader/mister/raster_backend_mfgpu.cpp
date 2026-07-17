@@ -85,7 +85,12 @@ enum {
     MF_MAX_CMDS    = MF_RING_CAP / BLT_CMD_BYTES,
     MF_MAX_VERTS   = 8192,
     MF_TEX_TEXELS  = 2048 * 2048,                // scratch = largest single page (8MB)
-    MF_TEX_CACHE_N = 64,                         // resident-page table size
+    // resident-page table size. Sub-region residency (per-sprite-quad staging)
+    // caches by (tex_id, cropped rect) instead of one entry per whole page, so a
+    // batched spritesheet draw can hold many small sub-rects at once -- 256 slots
+    // covers a frame's distinct sprite-quad regions with headroom (spec tuning
+    // default). Every entry is a real heap page, but each sub-rect is a few KB.
+    MF_TEX_CACHE_N = 256,                         // resident-page table size
 };
 static uint8_t       g_ring[MF_RING_CAP];
 // Deliberate ~40MB static footprint (32MB texture heap here + 8MB conversion
@@ -112,7 +117,14 @@ static bool          g_frame_active = false;
 // Persistent resident-texture cache. Keyed by GL texture id (tex_key). Survives
 // across frames (mf_frame_begin no longer resets the heap); entries are freed on
 // GL invalidate/delete (Task 3) or LRU eviction under heap pressure (Task 4).
-struct MfTexEntry { uint32_t key; bool used; bool has_key; blt_surface_ref_t ref; uint64_t lru; };
+// A resident source page. Sub-region residency keys each entry by
+// (key, rx,ry,rw,rh): `key` is the GL texture id and (rx,ry,rw,rh) is the cropped
+// texel rect of `key` that this page holds (a whole-page entry is rx=ry=0,
+// rw=full-w, rh=full-h). Two draws of the same texture that sample different
+// sub-rects get distinct entries; invalidate frees every entry with a matching
+// key regardless of rect.
+struct MfTexEntry { uint32_t key; bool used; bool has_key; blt_surface_ref_t ref; uint64_t lru;
+                    uint16_t rx, ry, rw, rh; };
 static MfTexEntry g_texcache[MF_TEX_CACHE_N];
 static uint64_t   g_lru_clock   = 0;
 static uint32_t   g_upload_count = 0;   // real blt_upload calls since reinit (test hook)
@@ -174,6 +186,9 @@ extern "C" void RasterBackend_MFGPU_SetAppSurface(uint32_t fbo, uint32_t tex) {
 static inline uint16_t mf_rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
 }
+
+static inline int   mf_clampi(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); }
+static inline float mf_clamp01(float x)              { return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
 
 // Sentinel RGB565 value (magenta) used to mark "this texel is transparent" for
 // BLT_BLEND_COLORKEY staging (Task 6). The golden rasterizer (blt_tri.c) skips
@@ -483,46 +498,33 @@ static void mf_heaplog_frame_set(const char *tag, int verbose) {
             blt_alloc_used(&g_e.alloc) / (1024.0*1024.0), g_e.alloc.size / (1024.0*1024.0));
 }
 
-static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *out_has_key) {
-    for (int i = 0; i < MF_TEX_CACHE_N; i++)
-        if (g_texcache[i].used && g_texcache[i].key == key) {
-            g_texcache[i].lru = ++g_lru_clock;
-            *out_has_key = g_texcache[i].has_key;
-            return g_texcache[i].ref;
-        }
-    // miss: convert into scratch
-    int tw, th; bool textured = (t && t->valid && t->rgba);
-    if (textured) { tw = t->w; th = t->h; } else { tw = 1; th = 1; }
-    if (tw <= 0 || th <= 0 || (size_t)tw * th > MF_TEX_TEXELS) {
-        blt_surface_ref_t bad; bad.valid = 0; *out_has_key = false; return bad;
-    }
-    bool has_key = false;
-    if (textured) {
-        for (int y = 0; y < th; y++)
-            for (int x = 0; x < tw; x++)
-                g_texscratch[(size_t)y * tw + x] = mf_texel565(t, x, y, &has_key);
-    } else {
-        g_texscratch[0] = 0xFFFF;   // 1x1 opaque white
-    }
+// Shared tail for stage_texture / stage_texture_region: g_texscratch already
+// holds `w*h` RGB565 texels for the page keyed (key, rx,ry,w,h). Upload it
+// (evicting prior-frame pages under heap pressure), STAGE it DDR3->SDRAM, and
+// insert a cache entry. Returns the ref (.valid==0 if it couldn't fit even after
+// eviction -- the last failed blt_upload leaves g_e.overflow set so the frame
+// drops, which is correct). `what` tags the HEAPLOG lines.
+static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
+                                             int rx, int ry, bool has_key,
+                                             const char *what) {
     bool ov_before = g_e.overflow;                    // preserve any overflow already set this frame
-    blt_surface_ref_t ref = blt_upload(&g_e, g_texscratch, tw, th, tw * 2);
+    blt_surface_ref_t ref = blt_upload(&g_e, g_texscratch, w, h, w * 2);
     int evicted = 0;
-    while (!ref.valid && evict_one_lru()) { evicted++; ref = blt_upload(&g_e, g_texscratch, tw, th, tw * 2); }
+    while (!ref.valid && evict_one_lru()) { evicted++; ref = blt_upload(&g_e, g_texscratch, w, h, w * 2); }
     if (!ref.valid) {
-        *out_has_key = false;
         if (mf_heaplog_on()) {
-            fprintf(stderr, "HEAPLOG STAGE FAIL key=%u want=%dx%d(%zu bytes) evicted=%d "
-                    "heap_used=%u/%u\n", key, tw, th, (size_t)tw*th*2, evicted,
+            fprintf(stderr, "HEAPLOG STAGE FAIL %s key=%u rect=%d,%d %dx%d(%zu bytes) evicted=%d "
+                    "heap_used=%u/%u\n", what, key, rx, ry, w, h, (size_t)w*h*2, evicted,
                     blt_alloc_used(&g_e.alloc), g_e.alloc.size);
             mf_heaplog_frame_set("at-fail", /*verbose=*/1);
         }
-        return ref;
-    }  // last blt_upload left overflow set -> frame drops, correct
+        return ref;   // overflow left set by the last blt_upload -> frame drops, correct
+    }
     g_e.overflow = ov_before;                         // our transient failed-then-succeeded uploads did NOT overflow the frame
     g_upload_count++;
     if (mf_heaplog_on())
-        fprintf(stderr, "HEAPLOG upload key=%u %dx%d bytes=%u off=%u evicted=%d heap_used=%u/%u\n",
-                key, tw, th, ref.size, ref.off, evicted, blt_alloc_used(&g_e.alloc), g_e.alloc.size);
+        fprintf(stderr, "HEAPLOG upload %s key=%u rect=%d,%d %dx%d bytes=%u off=%u evicted=%d heap_used=%u/%u\n",
+                what, key, rx, ry, w, h, ref.size, ref.off, evicted, blt_alloc_used(&g_e.alloc), g_e.alloc.size);
     // Fabric-offload Task 3: stage this freshly-uploaded page DDR3->SDRAM at the
     // SAME offset (SDRAM[off] = DDR[off]) so the fabric's TRILIST texel fetch —
     // which samples SDRAM unconditionally at src_off == ref.off — resolves. Emitted
@@ -543,9 +545,123 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
     }
     if (g_texcache[slot].used)
         blt_emitter_free(&g_e, g_texcache[slot].ref.off, g_texcache[slot].ref.size);
-    g_texcache[slot] = MfTexEntry{ key, true, has_key, ref, ++g_lru_clock };
-    *out_has_key = has_key;
+    g_texcache[slot] = MfTexEntry{ key, true, has_key, ref, ++g_lru_clock,
+                                   (uint16_t)rx, (uint16_t)ry, (uint16_t)w, (uint16_t)h };
     return ref;
+}
+
+static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *out_has_key) {
+    // Whole-page entry: rect (0,0,tw,th). Untextured => 1x1 opaque-white page.
+    int tw, th; bool textured = (t && t->valid && t->rgba);
+    if (textured) { tw = t->w; th = t->h; } else { tw = 1; th = 1; }
+    if (tw <= 0 || th <= 0 || (size_t)tw * th > MF_TEX_TEXELS) {
+        blt_surface_ref_t bad; bad.valid = 0; *out_has_key = false; return bad;
+    }
+    for (int i = 0; i < MF_TEX_CACHE_N; i++)
+        if (g_texcache[i].used && g_texcache[i].key == key &&
+            g_texcache[i].rx == 0 && g_texcache[i].ry == 0 &&
+            g_texcache[i].rw == tw && g_texcache[i].rh == th) {
+            g_texcache[i].lru = ++g_lru_clock;
+            *out_has_key = g_texcache[i].has_key;
+            return g_texcache[i].ref;
+        }
+    bool has_key = false;
+    if (textured) {
+        for (int y = 0; y < th; y++)
+            for (int x = 0; x < tw; x++)
+                g_texscratch[(size_t)y * tw + x] = mf_texel565(t, x, y, &has_key);
+    } else {
+        g_texscratch[0] = 0xFFFF;   // 1x1 opaque white
+    }
+    blt_surface_ref_t ref = mf_upload_and_cache(key, tw, th, 0, 0, has_key, "whole");
+    *out_has_key = ref.valid ? has_key : false;
+    return ref;
+}
+
+// Sub-region residency: stage ONLY the tight UV sub-rect [u0,u1]x[v0,v1]
+// (normalized) of texture `t` as its own small RGB565 page, keyed (key, rect).
+// The rect is the texel bbox of the UVs expanded by a 1-texel margin and clamped
+// to the page, so the fabric's +HALF-bias NEAREST sample can never address a
+// texel just outside the cropped edge (see blt_tri.c). A cache hit reuses the
+// resident sub-page (no re-upload). Returns the ref (ref.w/ref.h = cropped rw/rh)
+// and, via out_rx/out_ry, the crop origin the caller needs to REBASE the quad's
+// UVs into the cropped page. .valid==0 => could not fit even after eviction.
+//
+// UV-rebase bit-exactness: for any vertex UV `u`, the whole-page fabric texel
+// coord is o.u = lround(clamp01(u)*t->w*16); rebasing to the cropped page gives
+// o.u' = lround((clamp01(u)*t->w - rx)*16) = o.u - rx*16 (rx integer). So the
+// cropped-page sample resolves the SAME physical texel (rx + o.u'/16 == o.u/16)
+// -- byte-identical to the whole-page render, no ±1 slack introduced by cropping.
+static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
+                                              float u0, float v0, float u1, float v1,
+                                              bool *out_has_key, int *out_rx, int *out_ry) {
+    // tight texel bbox + 1-texel margin, clamped to the page
+    int rx  = mf_clampi((int)floorf(u0 * t->w) - 1, 0, t->w - 1);
+    int ry  = mf_clampi((int)floorf(v0 * t->h) - 1, 0, t->h - 1);
+    int rx1 = mf_clampi((int)ceilf (u1 * t->w) + 1, 1, t->w);
+    int ry1 = mf_clampi((int)ceilf (v1 * t->h) + 1, 1, t->h);
+    int rw = rx1 - rx, rh = ry1 - ry;
+    if (rw < 1) rw = 1;
+    if (rh < 1) rh = 1;
+    *out_rx = rx; *out_ry = ry;
+    for (int i = 0; i < MF_TEX_CACHE_N; i++)
+        if (g_texcache[i].used && g_texcache[i].key == key &&
+            g_texcache[i].rx == rx && g_texcache[i].ry == ry &&
+            g_texcache[i].rw == rw && g_texcache[i].rh == rh) {
+            g_texcache[i].lru = ++g_lru_clock;
+            *out_has_key = g_texcache[i].has_key;
+            return g_texcache[i].ref;
+        }
+    if ((size_t)rw * rh > MF_TEX_TEXELS) {
+        blt_surface_ref_t bad; bad.valid = 0; *out_has_key = false; return bad;
+    }
+    bool has_key = false;
+    for (int y = 0; y < rh; y++)
+        for (int x = 0; x < rw; x++)
+            g_texscratch[(size_t)y * rw + x] = mf_texel565(t, rx + x, ry + y, &has_key);
+    blt_surface_ref_t ref = mf_upload_and_cache(key, rw, rh, rx, ry, has_key, "region");
+    *out_has_key = ref.valid ? has_key : false;
+    return ref;
+}
+
+// Emit one BLT_OP_TRILIST for `nt` triangles (`verts` = nt*3 vertices, whose UVs
+// address the `tw`x`th` page `tex`). Converts + pushes the vertices, selects the
+// colorkey-vs-blend mode (has_key + fully-opaque => BLT_BLEND_COLORKEY, exactly
+// as the whole-page path did -- see the long note at mf_draw's blend site), and
+// emits. Shared by the sub-region quad loop, the untextured single-page path, and
+// the app-surface path (extra_flags carries BLT_F_SRC_SURFACE there). A hard emit
+// failure is logged and drops just this group's triangles.
+static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
+                          const BVtx *verts, int nt, RBlend bl,
+                          bool has_key, uint8_t extra_flags) {
+    int nverts = nt * 3;
+    if (nverts > MF_MAX_VERTS) {
+        fprintf(stderr, "backend_mfgpu: %d tris exceed vertex scratch (%d verts) - draw dropped\n",
+                nt, MF_MAX_VERTS);
+        return;
+    }
+    float min_vtx_a = 1.0f;
+    for (int i = 0; i < nverts; i++) {
+        g_vtxscratch[i] = bvtx_to_blt(&verts[i], tw, th);
+        if (verts[i].a < min_vtx_a) min_vtx_a = verts[i].a;
+    }
+    uint32_t eoff = blt_push_tris(&g_e, g_vtxscratch, nt);
+    if (eoff == 0xFFFFFFFFu) {
+        fprintf(stderr, "backend_mfgpu: vertex push overflow (%d tris) - draw dropped\n", nt);
+        return;
+    }
+    uint8_t blend_mode;
+    uint16_t colorkey;
+    if (has_key && min_vtx_a * 255.0f >= 254.0f) {
+        blend_mode = BLT_BLEND_COLORKEY;
+        colorkey = MF_COLORKEY;
+    } else {
+        blend_mode = rblend_to_blt(bl);
+        colorkey = 0;
+    }
+    if (blt_trilist(&g_e, tex, blend_mode, colorkey, /*alpha=*/255,
+                    eoff, nt, extra_flags) != 0)
+        fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", nt);
 }
 
 static void mf_draw(RSurface *d, const BVtx *v, int triCount,
@@ -585,18 +701,16 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
     if (triCount <= 0) return;
 
     mf_select_target(d->fbo);
+    (void)ar;   // the fabric tri path has no alpha-test; GM's threshold is ~0
 
-    // ── source: the app surface itself (no staging), or a normal SDRAM page ──
-    blt_surface_ref_t tex;
-    int tw, th;
-    bool has_key = false;
+    // ── source: the app surface itself (no staging) ───────────────────────────
+    // One TRILIST over ALL the draw's tris: the surface is already fabric-
+    // resident (rendered there by an earlier dst_is_appsurf draw), so there is
+    // nothing to crop/stage. BLT_F_SRC_SURFACE ignores src_off/stride/x/y
+    // (Task 2/3 contract); tex stays zeroed/invalid, which the relaxed
+    // blt_trilist guard allows when the flag is set.
     if (src_is_appsurf) {
-        // BLT_F_SRC_SURFACE ignores src_off/src_stride/src_x/src_y (Task 2/3
-        // contract) -- no blt_upload/blt_stage for the surface, it's already
-        // fabric-resident (rendered there by an earlier dst_is_appsurf draw
-        // this frame, or a prior one). tex stays zeroed/invalid; Task 2's
-        // relaxed blt_trilist guard allows that when the flag is set.
-        memset(&tex, 0, sizeof tex);
+        blt_surface_ref_t tex; memset(&tex, 0, sizeof tex);
         // UV scale: t->w/t->h are the ORIGINAL GL texture's real dimensions
         // (get_rtexture() in blitter.cpp), which may be a padded page (e.g.
         // a 2048x2048 POT atlas -- Task 1's boot trace) larger than the
@@ -609,100 +723,107 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         // rasterizer would sample from the real bound texture. UNVERIFIED
         // against a real device UV capture (Task 1's frame-graph dump didn't
         // log UV) -- flag for Task 9 bring-up if the surface samples offset.
-        tw = t ? t->w : BLT_FB_WIDTH;
-        th = t ? t->h : BLT_FB_HEIGHT;
+        int tw = t ? t->w : BLT_FB_WIDTH;
+        int th = t ? t->h : BLT_FB_HEIGHT;
         if (tw <= 0) tw = BLT_FB_WIDTH;
         if (th <= 0) th = BLT_FB_HEIGHT;
-    } else {
-        // [Task 9 bring-up diagnostic] Log the UV bbox this draw ACTUALLY
-        // touches within the full page, vs the full page's own dims -- to
-        // measure how much of a large sprite-sheet a typical draw uses (sub-
-        // region staging feasibility evidence). Cheap: only when heaplog is on.
-        if (mf_heaplog_on() && t && t->valid && t->w > 0 && t->h > 0) {
-            float umin=1e9f,umax=-1e9f,vmin=1e9f,vmax=-1e9f;
-            double sum_tri_px_area = 0;   // sum of PER-TRIANGLE bboxes (texels)
-            for (int i = 0; i < triCount*3; i++) {
-                if (v[i].u<umin) umin=v[i].u; if (v[i].u>umax) umax=v[i].u;
-                if (v[i].v<vmin) vmin=v[i].v; if (v[i].v>vmax) vmax=v[i].v;
-            }
-            for (int q = 0; q < triCount; q++) {
-                float tu0=1e9f,tu1=-1e9f,tv0=1e9f,tv1=-1e9f;
-                for (int k = 0; k < 3; k++) {
-                    const BVtx &vv = v[q*3+k];
-                    if (vv.u<tu0) tu0=vv.u; if (vv.u>tu1) tu1=vv.u;
-                    if (vv.v<tv0) tv0=vv.v; if (vv.v>tv1) tv1=vv.v;
-                }
-                sum_tri_px_area += (double)(tu1-tu0)*t->w * (double)(tv1-tv0)*t->h;
-            }
-            int pxw = (int)((umax-umin) * t->w + 0.5f), pxh = (int)((vmax-vmin) * t->h + 0.5f);
-            fprintf(stderr, "HEAPLOG uvbbox key=%u page=%dx%d tris=%d touched=%dx%d(%d bytes) "
-                    "of %u bytes (%.1f%%) sum_tri_px_area=%.0f (%.1f%% of page, %.1f%% of bbox)\n",
-                    tex_key, t->w, t->h, triCount, pxw, pxh, pxw*pxh*2, (unsigned)t->w*t->h*2,
-                    100.0*(pxw*pxh*2)/((double)t->w*t->h*2), sum_tri_px_area,
-                    100.0*sum_tri_px_area/((double)t->w*t->h),
-                    pxw*pxh>0 ? 100.0*sum_tri_px_area/((double)pxw*pxh) : 0.0);
+        mf_emit_group(tex, tw, th, v, triCount, bl, /*has_key=*/false, BLT_F_SRC_SURFACE);
+        return;
+    }
+
+    // [Task 9 bring-up diagnostic] Log the UV bbox this draw ACTUALLY touches
+    // within the full page, vs the full page's own dims -- to measure how much
+    // of a large sprite-sheet a typical draw uses (sub-region staging feasibility
+    // evidence). Cheap: only when heaplog is on.
+    if (mf_heaplog_on() && t && t->valid && t->w > 0 && t->h > 0) {
+        float umin=1e9f,umax=-1e9f,vmin=1e9f,vmax=-1e9f;
+        double sum_tri_px_area = 0;   // sum of PER-TRIANGLE bboxes (texels)
+        for (int i = 0; i < triCount*3; i++) {
+            if (v[i].u<umin) umin=v[i].u; if (v[i].u>umax) umax=v[i].u;
+            if (v[i].v<vmin) vmin=v[i].v; if (v[i].v>vmax) vmax=v[i].v;
         }
-        // ── stage the texture page as RGB565 ──────────────────────────────
-        // Key 0 is reserved for the untextured 1x1 opaque-white page; a real GL
-        // texture name is never 0 (0 means "no texture bound"), so no collision.
-        uint32_t stage_key = (t && t->valid && t->rgba) ? tex_key : 0u;   // all untextured share key 0
-        tex = stage_texture(stage_key, t, &has_key);
+        for (int q = 0; q < triCount; q++) {
+            float tu0=1e9f,tu1=-1e9f,tv0=1e9f,tv1=-1e9f;
+            for (int k = 0; k < 3; k++) {
+                const BVtx &vv = v[q*3+k];
+                if (vv.u<tu0) tu0=vv.u; if (vv.u>tu1) tu1=vv.u;
+                if (vv.v<tv0) tv0=vv.v; if (vv.v>tv1) tv1=vv.v;
+            }
+            sum_tri_px_area += (double)(tu1-tu0)*t->w * (double)(tv1-tv0)*t->h;
+        }
+        int pxw = (int)((umax-umin) * t->w + 0.5f), pxh = (int)((vmax-vmin) * t->h + 0.5f);
+        fprintf(stderr, "HEAPLOG uvbbox key=%u page=%dx%d tris=%d touched=%dx%d(%d bytes) "
+                "of %u bytes (%.1f%%) sum_tri_px_area=%.0f (%.1f%% of page, %.1f%% of bbox)\n",
+                tex_key, t->w, t->h, triCount, pxw, pxh, pxw*pxh*2, (unsigned)t->w*t->h*2,
+                100.0*(pxw*pxh*2)/((double)t->w*t->h*2), sum_tri_px_area,
+                100.0*sum_tri_px_area/((double)t->w*t->h),
+                pxw*pxh>0 ? 100.0*sum_tri_px_area/((double)pxw*pxh) : 0.0);
+    }
+
+    // ── untextured: one 1x1 opaque-white page, single TRILIST over all tris ────
+    // Key 0 is reserved for that page; a real GL texture name is never 0, so no
+    // collision. Cropping a 1x1 page is meaningless, so untextured fills stay on
+    // the whole-page path.
+    bool textured = (t && t->valid && t->rgba);
+    if (!textured) {
+        bool has_key = false;
+        blt_surface_ref_t tex = stage_texture(0u, t, &has_key);
         if (!tex.valid) {
             fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
             return;
         }
-        tw = tex.w; th = tex.h;   // staged page dims (1x1 for untextured)
-    }
-
-    // ── convert + push the vertices ───────────────────────────────────────────
-    int nverts = triCount * 3;
-    if (nverts > MF_MAX_VERTS) {
-        fprintf(stderr, "backend_mfgpu: %d tris exceed vertex scratch (%d verts) - draw dropped\n",
-                triCount, MF_MAX_VERTS);
-        return;
-    }
-    float min_vtx_a = 1.0f;
-    for (int i = 0; i < nverts; i++) {
-        g_vtxscratch[i] = bvtx_to_blt(&v[i], tw, th);
-        if (v[i].a < min_vtx_a) min_vtx_a = v[i].a;
-    }
-    uint32_t eoff = blt_push_tris(&g_e, g_vtxscratch, triCount);
-    if (eoff == 0xFFFFFFFFu) {
-        fprintf(stderr, "backend_mfgpu: vertex push overflow (%d tris) - draw dropped\n", triCount);
+        mf_emit_group(tex, tex.w, tex.h, v, triCount, bl, has_key, /*extra_flags=*/0);
         return;
     }
 
-    // ── emit the TRILIST header (header alpha 255: CONST_ALPHA rides vtx.a) ────
-    (void)ar;   // the fabric tri path has no alpha-test; GM's threshold is ~0
+    // ── textured: per-sprite-quad sub-region staging ──────────────────────────
+    // Split the draw into sprite-quads (2 tris / 6 verts), crop-stage only the
+    // UV sub-rect each quad samples, rebase its UVs into that cropped page, and
+    // emit one TRILIST per quad. A trailing odd triangle (triCount odd) is its
+    // own 3-vertex group -- cropped the same way, so nothing is dropped and the
+    // whole draw stays bit-exact vs the old whole-page render (see
+    // stage_texture_region's rebase-exactness note). This is the change that
+    // drops the per-frame device working set from whole 2048^2 atlas pages to
+    // the ~1.5-3%-of-page the sprites actually touch.
     //
-    // Colorkey-aware blend selection (Task 6): a texture that staged any texel
-    // as MF_COLORKEY (has_key) is a hard-edged (alpha in {0,255}) cutout — if
-    // the draw is also fully opaque at the vertex level (min_vtx_a*255 >= 254),
-    // BLT_BLEND_COLORKEY reproduces the SW oracle's per-texel-alpha cutout
-    // exactly (mod 565 rounding). Otherwise fall back to the Task 5 path.
-    // has_key is always false for a surface-sampled draw (no texel staging
-    // happens for it at all), so it never takes the colorkey path.
-    //
-    // KNOWN LIMITATION: a *faded* cutout sprite (keyed texture drawn with
-    // vtx.a < 254, e.g. a fade-out) cannot combine colorkey + const-alpha in a
-    // single fabric TRILIST pass (blt_tri.c's blend switch is one case, not a
-    // pipeline) — it falls back to CONST_ALPHA below, which composites the key
-    // colour's pixels too (no cutout) while fading. Soft/faded transparency
-    // needs real per-texel alpha in the fabric raster path; that's a future RTL
-    // item, out of scope here.
-    uint8_t blend_mode;
-    uint16_t colorkey;
-    if (has_key && min_vtx_a * 255.0f >= 254.0f) {
-        blend_mode = BLT_BLEND_COLORKEY;
-        colorkey = MF_COLORKEY;
-    } else {
-        blend_mode = rblend_to_blt(bl);
-        colorkey = 0;
+    // Blend selection + the keyed-cutout / faded-sprite limitation live in
+    // mf_emit_group (unchanged from the whole-page path): has_key is computed
+    // per cropped region -- a region that includes a keyed texel reports
+    // has_key, and a keyed texel a quad samples is always inside that quad's own
+    // cropped rect, so the COLORKEY-vs-COPY choice is identical to whole-page.
+    for (int tri = 0; tri < triCount; ) {
+        int ntg = (triCount - tri >= 2) ? 2 : 1;   // a sprite-quad, or a trailing odd tri
+        const BVtx *gv = v + (size_t)tri * 3;
+        int gverts = ntg * 3;
+        // quad UV bbox (clamp01 to match the rebase + the fabric's clamped sampling)
+        float u0 = 1.0f, u1 = 0.0f, v0 = 1.0f, v1 = 0.0f;
+        for (int i = 0; i < gverts; i++) {
+            float uu = mf_clamp01(gv[i].u), vv = mf_clamp01(gv[i].v);
+            if (uu < u0) u0 = uu; if (uu > u1) u1 = uu;
+            if (vv < v0) v0 = vv; if (vv > v1) v1 = vv;
+        }
+        bool has_key = false; int rx = 0, ry = 0;
+        blt_surface_ref_t tex = stage_texture_region(tex_key, t, u0, v0, u1, v1, &has_key, &rx, &ry);
+        if (!tex.valid) {
+            // The failed upload left g_e.overflow set -> the whole frame drops at
+            // frame_end (correct: a texture that can't fit must not render half a
+            // command list). No point emitting the remaining quads.
+            fprintf(stderr, "backend_mfgpu: sub-region cannot fit heap after eviction - draw dropped\n");
+            return;
+        }
+        int rw = tex.w, rh = tex.h;
+        // rebase this quad's UVs into the cropped page: cropped-page uv' =
+        // (clamp01(uv)*page - rect_origin) / crop_dim.
+        BVtx reb[6];
+        for (int i = 0; i < gverts; i++) {
+            float u_abs = mf_clamp01(gv[i].u) * t->w, v_abs = mf_clamp01(gv[i].v) * t->h;
+            reb[i] = gv[i];
+            reb[i].u = (u_abs - rx) / (float)rw;
+            reb[i].v = (v_abs - ry) / (float)rh;
+        }
+        mf_emit_group(tex, rw, rh, reb, ntg, bl, has_key, /*extra_flags=*/0);
+        tri += ntg;
     }
-    uint8_t extra_flags = src_is_appsurf ? BLT_F_SRC_SURFACE : 0;
-    if (blt_trilist(&g_e, tex, blend_mode, colorkey, /*alpha=*/255,
-                    eoff, triCount, extra_flags) != 0)
-        fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", triCount);
 }
 
 static void mf_frame_end(void);   // forward decl: defined below, called from mf_present

@@ -642,6 +642,83 @@ static int case_stage_noop(void) {
     return memcmp(fb_plain, fb_staged, sizeof fb_plain) == 0;
 }
 
+// ── Task 2 (sub-region residency): per-quad crop-stage bit-exact + small ──────
+// Fill helper: a smooth low-contrast RGB gradient over a 512x512 page. Smooth on
+// purpose (<=1 565 LSB between adjacent texels), so the fabric's +HALF-bias
+// nearest sample and the SW oracle's floor never disagree by more than the +-1
+// tolerance at a texel boundary -- while a GROSS crop-offset bug (sampling a
+// wrong sub-rect dozens of texels away) shifts the gradient far enough to blow
+// past +-1. Exactly the fixture rationale the tex-NxM battery case documents.
+static void fill_gradient_512(uint8_t *tex, int TW, int TH) {
+    for (int y = 0; y < TH; y++)
+        for (int x = 0; x < TW; x++) {
+            uint8_t *p = tex + ((size_t)y * TW + x) * 4;
+            p[0] = (uint8_t)(x / 2);   // 0..255 across the page width
+            p[1] = (uint8_t)(y / 2);
+            p[2] = 100; p[3] = 255;
+        }
+}
+
+// A single sprite-quad sampling a small UV sub-rect of a 512x512 (512KB RGB565)
+// page must (a) render +-1 LSB identical to the whole-page render (the SW oracle
+// samples the full texture), and (b) stage ONLY that sub-rect.
+//
+// The texture heap is capped to 256KB -- SMALLER than the 512KB whole page but
+// far larger than the ~51x51-texel sub-rect (~5KB). So the RED (pre-crop, whole-
+// page staging) is unambiguous: the 512KB page cannot fit -> blt_upload fails ->
+// the frame drops (g_fb565 zeroed) -> compare565 FAILS and upload_count stays 0.
+// The GREEN (per-quad crop): only the sub-rect is staged -> it fits -> renders
+// bit-exact and upload_count == 1. This is the on-device 20MB-vs-14.62MB heap
+// overflow the whole feature exists to fix, reproduced in miniature.
+static int case_subregion_matches_wholepage(void) {
+    enum { TW = 512, TH = 512 };
+    static uint8_t tex[TW*TH*4];
+    fill_gradient_512(tex, TW, TH);
+    RTexture t = { tex, TW, TH, 1, 1, /*RGBA8888*/0, 1 };
+    // One quad (2 tris) sampling UV [0.1,0.2] x [0.3,0.4] -- a ~51x51-texel
+    // sub-rect of the 512x512 page -- mapped onto a screen rect.
+    BVtx v[6] = {
+        {  40.f,  40.f, 0.1f,0.3f, 1,1,1,1 }, { 200.f,  40.f, 0.2f,0.3f, 1,1,1,1 }, { 200.f,150.f, 0.2f,0.4f, 1,1,1,1 },
+        {  40.f,  40.f, 0.1f,0.3f, 1,1,1,1 }, { 200.f,150.f, 0.2f,0.4f, 1,1,1,1 }, {  40.f,150.f, 0.1f,0.4f, 1,1,1,1 },
+    };
+    RasterBackend_MFGPU_TestReinit(256u*1024);   // < 512KB whole page, >> the sub-rect
+    int ok = battery_case_key("subregion", 8,8,8, &t, v, 2, RB_NONE, next_key());
+    uint32_t up = RasterBackend_MFGPU_TestUploadCount();
+    if (up != 1) {
+        printf("  FAIL subregion upload_count=%u (expected 1 sub-rect, not the whole page)\n", up);
+        ok = 0;
+    }
+    return ok;
+}
+
+// Batched multi-sprite (mirrors the real key5 sprite-batch): ONE draw with 4 tris
+// = two quads sampling two DIFFERENT sub-rects of the same page. Both must render
+// bit-exact vs whole-page, and TWO small regions must stage (not the full page).
+// Same 256KB cap => whole-page staging (pre-crop) can't fit -> RED; two sub-rects
+// fit -> GREEN with upload_count == 2.
+static int case_subregion_batched_multi(void) {
+    enum { TW = 512, TH = 512 };
+    static uint8_t tex[TW*TH*4];
+    fill_gradient_512(tex, TW, TH);
+    RTexture t = { tex, TW, TH, 1, 1, /*RGBA8888*/0, 1 };
+    BVtx v[12] = {
+        // quad A: screen [20,20]-[110,110], UV sub-rect [0.10,0.20] x [0.10,0.20]
+        {  20.f, 20.f, 0.10f,0.10f, 1,1,1,1 }, { 110.f, 20.f, 0.20f,0.10f, 1,1,1,1 }, { 110.f,110.f, 0.20f,0.20f, 1,1,1,1 },
+        {  20.f, 20.f, 0.10f,0.10f, 1,1,1,1 }, { 110.f,110.f, 0.20f,0.20f, 1,1,1,1 }, {  20.f,110.f, 0.10f,0.20f, 1,1,1,1 },
+        // quad B: screen [140,20]-[230,110], UV sub-rect [0.70,0.80] x [0.70,0.80]
+        { 140.f, 20.f, 0.70f,0.70f, 1,1,1,1 }, { 230.f, 20.f, 0.80f,0.70f, 1,1,1,1 }, { 230.f,110.f, 0.80f,0.80f, 1,1,1,1 },
+        { 140.f, 20.f, 0.70f,0.70f, 1,1,1,1 }, { 230.f,110.f, 0.80f,0.80f, 1,1,1,1 }, { 140.f,110.f, 0.70f,0.80f, 1,1,1,1 },
+    };
+    RasterBackend_MFGPU_TestReinit(256u*1024);
+    int ok = battery_case_key("subregion-batch", 8,8,8, &t, v, 4, RB_NONE, next_key());
+    uint32_t up = RasterBackend_MFGPU_TestUploadCount();
+    if (up != 2) {
+        printf("  FAIL subregion-batch upload_count=%u (expected 2 sub-rects, not the whole page)\n", up);
+        ok = 0;
+    }
+    return ok;
+}
+
 // ── Task 5: route app-surface draws to the fabric surface, sample via
 // BLT_F_SRC_SURFACE ──────────────────────────────────────────────────────────
 // Two-pass scene through the REAL backend entry points (mirrors Task 3's
@@ -790,6 +867,10 @@ int main(void){
     else printf("raster_backend mfgpu-stage-noop OK\n");
     if (!case_sdram_residency()) { printf("FAIL mfgpu-sdram-residency\n"); ok = 0; }
     else printf("raster_backend mfgpu-sdram-residency OK\n");
+    if (!case_subregion_matches_wholepage()) { printf("FAIL mfgpu-subregion\n"); ok = 0; }
+    else printf("raster_backend mfgpu-subregion OK\n");
+    if (!case_subregion_batched_multi()) { printf("FAIL mfgpu-subregion-batch\n"); ok = 0; }
+    else printf("raster_backend mfgpu-subregion-batch OK\n");
     // Placed last: sets g_appSurfFbo/Tex (backend_mfgpu) nonzero mid-run, which
     // would change dst_is_appsurf's outcome for any earlier-in-main() case that
     // happens to share an FBO/tex id (none do today, but keep this last so a
