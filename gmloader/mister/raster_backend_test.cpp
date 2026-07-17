@@ -719,6 +719,171 @@ static int case_subregion_batched_multi(void) {
     return ok;
 }
 
+// ── Task 3 (fallback + edge + pin-aware insert) ───────────────────────────────
+// Build a grid of screen cells, each a 2-tri quad sampling ONE texel of the page
+// at a constant mid-texel UV (tx+0.25)/tw -- exact on both rasterizers (no
+// nearest-boundary ambiguity), so a high-contrast per-texel pattern compares
+// bit-exact and a wrong/dropped texel is caught. Samples texels
+// (tx0+i*stride, ty0+j*stride) for i in [0,nx), j in [0,ny); cells are `cell` px
+// from origin (ox,oy). Writes nx*ny*6 verts, returns the triangle count.
+static int build_texel_grid(BVtx *out, int tx0, int ty0, int nx, int ny, int stride,
+                            int tw, int th, float cell, float ox, float oy) {
+    int n = 0;
+    for (int j = 0; j < ny; j++)
+        for (int i = 0; i < nx; i++) {
+            int tx = tx0 + i*stride, ty = ty0 + j*stride;
+            float u = (tx + 0.25f) / (float)tw, uv = (ty + 0.25f) / (float)th;
+            float x0 = ox + i*cell, y0 = oy + j*cell, x1 = x0 + cell, y1 = y0 + cell;
+            BVtx q[6] = {
+                { x0,y0, u,uv, 1,1,1,1 }, { x1,y0, u,uv, 1,1,1,1 }, { x1,y1, u,uv, 1,1,1,1 },
+                { x0,y0, u,uv, 1,1,1,1 }, { x1,y1, u,uv, 1,1,1,1 }, { x0,y1, u,uv, 1,1,1,1 },
+            };
+            for (int k = 0; k < 6; k++) out[n++] = q[k];
+        }
+    return nx*ny*2;
+}
+
+// After a draw of `key` that (per Task 3) routes through the WHOLE-PAGE path, a
+// subsequent whole-page (UV 0..1) draw of the same key must be a cache HIT.
+// Returns upload_count after the second draw: 1 iff both share the one whole-page
+// entry; >1 iff the first draw cached a different (cropped) rect. Shares the live
+// cache (no reinit).
+static uint32_t wholepage_followup_uploads(const RTexture *t, uint32_t key) {
+    static uint8_t rgba[BW*BH*4];
+    RSurface s = { rgba, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba);
+    BVtx wp[6] = {
+        {   0.f,  0.f, 0,0, 1,1,1,1 }, { 200.f,  0.f, 1,0, 1,1,1,1 }, { 200.f,150.f, 1,1, 1,1,1,1 },
+        {   0.f,  0.f, 0,0, 1,1,1,1 }, { 200.f,150.f, 1,1, 1,1,1,1 }, {   0.f,150.f, 0,1, 1,1,1,1 },
+    };
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.clear(&s, 8,8,8,255);
+    backend_mfgpu.draw(&s, wp, 2, t, RB_NONE, 0.f, key);
+    backend_mfgpu.frame_end();
+    return RasterBackend_MFGPU_TestUploadCount();
+}
+
+// Odd triCount (not clean sprite-quads) routes the WHOLE draw through the intact
+// whole-page path: renders bit-exact, and a following whole-page draw of the same
+// texture is a cache HIT (upload_count stays 1). Before Task 3, odd was split into
+// a quad + a trailing tri cropped to two sub-rects != the whole page, so the
+// whole-page follow-up would MISS and upload again (RED: uploads>1).
+static int case_fallback_odd_tricount(void) {
+    enum { TW = 64, TH = 64 };
+    static uint8_t tex[TW*TH*4];
+    for (int y=0;y<TH;y++) for (int x=0;x<TW;x++){ uint8_t*p=tex+((y*TW+x)*4);
+        p[0]=(uint8_t)(x*4); p[1]=(uint8_t)(y*4); p[2]=90; p[3]=255; }
+    RTexture t = { tex, TW, TH, 1, 1, 0, 1 };
+    BVtx v[9] = {                              // 3 tris = 1 quad + 1 stray triangle
+        {  20.f,20.f, 0.10f,0.10f, 1,1,1,1 }, { 120.f,20.f, 0.50f,0.10f, 1,1,1,1 }, { 120.f,120.f, 0.50f,0.50f, 1,1,1,1 },
+        {  20.f,20.f, 0.10f,0.10f, 1,1,1,1 }, { 120.f,120.f,0.50f,0.50f, 1,1,1,1 }, {  20.f,120.f,0.10f,0.50f, 1,1,1,1 },
+        { 140.f,20.f, 0.60f,0.60f, 1,1,1,1 }, { 240.f,20.f, 0.90f,0.60f, 1,1,1,1 }, { 140.f,120.f,0.60f,0.90f, 1,1,1,1 },
+    };
+    RasterBackend_MFGPU_TestReinit(0);
+    uint32_t K = next_key();
+    int ok = battery_case_key("odd-tricount", 8,8,8, &t, v, 3, RB_NONE, K);
+    uint32_t up = wholepage_followup_uploads(&t, K);
+    if (up != 1) { printf("  FAIL odd-tricount routed to crop, not whole-page (uploads=%u)\n", up); ok = 0; }
+    return ok;
+}
+
+// A quad whose UV bbox covers ~the whole page (>=90% area) routes through the
+// whole-page path (avoids re-cropping ~the entire page every frame). Renders
+// bit-exact, and a whole-page follow-up is a cache HIT. Before Task 3 the
+// near-full quad cached a cropped rect (e.g. 9,9,495,495) != the whole page, so
+// the follow-up MISSED (RED: uploads>1).
+static int case_nearfullpage(void) {
+    enum { TW = 512, TH = 512 };
+    static uint8_t tex[TW*TH*4];
+    fill_gradient_512(tex, TW, TH);
+    RTexture t = { tex, TW, TH, 1, 1, 0, 1 };
+    BVtx v[6] = {                              // UV [0.02,0.98]^2 ~= 93% of the page
+        {  40.f,40.f, 0.02f,0.02f, 1,1,1,1 }, { 200.f,40.f, 0.98f,0.02f, 1,1,1,1 }, { 200.f,150.f, 0.98f,0.98f, 1,1,1,1 },
+        {  40.f,40.f, 0.02f,0.02f, 1,1,1,1 }, { 200.f,150.f,0.98f,0.98f, 1,1,1,1 }, {  40.f,150.f,0.02f,0.98f, 1,1,1,1 },
+    };
+    RasterBackend_MFGPU_TestReinit(0);
+    uint32_t K = next_key();
+    int ok = battery_case_key("nearfull", 8,8,8, &t, v, 2, RB_NONE, K);
+    uint32_t up = wholepage_followup_uploads(&t, K);
+    if (up != 1) { printf("  FAIL nearfull routed to crop, not whole-page (uploads=%u)\n", up); ok = 0; }
+    return ok;
+}
+
+// A sprite whose UV bbox touches the texture's MAX row/col: verifies the +1-texel
+// crop margin clamps to the page (rx1 = clampi(ceil(u1*w)+1, 1, w) includes texel
+// w-1) so the edge texel is never dropped. The max row/col are a distinct bright
+// colour; mid-texel UV keeps the sample exact, so a dropped/clamped-wrong edge
+// texel diverges past +-1.
+static int case_edge_sprite(void) {
+    enum { TW = 16, TH = 16 };
+    static uint8_t tex[TW*TH*4];
+    for (int y=0;y<TH;y++) for (int x=0;x<TW;x++){ uint8_t*p=tex+((y*TW+x)*4);
+        p[0]=(uint8_t)(x*17); p[1]=(uint8_t)(y*17);
+        p[2]=(x==TW-1 || y==TH-1) ? 255 : 40;   // bright max-edge marker
+        p[3]=255; }
+    RTexture t = { tex, TW, TH, 1, 1, 0, 1 };
+    static BVtx v[4*4*6];
+    int tris = build_texel_grid(v, /*tx0*/12,/*ty0*/12, /*nx*/4,/*ny*/4, /*stride*/1,
+                                TW, TH, /*cell*/20.f, /*ox*/40.f, /*oy*/40.f);
+    RasterBackend_MFGPU_TestReinit(0);
+    return battery_case_key("edge-sprite", 5,5,5, &t, v, tris, RB_NONE, next_key());
+}
+
+// Pin-aware cache insert (Task-2 reviewer-mandated). Force >MF_TEX_CACHE_N (256)
+// DISTINCT sub-regions in ONE frame (a 20x15 grid = 300 cells, texels spaced 5
+// apart so each crop rect is a distinct cache key). The full-table insert cannot
+// evict a frame-pinned entry (its heap is referenced by an already-emitted, not-
+// yet-executed trilist); it must DROP the frame (overflow) instead of freeing +
+// reusing that slot. Invariant: for every drawn cell centre, the fabric pixel is
+// EITHER black (the frame gracefully dropped) OR within +-1 of the SW oracle. A
+// NON-black pixel that differs from the oracle == an intra-frame texture ALIAS
+// (the bug). Before the fix the frame does NOT overflow (all uploads fit) and the
+// aliasing inserts render wrong textures -> RED.
+static int case_pin_aware_insert(void) {
+    enum { TW = 512, TH = 512, NX = 20, NY = 15 };
+    static uint8_t tex[TW*TH*4];
+    for (int y=0;y<TH;y++) for (int x=0;x<TW;x++){ uint8_t*p=tex+((size_t)(y*TW+x)*4);
+        p[0]=(uint8_t)(x*4); p[1]=(uint8_t)(y*4); p[2]=128; p[3]=255; }   // per-texel distinct, non-black
+    RTexture t = { tex, TW, TH, 1, 1, 0, 1 };
+    static BVtx v[NX*NY*6];
+    const float CELL = 8.f, OX = 8.f, OY = 8.f;
+    int tris = build_texel_grid(v, /*tx0*/10,/*ty0*/10, NX, NY, /*stride*/5,
+                                TW, TH, CELL, OX, OY);   // 300 distinct sub-regions
+
+    static uint8_t  rgba_sw[BW*BH*4], rgba_mf[BW*BH*4];
+    static uint16_t mf565[BW*BH];
+    RSurface s_sw = { rgba_sw, BW, BH }, s_mf = { rgba_mf, BW, BH };
+    backend_sw.clear(&s_sw, 8,8,8,255);
+    backend_sw.draw(&s_sw, v, tris, &t, RB_NONE, 0.f, 1);   // whole-texture oracle
+
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.clear(&s_mf, 8,8,8,255);
+    backend_mfgpu.draw(&s_mf, v, tris, &t, RB_NONE, 0.f, 55);
+    backend_mfgpu.frame_end();
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, mf565);
+
+    int checked = 0, dropped = 0;
+    for (int j = 0; j < NY; j++)
+        for (int i = 0; i < NX; i++) {
+            int cx = (int)(OX + i*CELL + CELL/2), cy = (int)(OY + j*CELL + CELL/2);
+            uint16_t fb = mf565[cy*BW + cx];
+            const uint8_t *p = s_sw.rgba + ((size_t)cy*BW + cx)*4;
+            int sr=p[0]>>3, sg=p[1]>>2, sb=p[2]>>3;
+            int fr=(fb>>11)&0x1F, fg=(fb>>5)&0x3F, fbb=fb&0x1F;
+            checked++;
+            if (fb == 0) { dropped++; continue; }          // gracefully dropped
+            if (abs(sr-fr)>1 || abs(sg-fg)>1 || abs(sb-fbb)>1) {
+                printf("  FAIL pin-aware-insert ALIAS @cell(%d,%d) sw=(%d,%d,%d) fb=(%d,%d,%d)\n",
+                       i,j,sr,sg,sb,fr,fg,fbb);
+                return 0;
+            }
+        }
+    printf("  OK   pin-aware-insert  %d cells checked, %d gracefully dropped (no alias)\n", checked, dropped);
+    return 1;
+}
+
 // ── Task 5: route app-surface draws to the fabric surface, sample via
 // BLT_F_SRC_SURFACE ──────────────────────────────────────────────────────────
 // Two-pass scene through the REAL backend entry points (mirrors Task 3's
@@ -871,6 +1036,14 @@ int main(void){
     else printf("raster_backend mfgpu-subregion OK\n");
     if (!case_subregion_batched_multi()) { printf("FAIL mfgpu-subregion-batch\n"); ok = 0; }
     else printf("raster_backend mfgpu-subregion-batch OK\n");
+    if (!case_fallback_odd_tricount()) { printf("FAIL mfgpu-fallback-odd\n"); ok = 0; }
+    else printf("raster_backend mfgpu-fallback-odd OK\n");
+    if (!case_nearfullpage()) { printf("FAIL mfgpu-nearfull\n"); ok = 0; }
+    else printf("raster_backend mfgpu-nearfull OK\n");
+    if (!case_edge_sprite()) { printf("FAIL mfgpu-edge-sprite\n"); ok = 0; }
+    else printf("raster_backend mfgpu-edge-sprite OK\n");
+    if (!case_pin_aware_insert()) { printf("FAIL mfgpu-pin-aware-insert\n"); ok = 0; }
+    else printf("raster_backend mfgpu-pin-aware-insert OK\n");
     // Placed last: sets g_appSurfFbo/Tex (backend_mfgpu) nonzero mid-run, which
     // would change dst_is_appsurf's outcome for any earlier-in-main() case that
     // happens to share an FBO/tex id (none do today, but keep this last so a

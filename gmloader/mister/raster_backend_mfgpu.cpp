@@ -537,11 +537,27 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
         fprintf(stderr, "backend_mfgpu: blt_stage overflow (off=%u) - draw may drop\n", ref.off);
     else
         g_stage_count++;
-    // insert into a free slot, evicting the LRU slot if the table is full
+    // insert into a free slot, else the LRU slot -- but NEVER a frame-pinned one.
     int slot = -1; uint64_t best = ~0ull;
     for (int i = 0; i < MF_TEX_CACHE_N; i++) {
         if (!g_texcache[i].used) { slot = i; break; }
         if (g_texcache[i].lru < best) { best = g_texcache[i].lru; slot = i; }
+    }
+    // Pin-aware insert: when the table is full and even the global-LRU victim was
+    // touched THIS frame (lru > floor), its heap offset is referenced by a
+    // trilist already emitted this frame and not yet executed -- freeing+reusing
+    // it would alias that draw onto the new texture (the exact hazard evict_one_lru
+    // guards on the heap-pressure path). There is no safe slot, so drop the frame
+    // (mirror the heap-overflow graceful path): undo this upload, set overflow, and
+    // fail the stage so the caller drops the draw. A busy frame degrades to a
+    // DROPPED frame, never a wrong-pixel frame.
+    if (g_texcache[slot].used && g_texcache[slot].lru > g_lru_frame_floor) {
+        if (mf_heaplog_on())
+            fprintf(stderr, "HEAPLOG CACHE-FULL %s key=%u: all %d slots frame-pinned "
+                    "- dropping frame\n", what, key, MF_TEX_CACHE_N);
+        blt_emitter_free(&g_e, ref.off, ref.size);   // the STAGE cmd dies with the dropped ring
+        g_e.overflow = true;
+        blt_surface_ref_t bad; bad.valid = 0; return bad;
     }
     if (g_texcache[slot].used)
         blt_emitter_free(&g_e, g_texcache[slot].ref.off, g_texcache[slot].ref.size);
@@ -592,17 +608,26 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
 // o.u' = lround((clamp01(u)*t->w - rx)*16) = o.u - rx*16 (rx integer). So the
 // cropped-page sample resolves the SAME physical texel (rx + o.u'/16 == o.u/16)
 // -- byte-identical to the whole-page render, no ±1 slack introduced by cropping.
+// The clamped, +1-texel-margin crop rect for UV bbox [u0,u1]x[v0,v1] of `t`. The
+// margin guards the fabric's +HALF-bias NEAREST edge; clamping rx1/ry1 to the
+// page (NOT page-1) keeps the max-edge texel w-1 inside the rect. Single-sourced
+// so stage_texture_region and mf_draw's near-full-page decision agree exactly.
+static void mf_crop_rect(const RTexture *t, float u0, float v0, float u1, float v1,
+                         int *rx, int *ry, int *rw, int *rh) {
+    int x0 = mf_clampi((int)floorf(u0 * t->w) - 1, 0, t->w - 1);
+    int y0 = mf_clampi((int)floorf(v0 * t->h) - 1, 0, t->h - 1);
+    int x1 = mf_clampi((int)ceilf (u1 * t->w) + 1, 1, t->w);
+    int y1 = mf_clampi((int)ceilf (v1 * t->h) + 1, 1, t->h);
+    *rx = x0; *ry = y0;
+    *rw = (x1 - x0 < 1) ? 1 : x1 - x0;
+    *rh = (y1 - y0 < 1) ? 1 : y1 - y0;
+}
+
 static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
                                               float u0, float v0, float u1, float v1,
                                               bool *out_has_key, int *out_rx, int *out_ry) {
-    // tight texel bbox + 1-texel margin, clamped to the page
-    int rx  = mf_clampi((int)floorf(u0 * t->w) - 1, 0, t->w - 1);
-    int ry  = mf_clampi((int)floorf(v0 * t->h) - 1, 0, t->h - 1);
-    int rx1 = mf_clampi((int)ceilf (u1 * t->w) + 1, 1, t->w);
-    int ry1 = mf_clampi((int)ceilf (v1 * t->h) + 1, 1, t->h);
-    int rw = rx1 - rx, rh = ry1 - ry;
-    if (rw < 1) rw = 1;
-    if (rh < 1) rh = 1;
+    int rx, ry, rw, rh;
+    mf_crop_rect(t, u0, v0, u1, v1, &rx, &ry, &rw, &rh);
     *out_rx = rx; *out_ry = ry;
     for (int i = 0; i < MF_TEX_CACHE_N; i++)
         if (g_texcache[i].used && g_texcache[i].key == key &&
@@ -776,53 +801,82 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         return;
     }
 
+    // ── fallback: odd triangle count is not clean sprite-quads ────────────────
+    // The sub-region path below assumes 2-tri (6-vertex) sprite-quads. A draw
+    // whose tri count is odd isn't that shape (stray/fan geometry, rare and not
+    // the batched-atlas hot path), so route the WHOLE draw through the intact
+    // whole-page path -- bit-exact, and it shares one cache entry instead of
+    // fragmenting into odd sub-rects.
+    if (triCount % 2 != 0) {
+        bool has_key = false;
+        blt_surface_ref_t tex = stage_texture(tex_key, t, &has_key);
+        if (!tex.valid) {
+            fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
+            return;
+        }
+        mf_emit_group(tex, tex.w, tex.h, v, triCount, bl, has_key, /*extra_flags=*/0);
+        return;
+    }
+
     // ── textured: per-sprite-quad sub-region staging ──────────────────────────
     // Split the draw into sprite-quads (2 tris / 6 verts), crop-stage only the
     // UV sub-rect each quad samples, rebase its UVs into that cropped page, and
-    // emit one TRILIST per quad. A trailing odd triangle (triCount odd) is its
-    // own 3-vertex group -- cropped the same way, so nothing is dropped and the
-    // whole draw stays bit-exact vs the old whole-page render (see
-    // stage_texture_region's rebase-exactness note). This is the change that
-    // drops the per-frame device working set from whole 2048^2 atlas pages to
-    // the ~1.5-3%-of-page the sprites actually touch.
+    // emit one TRILIST per quad. This is the change that drops the per-frame
+    // device working set from whole 2048^2 atlas pages to the ~1.5-3%-of-page the
+    // sprites actually touch, bit-exact vs the old whole-page render (see
+    // stage_texture_region's rebase-exactness note).
     //
     // Blend selection + the keyed-cutout / faded-sprite limitation live in
     // mf_emit_group (unchanged from the whole-page path): has_key is computed
     // per cropped region -- a region that includes a keyed texel reports
     // has_key, and a keyed texel a quad samples is always inside that quad's own
     // cropped rect, so the COLORKEY-vs-COPY choice is identical to whole-page.
-    for (int tri = 0; tri < triCount; ) {
-        int ntg = (triCount - tri >= 2) ? 2 : 1;   // a sprite-quad, or a trailing odd tri
-        const BVtx *gv = v + (size_t)tri * 3;
-        int gverts = ntg * 3;
+    for (int q = 0; q < triCount / 2; q++) {
+        const BVtx *gv = v + (size_t)q * 6;    // 6 verts = one sprite-quad
         // quad UV bbox (clamp01 to match the rebase + the fabric's clamped sampling)
         float u0 = 1.0f, u1 = 0.0f, v0 = 1.0f, v1 = 0.0f;
-        for (int i = 0; i < gverts; i++) {
+        for (int i = 0; i < 6; i++) {
             float uu = mf_clamp01(gv[i].u), vv = mf_clamp01(gv[i].v);
             if (uu < u0) u0 = uu; if (uu > u1) u1 = uu;
             if (vv < v0) v0 = vv; if (vv > v1) v1 = vv;
         }
-        bool has_key = false; int rx = 0, ry = 0;
-        blt_surface_ref_t tex = stage_texture_region(tex_key, t, u0, v0, u1, v1, &has_key, &rx, &ry);
+
+        // Near-full-page fallback: if the cropped rect (+margin) already covers
+        // >=90% of the page, cropping buys almost nothing and just fragments the
+        // cache / re-stages ~the whole page every frame -- route this quad through
+        // the shared whole-page entry instead (no rebase; UVs address the page).
+        int rx, ry, rw, rh;
+        mf_crop_rect(t, u0, v0, u1, v1, &rx, &ry, &rw, &rh);
+        if ((double)rw * rh >= 0.9 * (double)t->w * t->h) {
+            bool has_key = false;
+            blt_surface_ref_t tex = stage_texture(tex_key, t, &has_key);
+            if (!tex.valid) {
+                fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
+                return;
+            }
+            mf_emit_group(tex, tex.w, tex.h, gv, 2, bl, has_key, /*extra_flags=*/0);
+            continue;
+        }
+
+        bool has_key = false; int srx = 0, sry = 0;
+        blt_surface_ref_t tex = stage_texture_region(tex_key, t, u0, v0, u1, v1, &has_key, &srx, &sry);
         if (!tex.valid) {
             // The failed upload left g_e.overflow set -> the whole frame drops at
-            // frame_end (correct: a texture that can't fit must not render half a
-            // command list). No point emitting the remaining quads.
+            // frame_end (correct: a texture that can't fit -- heap or cache-table
+            // -- must not render half a command list). No point emitting the rest.
             fprintf(stderr, "backend_mfgpu: sub-region cannot fit heap after eviction - draw dropped\n");
             return;
         }
-        int rw = tex.w, rh = tex.h;
         // rebase this quad's UVs into the cropped page: cropped-page uv' =
-        // (clamp01(uv)*page - rect_origin) / crop_dim.
+        // (clamp01(uv)*page - rect_origin) / crop_dim. (srx/sry == rx/ry.)
         BVtx reb[6];
-        for (int i = 0; i < gverts; i++) {
+        for (int i = 0; i < 6; i++) {
             float u_abs = mf_clamp01(gv[i].u) * t->w, v_abs = mf_clamp01(gv[i].v) * t->h;
             reb[i] = gv[i];
-            reb[i].u = (u_abs - rx) / (float)rw;
-            reb[i].v = (v_abs - ry) / (float)rh;
+            reb[i].u = (u_abs - srx) / (float)tex.w;
+            reb[i].v = (v_abs - sry) / (float)tex.h;
         }
-        mf_emit_group(tex, rw, rh, reb, ntg, bl, has_key, /*extra_flags=*/0);
-        tri += ntg;
+        mf_emit_group(tex, tex.w, tex.h, reb, 2, bl, has_key, /*extra_flags=*/0);
     }
 }
 
