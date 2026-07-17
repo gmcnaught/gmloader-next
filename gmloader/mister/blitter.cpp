@@ -46,6 +46,8 @@ static int      g_opaque = 1;    // GMLOADER_BLITTER_OPAQUE (default on): downgr
 static int      g_cull = 1;      // GMLOADER_BLITTER_CULL (default on): skip draws that
                                  // provably can't change a visible pixel (overdraw)
 static int      g_threads = 1;   // GMLOADER_BLITTER_THREADS (rasterizer worker cores)
+static int      g_fg = 0;        // GMLOADER_FRAMEGRAPH: first frame of the full-frame
+                                 // draw-graph dump window (0 = disabled); see fg_window()
 static uint64_t g_pf_raster = 0, g_pf_clear = 0, g_pf_tex = 0, g_pf_present = 0;
 static uint32_t g_pf_draws = 0, g_pf_tris = 0, g_pf_frame = 0, g_pf_culled = 0;
 
@@ -81,6 +83,7 @@ void Blitter_Init(void) {
     { const char *th = getenv("GMLOADER_BLITTER_THREADS");
       g_threads = th ? atoi(th) : 1;
       if (g_threads < 1) g_threads = 1; else if (g_threads > 4) g_threads = 4; }
+    { const char *fg = getenv("GMLOADER_FRAMEGRAPH"); g_fg = (fg && *fg) ? atoi(fg) : 0; }
     RasterBackend_SW_SetThreads(g_threads);   // keep backend_sw in sync with g_threads
     g_rw = MISTER_WIDTH; g_rh = MISTER_HEIGHT;
     if (g_own) {   // render-size override only applies when the blitter presents
@@ -163,16 +166,13 @@ int   g_wvpValid = 0;
 uint64_t g_drawNo = 0;
 const uint64_t LOG_FIRST = 24;  // log the first N draws in detail
 
-// GMLOADER_FRAMEGRAPH=N: dump EVERY draw (not just the first LOG_FIRST) plus
-// every FBO bind/attach, for frames N..N+2 of steady state — a representative
-// full-frame draw graph (fbo/target/source/blend/rect) vs. LOG_FIRST's boot-
-// only detail. g_frameNo is bumped once per Blitter_PresentDefault(). 0/unset
-// = disabled (env read once, lazily, since g_enabled flips before main()'s
-// getenv() calls would normally run).
+// GMLOADER_FRAMEGRAPH=N (read once in Blitter_Init, into g_fg): dump EVERY draw
+// (not just the first LOG_FIRST) plus every FBO bind/attach, for frames N..N+2
+// of steady state — a representative full-frame draw graph (fbo/target/
+// source/blend/rect) vs. LOG_FIRST's boot-only detail. g_frameNo is bumped
+// once per Blitter_PresentDefault(). g_fg == 0 => disabled.
 int g_frameNo = 0;
-int g_fg = -1;
 bool fg_window() {
-    if (g_fg < 0) { const char *e = getenv("GMLOADER_FRAMEGRAPH"); g_fg = (e && *e) ? atoi(e) : 0; }
     return g_fg && g_frameNo >= g_fg && g_frameNo < g_fg + 3;
 }
 
