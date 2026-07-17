@@ -71,6 +71,7 @@ extern "C" {
 }
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>   // getenv (GMLOADER_MFGPU_HEAPLOG diagnostic, Task 9 bring-up)
 
 extern "C" const RasterBackend backend_sw;   /* FBO / RB_PREMULT fallback */
 
@@ -448,6 +449,40 @@ static bool evict_one_lru(void) {
 // (no re-upload); miss converts RGBA->RGB565 into g_texscratch and blt_uploads
 // once. Returns a ref with .valid==0 if the page cannot fit even after eviction
 // (caller drops the draw). *out_has_key := did any texel fold to the colorkey.
+// [Task 9 bring-up diagnostic] GMLOADER_MFGPU_HEAPLOG=1: log every real texture
+// upload (miss) with its size and the resulting heap occupancy, every stage
+// failure with the full pinned-working-set breakdown, and a per-frame summary
+// of exactly which textures were touched (pinned) this frame -- to measure the
+// STEADY-STATE per-frame texture working set against the device's ~14.75MB
+// SRC heap (MF_DEV_SRC_CAP), since the host's 32MB MF_TEX_HEAP masked this
+// capacity gap in every host-side parity test. Zero cost when unset.
+static int mf_heaplog_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_MFGPU_HEAPLOG"); v = (e && *e) ? 1 : 0; }
+    return v;
+}
+// Sum bytes + count of g_texcache entries "pinned" this frame (lru > floor --
+// see g_lru_frame_floor's comment): the actual working set blt_execute must
+// hold resident SIMULTANEOUSLY to render the frame, not just cumulative
+// uploads. Also prints each entry when `verbose`.
+static void mf_heaplog_frame_set(const char *tag, int verbose) {
+    if (!mf_heaplog_on()) return;
+    uint32_t total = 0; int n = 0;
+    for (int i = 0; i < MF_TEX_CACHE_N; i++) {
+        if (!g_texcache[i].used || g_texcache[i].lru <= g_lru_frame_floor) continue;
+        total += g_texcache[i].ref.size; n++;
+        if (verbose)
+            fprintf(stderr, "HEAPLOG   pinned key=%u %ux%u bytes=%u off=%u\n",
+                    g_texcache[i].key, g_texcache[i].ref.w, g_texcache[i].ref.h,
+                    g_texcache[i].ref.size, g_texcache[i].ref.off);
+    }
+    fprintf(stderr, "HEAPLOG %s: %d distinct textures pinned this frame, %u bytes "
+            "(%.2fMB) | heap_used=%u/%u (%.2fMB/%.2fMB)\n",
+            tag, n, total, total / (1024.0*1024.0),
+            blt_alloc_used(&g_e.alloc), g_e.alloc.size,
+            blt_alloc_used(&g_e.alloc) / (1024.0*1024.0), g_e.alloc.size / (1024.0*1024.0));
+}
+
 static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *out_has_key) {
     for (int i = 0; i < MF_TEX_CACHE_N; i++)
         if (g_texcache[i].used && g_texcache[i].key == key) {
@@ -471,10 +506,23 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
     }
     bool ov_before = g_e.overflow;                    // preserve any overflow already set this frame
     blt_surface_ref_t ref = blt_upload(&g_e, g_texscratch, tw, th, tw * 2);
-    while (!ref.valid && evict_one_lru()) ref = blt_upload(&g_e, g_texscratch, tw, th, tw * 2);
-    if (!ref.valid) { *out_has_key = false; return ref; }  // last blt_upload left overflow set -> frame drops, correct
+    int evicted = 0;
+    while (!ref.valid && evict_one_lru()) { evicted++; ref = blt_upload(&g_e, g_texscratch, tw, th, tw * 2); }
+    if (!ref.valid) {
+        *out_has_key = false;
+        if (mf_heaplog_on()) {
+            fprintf(stderr, "HEAPLOG STAGE FAIL key=%u want=%dx%d(%zu bytes) evicted=%d "
+                    "heap_used=%u/%u\n", key, tw, th, (size_t)tw*th*2, evicted,
+                    blt_alloc_used(&g_e.alloc), g_e.alloc.size);
+            mf_heaplog_frame_set("at-fail", /*verbose=*/1);
+        }
+        return ref;
+    }  // last blt_upload left overflow set -> frame drops, correct
     g_e.overflow = ov_before;                         // our transient failed-then-succeeded uploads did NOT overflow the frame
     g_upload_count++;
+    if (mf_heaplog_on())
+        fprintf(stderr, "HEAPLOG upload key=%u %dx%d bytes=%u off=%u evicted=%d heap_used=%u/%u\n",
+                key, tw, th, ref.size, ref.off, evicted, blt_alloc_used(&g_e.alloc), g_e.alloc.size);
     // Fabric-offload Task 3: stage this freshly-uploaded page DDR3->SDRAM at the
     // SAME offset (SDRAM[off] = DDR[off]) so the fabric's TRILIST texel fetch —
     // which samples SDRAM unconditionally at src_off == ref.off — resolves. Emitted
@@ -566,6 +614,34 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         if (tw <= 0) tw = BLT_FB_WIDTH;
         if (th <= 0) th = BLT_FB_HEIGHT;
     } else {
+        // [Task 9 bring-up diagnostic] Log the UV bbox this draw ACTUALLY
+        // touches within the full page, vs the full page's own dims -- to
+        // measure how much of a large sprite-sheet a typical draw uses (sub-
+        // region staging feasibility evidence). Cheap: only when heaplog is on.
+        if (mf_heaplog_on() && t && t->valid && t->w > 0 && t->h > 0) {
+            float umin=1e9f,umax=-1e9f,vmin=1e9f,vmax=-1e9f;
+            double sum_tri_px_area = 0;   // sum of PER-TRIANGLE bboxes (texels)
+            for (int i = 0; i < triCount*3; i++) {
+                if (v[i].u<umin) umin=v[i].u; if (v[i].u>umax) umax=v[i].u;
+                if (v[i].v<vmin) vmin=v[i].v; if (v[i].v>vmax) vmax=v[i].v;
+            }
+            for (int q = 0; q < triCount; q++) {
+                float tu0=1e9f,tu1=-1e9f,tv0=1e9f,tv1=-1e9f;
+                for (int k = 0; k < 3; k++) {
+                    const BVtx &vv = v[q*3+k];
+                    if (vv.u<tu0) tu0=vv.u; if (vv.u>tu1) tu1=vv.u;
+                    if (vv.v<tv0) tv0=vv.v; if (vv.v>tv1) tv1=vv.v;
+                }
+                sum_tri_px_area += (double)(tu1-tu0)*t->w * (double)(tv1-tv0)*t->h;
+            }
+            int pxw = (int)((umax-umin) * t->w + 0.5f), pxh = (int)((vmax-vmin) * t->h + 0.5f);
+            fprintf(stderr, "HEAPLOG uvbbox key=%u page=%dx%d tris=%d touched=%dx%d(%d bytes) "
+                    "of %u bytes (%.1f%%) sum_tri_px_area=%.0f (%.1f%% of page, %.1f%% of bbox)\n",
+                    tex_key, t->w, t->h, triCount, pxw, pxh, pxw*pxh*2, (unsigned)t->w*t->h*2,
+                    100.0*(pxw*pxh*2)/((double)t->w*t->h*2), sum_tri_px_area,
+                    100.0*sum_tri_px_area/((double)t->w*t->h),
+                    pxw*pxh>0 ? 100.0*sum_tri_px_area/((double)pxw*pxh) : 0.0);
+        }
         // ── stage the texture page as RGB565 ──────────────────────────────
         // Key 0 is reserved for the untextured 1x1 opaque-white page; a real GL
         // texture name is never 0 (0 means "no texture bound"), so no collision.
@@ -644,6 +720,10 @@ static void mf_present(const RSurface *) {
 }
 
 static void mf_frame_end(void) {
+    // [Task 9 bring-up diagnostic] Log BEFORE blt_end_frame touches anything --
+    // g_lru_frame_floor (set in mf_frame_begin) still delimits exactly this
+    // frame's pinned working set at this point.
+    mf_heaplog_frame_set(g_e.overflow ? "frame-end(OVERFLOWED)" : "frame-end(ok)", /*verbose=*/1);
     blt_end_frame(&g_e);
 #ifdef MISTER_NATIVE_VIDEO
     // Device: the ring + heap are already resident in the mmap'd DDR (the emitter
