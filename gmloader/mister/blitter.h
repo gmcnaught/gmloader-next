@@ -77,6 +77,13 @@ void Blitter_OnBindAttribLocation(GLuint program, GLuint index, const char *name
 void Blitter_OnBindFramebuffer(GLenum target, GLuint fbo);
 void Blitter_OnFramebufferTexture2D(GLenum attach, GLuint tex);
 
+// ---- Application-surface detection (app-surface render target, step 1) -----
+// The FBO whose color-attachment texture is drawn as a fullscreen quad to the
+// default framebuffer (0 if not yet detected). See BLITTER_DESIGN.md /
+// docs/superpowers/specs/2026-07-17-maldita-appsurface-bram-render-target-design.md.
+GLuint Blitter_AppSurfaceFBO(void);
+GLuint Blitter_AppSurfaceTex(void);
+
 void Blitter_OnUseProgram(GLuint program);
 void Blitter_OnGetUniformLocation(GLuint program, const char *name, GLint loc);
 void Blitter_OnUniformMatrix4fv(GLint location, GLsizei count, const GLfloat *value);  // capture matrices

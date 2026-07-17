@@ -176,3 +176,21 @@ raster-backend-test:
 	  gmloader/mister/blitter_raster.cpp \
 	  $(MFGPU_SRC) \
 	  -lm -o /tmp/rbt && /tmp/rbt
+
+# Task 4 (app-surface BRAM render-target plan): drives blitter.cpp's real
+# GL-shadow hooks (unlike raster-backend-test, which stays below that layer),
+# so it needs blitter.cpp itself, its GL type header (glad.h -- see the
+# vendored thunks/khronos/KHR/khrplatform.h it needs), and configuration.cpp
+# (gmloader_config, extern'd by blitter.cpp).
+.PHONY: blitter-appsurf-test
+blitter-appsurf-test:
+	c++ -std=c++17 -DMISTER_NATIVE_VIDEO=1 -Igmloader/mister -Igmloader -I. \
+	  -Ithunks/khronos -Iloader -I3rdparty/json/include $(MFGPU_INC) \
+	  gmloader/mister/blitter_appsurf_test.cpp \
+	  gmloader/mister/blitter.cpp \
+	  gmloader/mister/blitter_raster.cpp \
+	  gmloader/mister/raster_backend_sw.cpp \
+	  gmloader/mister/raster_backend_mfgpu.cpp \
+	  gmloader/configuration.cpp \
+	  $(MFGPU_SRC) \
+	  -lm -o /tmp/bat && /tmp/bat

@@ -149,6 +149,12 @@ Attrib  g_attribs[16];
 GLuint  g_curFBO       = 0;     // 0 = default framebuffer
 std::map<GLuint, GLuint> g_fboColorTex;   // fbo -> color attachment texture id
 
+// [app-surface render target, step 1] The GameMaker application-surface FBO,
+// detected in handle_draw() (Task 1's rule: the FBO whose color-attachment
+// texture is later sampled by a fullscreen quad drawn to the default
+// framebuffer). 0 = not yet detected. See Blitter_AppSurfaceFBO/Tex.
+GLuint  g_appSurfFbo   = 0, g_appSurfTex = 0;
+
 int     g_blendEnabled = 0;
 GLenum  g_blendSrc = GL_ONE, g_blendDst = GL_ZERO;
 
@@ -399,6 +405,13 @@ void Blitter_OnFramebufferTexture2D(GLenum, GLuint tex) {
     if (fg_window()) fprintf(stderr, "FG f=%d attachTex fbo=%u tex=%u\n", g_frameNo, g_curFBO, tex);
 }
 
+// [app-surface render target, step 1] The detected GameMaker application-
+// surface FBO / its color-attachment texture id, or 0/0 if not yet detected
+// (see handle_draw()). Consumed by Task 5 to route its draws to the fabric
+// render target instead of the SW fallback.
+GLuint Blitter_AppSurfaceFBO(void) { return g_appSurfFbo; }
+GLuint Blitter_AppSurfaceTex(void) { return g_appSurfTex; }
+
 void Blitter_OnUseProgram(GLuint program) { if (g_enabled) { g_nUseProg++; g_curProgram = program; } }
 void Blitter_OnGetUniformLocation(GLuint program, const char *name, GLint loc) {
     if (!g_enabled) return;
@@ -493,6 +506,21 @@ static int handle_draw(const char *kind, GLenum mode, int count,
             if (bv.y<miny)miny=bv.y; if (bv.y>maxy)maxy=bv.y;
             decoded++;
         }
+    }
+
+    // [app-surface render target, step 1] Identify the application-surface
+    // FBO (Task 1's rule): a fbo=0 draw whose sampled texture is some FBO's
+    // color attachment, covering (at least) the full viewport. Runs
+    // regardless of g_own (detection is a shadow-layer concern, not tied to
+    // the blitter owning rasterization) and updates on every recurrence of
+    // the pattern rather than latching to the first match, so a later
+    // fullscreen-blit-of-a-different-FBO-texture (e.g. after a room/surface
+    // recreation reassigns GL names) is picked up too.
+    if (g_curFBO == 0 && decoded == count) {
+        for (auto &kv : g_fboColorTex)
+            if (kv.second == g_boundTex2D && maxx-minx >= g_rw-1 && maxy-miny >= g_rh-1) {
+                g_appSurfFbo = kv.first; g_appSurfTex = kv.second; break;
+            }
     }
 
     // Rasterize into our surfaces (owning mode only).
