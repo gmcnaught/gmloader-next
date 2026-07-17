@@ -163,6 +163,19 @@ int   g_wvpValid = 0;
 uint64_t g_drawNo = 0;
 const uint64_t LOG_FIRST = 24;  // log the first N draws in detail
 
+// GMLOADER_FRAMEGRAPH=N: dump EVERY draw (not just the first LOG_FIRST) plus
+// every FBO bind/attach, for frames N..N+2 of steady state — a representative
+// full-frame draw graph (fbo/target/source/blend/rect) vs. LOG_FIRST's boot-
+// only detail. g_frameNo is bumped once per Blitter_PresentDefault(). 0/unset
+// = disabled (env read once, lazily, since g_enabled flips before main()'s
+// getenv() calls would normally run).
+int g_frameNo = 0;
+int g_fg = -1;
+bool fg_window() {
+    if (g_fg < 0) { const char *e = getenv("GMLOADER_FRAMEGRAPH"); g_fg = (e && *e) ? atoi(e) : 0; }
+    return g_fg && g_frameNo >= g_fg && g_frameNo < g_fg + 3;
+}
+
 // Hook-fire counters — confirm which state-setting calls actually reach our
 // thunk vs. go straight to Mesa via eglGetProcAddress (RTLD_GLOBAL bypass).
 uint32_t g_nVap=0, g_nBindBuf=0, g_nBufData=0, g_nGetULoc=0, g_nUniMat=0, g_nEnVap=0, g_nUseProg=0;
@@ -375,9 +388,15 @@ void Blitter_OnEnableVertexAttrib(GLuint index, int enabled) {
     if (g_enabled && index < 16) g_attribs[index].enabled = enabled;
 }
 
-void Blitter_OnBindFramebuffer(GLenum, GLuint fbo) { if (g_enabled) g_curFBO = fbo; }
+void Blitter_OnBindFramebuffer(GLenum, GLuint fbo) {
+    if (!g_enabled) return;
+    g_curFBO = fbo;
+    if (fg_window()) fprintf(stderr, "FG f=%d bindFBO fbo=%u\n", g_frameNo, fbo);
+}
 void Blitter_OnFramebufferTexture2D(GLenum, GLuint tex) {
-    if (g_enabled) g_fboColorTex[g_curFBO] = tex;   // attach to currently-bound FBO
+    if (!g_enabled) return;
+    g_fboColorTex[g_curFBO] = tex;   // attach to currently-bound FBO
+    if (fg_window()) fprintf(stderr, "FG f=%d attachTex fbo=%u tex=%u\n", g_frameNo, g_curFBO, tex);
 }
 
 void Blitter_OnUseProgram(GLuint program) { if (g_enabled) { g_nUseProg++; g_curProgram = program; } }
@@ -527,6 +546,7 @@ static int handle_draw(const char *kind, GLenum mode, int count,
         }
     }
 
+    bool fg_win = fg_window();
     if (g_drawNo <= LOG_FIRST) {
         Tex *bt = g_textures.count(g_boundTex2D) ? &g_textures[g_boundTex2D] : nullptr;
         fprintf(stderr, "BLIT draw#%llu %s rt=%s tex=%u(%dx%d val=%d) blend=%s "
@@ -534,6 +554,18 @@ static int handle_draw(const char *kind, GLenum mode, int count,
                 (unsigned long long)g_drawNo, kind, g_curFBO ? "FBO" : "DEF",
                 g_boundTex2D, bt?bt->w:0, bt?bt->h:0, bt?bt->valid:0, blend_name(),
                 decoded, count, rast, cullReason ? cullReason : "-",
+                decoded?minx:0, decoded?miny:0, decoded?maxx:0, decoded?maxy:0);
+    }
+    // Full-frame draw-graph dump (GMLOADER_FRAMEGRAPH): every draw in the
+    // steady-state window, including the target FBO's color-attachment tex id
+    // (fbotex — identifies the app-surface FBO when it later shows up as
+    // srctex on a fbo=0 fullscreen draw) and the sampled texture (srctex).
+    if (fg_win) {
+        GLuint fbotex = g_curFBO ? g_fboColorTex[g_curFBO] : 0;
+        fprintf(stderr, "FG f=%d d#%llu fbo=%u fbotex=%u srctex=%u prog=%u blend=%s "
+                "vp=[%d,%d,%d,%d] scr=[%.0f,%.0f..%.0f,%.0f]\n",
+                g_frameNo, (unsigned long long)g_drawNo, g_curFBO, fbotex, g_boundTex2D,
+                g_curProgram, blend_name(), g_vpX, g_vpY, g_vpW, g_vpH,
                 decoded?minx:0, decoded?miny:0, decoded?maxx:0, decoded?maxy:0);
     }
 
@@ -556,6 +588,7 @@ int Blitter_TryDrawElements(GLenum mode, GLsizei count, GLenum type, const void 
 }
 
 const uint8_t *Blitter_PresentDefault(void) {
+    g_frameNo++;
     if (g_own) {
         // Route present through the seam. backend_sw's present is a no-op
         // today (see raster_backend_sw.cpp) — the real RGB565 conversion
