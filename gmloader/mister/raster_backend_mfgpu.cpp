@@ -509,6 +509,21 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
     bool dst_is_appsurf = (g_appSurfFbo != 0) && (d->fbo == g_appSurfFbo);
     bool src_is_appsurf = (g_appSurfTex != 0) && (tex_key == g_appSurfTex);
 
+    // Self-referential draw (render INTO the app surface while ALSO sampling
+    // it) should be structurally impossible for any well-formed GameMaker
+    // draw stream: Task 4's detection only fires for a g_curFBO==0 draw, so
+    // g_appSurfFbo is always a real nonzero FBO id and that same detecting/
+    // sampling draw always has d->fbo==0 -- the two conditions can't both be
+    // true without a genuine GL feedback loop (spec-level UB no engine relies
+    // on). Guarded anyway (reviewer's Task 5 follow-up): the RTL's shared
+    // surf_rd port starves silently if comp_target==APPSURF and SRC_SURFACE
+    // are both active, so if this invariant is ever violated, fail loud here
+    // rather than let it surface as unexplained visual corruption on device.
+    if (dst_is_appsurf && src_is_appsurf) {
+        fprintf(stderr, "backend_mfgpu: self-referential APPSURF draw (dst==src) - unsupported, dropped\n");
+        return;
+    }
+
     // Any OTHER (non-default, non-appsurf) render-to-texture target: the
     // fabric has one scanout FB plus the one app-surface BRAM, so effect
     // surfaces beyond the application surface stay on the SW rasterizer
