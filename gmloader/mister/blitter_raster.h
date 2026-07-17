@@ -20,6 +20,14 @@
 struct RSurface {
     uint8_t *rgba;
     int      w, h;
+    // [app-surface render target, step 1] The GL FBO id this surface is bound
+    // to (0 = default framebuffer / WORK), set by blitter.cpp's
+    // get_render_target(). Lets a backend (backend_mfgpu) tell "the
+    // application-surface FBO" apart from "some other FBO" apart from "the
+    // default framebuffer" without depending on GL types here -- plain
+    // uint32_t, not GLuint, to keep this header GL-independent (it's
+    // deliberately host-buildable with no GL headers; see the file comment).
+    uint32_t fbo = 0;
 };
 
 // ---- Source texture ---------------------------------------------------------

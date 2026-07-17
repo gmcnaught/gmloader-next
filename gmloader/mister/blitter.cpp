@@ -20,6 +20,15 @@
 // route the latter to the SW fallback. No-op when backend_sw is selected.
 extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba);
 
+// [app-surface render target, step 1] Push the detected application-surface
+// FBO/texture identity down into backend_mfgpu, mirroring the SetDefaultSurface
+// pattern above -- backend_mfgpu is a GL-independent seam (raster_backend.h's
+// header comment) and must not reach back up to call Blitter_AppSurfaceFBO()/
+// Tex() directly, so blitter.cpp pushes the identity instead, exactly like it
+// already does for "which pixels are the default fb". No-op when backend_sw
+// is selected (same as SetDefaultSurface).
+extern "C" void RasterBackend_MFGPU_SetAppSurface(uint32_t fbo, uint32_t tex);
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -303,11 +312,15 @@ bool get_rblend(RBlend *out) {
 // Current render target as an RSurface. The default fb maps to g_defSurf; an FBO
 // maps to its color attachment texture's CPU buffer (allocated on first use, so
 // it works as both a render target and a sampleable texture). False if unknown.
+// [app-surface render target, step 1] out->fbo = g_curFBO always, so a backend
+// (backend_mfgpu) can tell "the application-surface FBO" apart from "some
+// other FBO" apart from "the default framebuffer" (see RSurface::fbo).
 bool get_render_target(RSurface *out) {
     if (g_curFBO == 0) {
-        out->rgba = g_defSurf; out->w = g_rw; out->h = g_rh;
+        out->rgba = g_defSurf; out->w = g_rw; out->h = g_rh; out->fbo = 0;
         return out->rgba != nullptr;
     }
+    out->fbo = g_curFBO;
     auto fit = g_fboColorTex.find(g_curFBO);
     if (fit == g_fboColorTex.end()) return false;
     Tex &t = g_textures[fit->second];
@@ -534,7 +547,9 @@ static int handle_draw(const char *kind, GLenum mode, int count,
     if (g_curFBO == 0 && decoded == count) {
         for (auto &kv : g_fboColorTex)
             if (kv.second == g_boundTex2D && maxx-minx >= g_rw-1 && maxy-miny >= g_rh-1) {
-                g_appSurfFbo = kv.first; g_appSurfTex = kv.second; break;
+                g_appSurfFbo = kv.first; g_appSurfTex = kv.second;
+                RasterBackend_MFGPU_SetAppSurface(g_appSurfFbo, g_appSurfTex);
+                break;
             }
     }
 

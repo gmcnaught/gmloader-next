@@ -42,6 +42,9 @@ extern "C" const RasterBackend backend_sw;
 extern "C" const RasterBackend backend_mfgpu;
 extern "C" void RasterBackend_MFGPU_TestCopyFB565(int w, int h, uint16_t *out);
 extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba);
+// Task 5: push the app-surface FBO/tex identity down (mirrors SetDefaultSurface;
+// see blitter.cpp/raster_backend_mfgpu.cpp for why this is a push, not a pull).
+extern "C" void RasterBackend_MFGPU_SetAppSurface(uint32_t fbo, uint32_t tex);
 // Task 2: cache introspection/reset hooks (host-test-only, not part of the vtable).
 extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestStageCount(void);   // FO Task 3
@@ -639,6 +642,130 @@ static int case_stage_noop(void) {
     return memcmp(fb_plain, fb_staged, sizeof fb_plain) == 0;
 }
 
+// ── Task 5: route app-surface draws to the fabric surface, sample via
+// BLT_F_SRC_SURFACE ──────────────────────────────────────────────────────────
+// Two-pass scene through the REAL backend entry points (mirrors Task 3's
+// test_surface_src, one layer up): a sprite drawn into the (simulated)
+// application-surface FBO, then a fullscreen quad sampling that surface onto
+// WORK over a cleared background. This is what actually exercises
+// mf_draw's BLT_F_SRC_SURFACE path end-to-end -- until this test, nothing
+// called blt_trilist with that flag set (Task 2's relaxed !tex.valid guard
+// branch had no caller/test at all).
+//
+// Ordering deliberately matches the REAL steady-state graph (Task 1), not the
+// old "backgrounds first" assumption: scene->APPSURF is emitted BEFORE the
+// WORK clear, so this also exercises mf_clear's target-awareness (it must
+// switch back to WORK, not leave the ring pointed at APPSURF from the sprite
+// draw).
+//
+// Verification strategy: SPOT-CHECK interior/exterior points (like Task 3's
+// test_surface_src), not a full-canvas compare565(). The fabric's blt_raster_tri
+// and the SW rasterizer (blitter_raster.cpp) use DIFFERENT nearest-sample
+// sub-pixel conventions -- already documented in Task 3 (blt_tri.c rounds via a
+// +HALF bias, the SW oracle floors), a full LSB off at the sprite's edges, not
+// a rounding-noise level difference a +-1 LSB colour tolerance can absorb. The
+// existing keyed_case() battery avoids this by choosing UV offsets that land
+// inside both conventions' agreement window; a sharp sprite boundary can't be
+// dodged that way, so this test checks points comfortably inside and outside
+// the sprite instead of literally every pixel.
+static int case_surface_route(void) {
+    enum { W = 64, H = 48 };   // app-surface's used region for this test (arbitrary, <=BW,BH)
+    const uint32_t APPSURF_FBO = 50, APPSURF_TEX = 51;
+    const uint8_t BG_R = 20, BG_G = 30, BG_B = 40;
+
+    RasterBackend_MFGPU_SetAppSurface(0, 0);   // clean slate regardless of test order
+    RasterBackend_MFGPU_TestReinit(0);
+
+    // 1x1 opaque texel for the sprite drawn INTO the app surface.
+    static const uint8_t spritepx[4] = { 220, 60, 160, 255 };
+    RTexture spriteTex = { spritepx, 1, 1, 1, 1, /*RGBA8888*/0, 1 };
+    BVtx spriteVerts[3] = {
+        {  4.f,  4.f, 0,0, 1,1,1,1 },
+        { 40.f,  8.f, 0,0, 1,1,1,1 },
+        {  8.f, 36.f, 0,0, 1,1,1,1 },
+    };
+    // Fullscreen (over the WxH app-surface region) quad sampling it, UV (0,0)..(1,1).
+    BVtx fullVerts[6] = {
+        {   0.f,   0.f, 0.f,0.f, 1,1,1,1 }, { (float)W,   0.f, 1.f,0.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,1.f, 1,1,1,1 },
+        {   0.f,   0.f, 0.f,0.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,1.f, 1,1,1,1 }, {   0.f,(float)H, 0.f,1.f, 1,1,1,1 },
+    };
+
+    // ---- SW oracle: an independent app-surface buffer, then sampled as a
+    // normal texture -- backend_sw has no notion of "the app surface", so the
+    // oracle is built by hand from the same two operations. ----------------
+    static uint8_t appsurf_sw[W*H*4], work_sw[BW*BH*4];
+    RSurface s_appsurf_sw = { appsurf_sw, W, H, 0 };
+    RSurface s_work_sw    = { work_sw,   BW, BH, 0 };
+    // Init the SW oracle's app-surface buffer to OPAQUE black (alpha=255), not a raw
+    // memset-zero (alpha=0): the fabric's real appsurf buffer is RGB565 with NO alpha
+    // channel at all, so "undrawn" there just means "reads as black", never "reads as
+    // transparent". A memset-zero buffer has alpha=0 everywhere outside the sprite,
+    // and Blitter_RasterDraw's alphaRef is clamp01()'d to [0,1] -- alphaRef=0 (or even
+    // a negative value, clamped up to 0) still discards a frag.a==0 texel ("<=" test),
+    // so a naive all-zero buffer would make the SW oracle's sample draw silently skip
+    // its "background" pixels (leaving the prior WORK clear showing through) while the
+    // fabric's COPY blend has no such discard and genuinely overwrites with black --
+    // a divergence in the TEST FIXTURE, not in the code under test.
+    Blitter_ClearSurface(&s_appsurf_sw, 0, 0, 0, 255);
+    backend_sw.draw(&s_appsurf_sw, spriteVerts, 1, &spriteTex, RB_NONE, 0.f, next_key());
+    backend_sw.clear(&s_work_sw, BG_R, BG_G, BG_B, 255);
+    RTexture appsurfAsTex = { appsurf_sw, W, H, /*nearest*/1, /*valid*/1, /*RGBA8888*/0, /*opaque*/1 };
+    backend_sw.draw(&s_work_sw, fullVerts, 2, &appsurfAsTex, RB_NONE, 0.f, next_key());
+
+    // ---- fabric path: through the REAL backend entry points ------------------
+    static uint8_t  work_mf[BW*BH*4];
+    static uint16_t mf565[BW*BH];
+    RSurface s_appsurf_mf = { nullptr, W, H, APPSURF_FBO };   // rgba unused: fabric-only target
+    RSurface s_work_mf    = { work_mf, BW, BH, 0 };
+    RasterBackend_MFGPU_SetDefaultSurface(work_mf);
+    RasterBackend_MFGPU_SetAppSurface(APPSURF_FBO, APPSURF_TEX);
+
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.draw(&s_appsurf_mf, spriteVerts, 1, &spriteTex, RB_NONE, 0.f, next_key());  // scene -> APPSURF
+    backend_mfgpu.clear(&s_work_mf, BG_R, BG_G, BG_B, 255);                                   // WORK background
+    // The sampled "texture" here is the app surface itself: rgba/valid are
+    // never read by mf_draw's src_is_appsurf path (no staging happens for
+    // it) -- only w/h matter, for the UV-to-absolute-pixel scale (see
+    // mf_draw's comment). tex_key == APPSURF_TEX is what selects this path.
+    RTexture surfSrcTex = { nullptr, W, H, 1, 0, 0, 0 };
+    backend_mfgpu.draw(&s_work_mf, fullVerts, 2, &surfSrcTex, RB_NONE, 0.f, APPSURF_TEX);      // appsurf -> WORK
+    backend_mfgpu.frame_end();
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, mf565);
+
+    RasterBackend_MFGPU_SetAppSurface(0, 0);   // don't leak state to other tests
+
+    // Spot-check: (20,15) is comfortably inside the sprite (4,4)-(40,8)-(8,36)
+    // on both rasterizers' conventions; (55,40) is comfortably outside it (but
+    // still inside the WxH sampled region, so it exercises the SET_TARGET/
+    // BLT_F_SRC_SURFACE path reading real "background" surface content, not a
+    // trivially-untouched pixel); (200,150) is well outside the whole quad,
+    // proving the WORK clear survived undisturbed elsewhere.
+    auto px565 = [&](const RSurface &s, int x, int y) -> uint16_t {
+        const uint8_t *p = s.rgba + ((size_t)y * s.w + x) * 4;
+        return (uint16_t)(((p[0] >> 3) << 11) | ((p[1] >> 2) << 5) | (p[2] >> 3));
+    };
+    int ok = 1;
+    struct { const char *name; int x, y; } pts[] = {
+        { "inside-sprite",  20, 15 },
+        { "appsurf-bg",     55, 40 },
+        { "outside-quad",  200,150 },
+    };
+    for (auto &pt : pts) {
+        uint16_t sw = px565(s_work_sw, pt.x, pt.y);
+        uint16_t fb = mf565[pt.y * BW + pt.x];
+        int sr=(sw>>11)&0x1F, sg=(sw>>5)&0x3F, sb=sw&0x1F;
+        int fr=(fb>>11)&0x1F, fg=(fb>>5)&0x3F, fb5=fb&0x1F;
+        int d = abs(sr-fr); if (abs(sg-fg)>d) d=abs(sg-fg); if (abs(sb-fb5)>d) d=abs(sb-fb5);
+        if (d > 1) {
+            printf("  FAIL surface-route:%-14s @(%d,%d) sw565=0x%04X fb565=0x%04X\n", pt.name, pt.x, pt.y, sw, fb);
+            ok = 0;
+        } else {
+            printf("  OK   surface-route:%-14s sw565=0x%04X fb565=0x%04X\n", pt.name, sw, fb);
+        }
+    }
+    return ok;
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -663,5 +790,11 @@ int main(void){
     else printf("raster_backend mfgpu-stage-noop OK\n");
     if (!case_sdram_residency()) { printf("FAIL mfgpu-sdram-residency\n"); ok = 0; }
     else printf("raster_backend mfgpu-sdram-residency OK\n");
+    // Placed last: sets g_appSurfFbo/Tex (backend_mfgpu) nonzero mid-run, which
+    // would change dst_is_appsurf's outcome for any earlier-in-main() case that
+    // happens to share an FBO/tex id (none do today, but keep this last so a
+    // future case can't be silently affected without noticing).
+    if (!case_surface_route()) { printf("FAIL mfgpu-surface-route\n"); ok = 0; }
+    else printf("raster_backend mfgpu-surface-route OK\n");
     return ok ? 0 : 1;
 }

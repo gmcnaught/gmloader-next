@@ -147,6 +147,29 @@ static uint16_t      g_fb565[BLT_FB_PIXELS];
 // the host by RasterBackend_MFGPU_SetDefaultSurface().
 static const uint8_t *g_defRGBA = nullptr;
 
+// [app-surface render target, step 1] The application-surface FBO id / its
+// color-attachment texture id, pushed down by blitter.cpp's
+// RasterBackend_MFGPU_SetAppSurface() whenever Blitter_AppSurfaceFBO()/Tex()
+// (Task 4) update -- mirrors the g_defRGBA push-down pattern above so this
+// backend stays GL-independent. 0/0 = not yet detected (every draw/clear
+// routes as "not the app surface", matching today's behavior exactly).
+static uint32_t g_appSurfFbo = 0, g_appSurfTex = 0;
+
+// [app-surface render target, step 1] Which fabric composite target the
+// emitter's LAST BLT_OP_SET_TARGET pointed at, mirroring blt_wire's
+// BLT_TARGET_*; used only to skip a redundant re-emit when consecutive draws
+// target the same buffer. Reset to MF_TARGET_WORK at the top of every frame
+// (mf_frame_begin) -- blt_execute (and the RTL) always start a fresh command
+// list targeting WORK regardless of where the PREVIOUS frame's ring left off,
+// so this host-side cache must track that same per-frame reset or an early
+// appsurf-targeted draw could silently land on WORK instead.
+enum { MF_TARGET_WORK = BLT_TARGET_WORK, MF_TARGET_APPSURF = BLT_TARGET_APPSURF };
+static int g_cur_target = MF_TARGET_WORK;
+
+extern "C" void RasterBackend_MFGPU_SetAppSurface(uint32_t fbo, uint32_t tex) {
+    g_appSurfFbo = fbo; g_appSurfTex = tex;
+}
+
 static inline uint16_t mf_rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
 }
@@ -365,6 +388,10 @@ static void mf_frame_begin(void) {
     // Textures persist across frames now (cache in g_texcache). Only the vtx
     // cursor + command list reset here (blt_begin_frame). No blt_heap_reset.
     blt_begin_frame(&g_e, /*target_buf=*/0, /*clear=*/0, /*clear_color=*/0);
+    // [app-surface render target, step 1] Every fresh ring starts targeting
+    // WORK (blt_execute's own default, matched by the RTL) -- see g_cur_target's
+    // comment for why this reset (not just the variable's initial value) matters.
+    g_cur_target = MF_TARGET_WORK;
     g_frame_active = true;
 }
 
@@ -374,8 +401,22 @@ static void mf_ensure_frame(void) {
     if (!g_frame_active) mf_frame_begin();
 }
 
+// [app-surface render target, step 1] Emit a BLT_OP_SET_TARGET iff `d`'s
+// target differs from the emitter's current one (g_cur_target), so back-to-
+// back ops on the same buffer don't each redundantly re-select it. Shared by
+// mf_clear and mf_draw so BOTH ops are target-aware -- the real per-frame
+// order (Task 1) clears/draws WORK *after* the scene has already rendered
+// into the app surface (SET_TARGET APPSURF), so a clear()-only target switch
+// is just as load-bearing as draw()'s.
+static void mf_select_target(uint32_t fbo) {
+    bool is_appsurf = (g_appSurfFbo != 0) && (fbo == g_appSurfFbo);
+    int want = is_appsurf ? MF_TARGET_APPSURF : MF_TARGET_WORK;
+    if (want != g_cur_target) { blt_set_target(&g_e, want); g_cur_target = want; }
+}
+
 static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     mf_ensure_frame();
+    mf_select_target(d->fbo);
     (void)a;   // fabric FILL writes opaque RGB565; no alpha channel on the wire
     int w = d->w < BLT_FB_WIDTH  ? d->w : BLT_FB_WIDTH;
     int h = d->h < BLT_FB_HEIGHT ? d->h : BLT_FB_HEIGHT;
@@ -462,25 +503,65 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
 static void mf_draw(RSurface *d, const BVtx *v, int triCount,
                     const RTexture *t, RBlend bl, float ar, uint32_t tex_key) {
     mf_ensure_frame();
-    // FBO / non-default render target: the fabric has one scanout FB, so
-    // render-to-texture targets fall back to the SW rasterizer (writes d->rgba).
-    if (g_defRGBA && d->rgba != g_defRGBA) { backend_sw.draw(d, v, triCount, t, bl, ar, tex_key); return; }
+    // [app-surface render target, step 1] d->fbo identifies the target FBO
+    // (blitter.cpp's get_render_target); tex_key identifies the sampled GL
+    // texture. Either can alias the detected application surface.
+    bool dst_is_appsurf = (g_appSurfFbo != 0) && (d->fbo == g_appSurfFbo);
+    bool src_is_appsurf = (g_appSurfTex != 0) && (tex_key == g_appSurfTex);
+
+    // Any OTHER (non-default, non-appsurf) render-to-texture target: the
+    // fabric has one scanout FB plus the one app-surface BRAM, so effect
+    // surfaces beyond the application surface stay on the SW rasterizer
+    // (step-1 scope; step 2 adds N surfaces).
+    if (g_defRGBA && d->rgba != g_defRGBA && !dst_is_appsurf) {
+        backend_sw.draw(d, v, triCount, t, bl, ar, tex_key); return;
+    }
     // Premultiplied-alpha source-over (dst = src + dst*(1-a)) has no exact fabric
     // blend; keep it on SW for bring-up (see raster_backend_convert.h).
     if (bl == RB_PREMULT)        { backend_sw.draw(d, v, triCount, t, bl, ar, tex_key); return; }
     if (triCount <= 0) return;
 
-    // ── stage the texture page as RGB565 ──────────────────────────────────────
-    // Key 0 is reserved for the untextured 1x1 opaque-white page; a real GL
-    // texture name is never 0 (0 means "no texture bound"), so no collision.
-    uint32_t stage_key = (t && t->valid && t->rgba) ? tex_key : 0u;   // all untextured share key 0
+    mf_select_target(d->fbo);
+
+    // ── source: the app surface itself (no staging), or a normal SDRAM page ──
+    blt_surface_ref_t tex;
+    int tw, th;
     bool has_key = false;
-    blt_surface_ref_t tex = stage_texture(stage_key, t, &has_key);
-    if (!tex.valid) {
-        fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
-        return;
+    if (src_is_appsurf) {
+        // BLT_F_SRC_SURFACE ignores src_off/src_stride/src_x/src_y (Task 2/3
+        // contract) -- no blt_upload/blt_stage for the surface, it's already
+        // fabric-resident (rendered there by an earlier dst_is_appsurf draw
+        // this frame, or a prior one). tex stays zeroed/invalid; Task 2's
+        // relaxed blt_trilist guard allows that when the flag is set.
+        memset(&tex, 0, sizeof tex);
+        // UV scale: t->w/t->h are the ORIGINAL GL texture's real dimensions
+        // (get_rtexture() in blitter.cpp), which may be a padded page (e.g.
+        // a 2048x2048 POT atlas -- Task 1's boot trace) larger than the
+        // <=320x240 used region. bvtx_to_blt(v, tw, th) = clamp(uv,0,1)*tw*16
+        // is an ABSOLUTE PIXEL coordinate within that tw x th space; by the
+        // (assumed) top-left-aligned used-region convention, that absolute
+        // pixel coordinate is identical to the app-surface's own absolute
+        // pixel addressing (both start at (0,0)), so reusing t->w/t->h here
+        // -- NOT BLT_FB_WIDTH/HEIGHT -- reproduces the same coordinate the SW
+        // rasterizer would sample from the real bound texture. UNVERIFIED
+        // against a real device UV capture (Task 1's frame-graph dump didn't
+        // log UV) -- flag for Task 9 bring-up if the surface samples offset.
+        tw = t ? t->w : BLT_FB_WIDTH;
+        th = t ? t->h : BLT_FB_HEIGHT;
+        if (tw <= 0) tw = BLT_FB_WIDTH;
+        if (th <= 0) th = BLT_FB_HEIGHT;
+    } else {
+        // ── stage the texture page as RGB565 ──────────────────────────────
+        // Key 0 is reserved for the untextured 1x1 opaque-white page; a real GL
+        // texture name is never 0 (0 means "no texture bound"), so no collision.
+        uint32_t stage_key = (t && t->valid && t->rgba) ? tex_key : 0u;   // all untextured share key 0
+        tex = stage_texture(stage_key, t, &has_key);
+        if (!tex.valid) {
+            fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
+            return;
+        }
+        tw = tex.w; th = tex.h;   // staged page dims (1x1 for untextured)
     }
-    int tw = tex.w, th = tex.h;   // staged page dims (1x1 for untextured)
 
     // ── convert + push the vertices ───────────────────────────────────────────
     int nverts = triCount * 3;
@@ -508,6 +589,8 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
     // the draw is also fully opaque at the vertex level (min_vtx_a*255 >= 254),
     // BLT_BLEND_COLORKEY reproduces the SW oracle's per-texel-alpha cutout
     // exactly (mod 565 rounding). Otherwise fall back to the Task 5 path.
+    // has_key is always false for a surface-sampled draw (no texel staging
+    // happens for it at all), so it never takes the colorkey path.
     //
     // KNOWN LIMITATION: a *faded* cutout sprite (keyed texture drawn with
     // vtx.a < 254, e.g. a fade-out) cannot combine colorkey + const-alpha in a
@@ -525,8 +608,9 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         blend_mode = rblend_to_blt(bl);
         colorkey = 0;
     }
+    uint8_t extra_flags = src_is_appsurf ? BLT_F_SRC_SURFACE : 0;
     if (blt_trilist(&g_e, tex, blend_mode, colorkey, /*alpha=*/255,
-                    eoff, triCount, /*flags=*/0) != 0)
+                    eoff, triCount, extra_flags) != 0)
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", triCount);
 }
 
