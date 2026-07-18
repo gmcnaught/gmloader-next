@@ -689,6 +689,22 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", nt);
 }
 
+// GL texcoord V origin is bottom-left (v=0 = image BOTTOM); the fabric texture
+// page is top-origin (row 0 = top). Every sampled sprite therefore arrives
+// V-inverted, which renders each sprite's image upside-down IN PLACE on the
+// device (positions are correct — they come from x/y, which the whole-frame
+// scanout orientation already handles). Flip v' = 1 - v at ingest, BEFORE the
+// sub-region crop/rebase, so the crop stages the rows the flipped sample
+// actually reads and the sprite comes out right-side-up. V-ONLY: u/x/y/rgba are
+// GL-native and untouched (a horizontal mirror would need 1-u, which nothing in
+// the pipeline produces). NOT applied to the app-surface composite
+// (src_is_appsurf, handled earlier and returned): that samples the fabric
+// surface, which already holds correctly-oriented content, so flipping it would
+// re-invert the whole scene. The SW-oracle parity tests feed backend_sw the same
+// flipped UVs (flip_v_copy) so "both backends sample identically" still holds.
+static inline BVtx mf_vflip(BVtx v) { v.v = 1.0f - v.v; return v; }
+static BVtx g_flipscratch[MF_MAX_VERTS];   // whole-page (odd) path V-flip buffer
+
 static void mf_draw(RSurface *d, const BVtx *v, int triCount,
                     const RTexture *t, RBlend bl, float ar, uint32_t tex_key) {
     mf_ensure_frame();
@@ -814,7 +830,12 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
             fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
             return;
         }
-        mf_emit_group(tex, tex.w, tex.h, v, triCount, bl, has_key, /*extra_flags=*/0);
+        // V-flip the whole draw (see mf_vflip). Bounded by MF_MAX_VERTS, the same
+        // cap mf_emit_group enforces (a larger draw is dropped there regardless).
+        int nverts = triCount * 3;
+        if (nverts > MF_MAX_VERTS) nverts = MF_MAX_VERTS;
+        for (int i = 0; i < nverts; i++) g_flipscratch[i] = mf_vflip(v[i]);
+        mf_emit_group(tex, tex.w, tex.h, g_flipscratch, triCount, bl, has_key, /*extra_flags=*/0);
         return;
     }
 
@@ -832,7 +853,14 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
     // has_key, and a keyed texel a quad samples is always inside that quad's own
     // cropped rect, so the COLORKEY-vs-COPY choice is identical to whole-page.
     for (int q = 0; q < triCount / 2; q++) {
-        const BVtx *gv = v + (size_t)q * 6;    // 6 verts = one sprite-quad
+        // 6 verts = one sprite-quad, V-flipped at ingest (GL bottom-origin ->
+        // fabric top-origin, see mf_vflip) so the crop bbox / rebase below all
+        // operate on the flipped V and the staged sub-rect is the one actually
+        // sampled. Local copy handles arbitrarily large batches (no MF_MAX_VERTS
+        // cap on the per-quad path).
+        const BVtx *gvraw = v + (size_t)q * 6;
+        BVtx gv[6];
+        for (int i = 0; i < 6; i++) gv[i] = mf_vflip(gvraw[i]);
         // quad UV bbox (clamp01 to match the rebase + the fabric's clamped sampling)
         float u0 = 1.0f, u1 = 0.0f, v0 = 1.0f, v1 = 0.0f;
         for (int i = 0; i < 6; i++) {
