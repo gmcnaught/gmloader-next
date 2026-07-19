@@ -57,18 +57,6 @@ extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
 // this task, but every draw call site now threads one through).
 static uint32_t next_key(void){ static uint32_t k = 1; return k++; }
 
-// GL texcoord origin is bottom-left (v=0 = image BOTTOM); the fabric texture page
-// is top-origin. mf_draw therefore emits v' = 1 - v so each sprite samples
-// right-side-up on the device (see raster_backend_mfgpu.cpp mf_draw). backend_sw
-// (== Blitter_RasterDraw, the ground-truth SW rasterizer) does NOT apply that
-// flip, so to keep the "fabric == SW oracle" parity honest the oracle must be fed
-// the SAME flipped UVs: both then render the identical (flipped) image and the
-// invariant "both backends sample identically" holds. Copies (never mutates the
-// caller's const verts); flips ONLY v (u/x/y/rgba unchanged — the flip is V-only).
-static void flip_v_copy(BVtx *dst, const BVtx *src, int nverts) {
-    for (int i = 0; i < nverts; i++) { dst[i] = src[i]; dst[i].v = 1.0f - src[i].v; }
-}
-
 // Mirrors Blitter_ToRGB565's per-pixel packing formula (gmloader/mister/
 // blitter.cpp) without linking that file: it lives inside #ifdef
 // MISTER_NATIVE_VIDEO and depends on GL-decode globals (g_rw/g_rh) plus the
@@ -174,12 +162,7 @@ static int battery_case_key(const char *name, uint8_t br, uint8_t bg, uint8_t bb
     RSurface s_mf = { rgba_mf, BW, BH };
 
     backend_sw.clear(&s_sw, br, bg, bb, 255);
-    // Oracle sees the SAME V-flip the fabric applies (see flip_v_copy) so parity
-    // stays "both sample identically". Sized for the largest battery_case_key draw.
-    static BVtx swv[4096];
-    int nv = triCount * 3; if (nv > (int)(sizeof swv / sizeof swv[0])) nv = (int)(sizeof swv / sizeof swv[0]);
-    flip_v_copy(swv, v, nv);
-    backend_sw.draw(&s_sw, swv, triCount, tex, blend, 0.f, key);
+    backend_sw.draw(&s_sw, v, triCount, tex, blend, 0.f, key);
 
     RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);   // this surface IS the default fb
     backend_mfgpu.frame_begin();
@@ -334,11 +317,7 @@ static int battery(void) {
         int n = 0;
         for (int ty = 0; ty < th; ty++) {
             for (int tx = 0; tx < tw; tx++) {
-                // U offset 0.25 (mid-texel, exact). V offset 0.75 because mf_draw
-                // flips V (v'=1-v): 0.75 flips to an exact 0.25, staying inside
-                // both rasterizers' nearest-agreement window [t,t+0.5) so a binary
-                // colorkey texel is never mis-classified. (U is never flipped.)
-                float u = (tx + 0.25f) / (float)tw, uv = (ty + 0.75f) / (float)th;
+                float u = (tx + 0.25f) / (float)tw, uv = (ty + 0.25f) / (float)th;
                 float x0 = 40.f + tx*cell, y0 = 40.f + ty*cell;
                 float x1 = x0 + cell,       y1 = y0 + cell;
                 BVtx q[6] = {
@@ -753,12 +732,7 @@ static int build_texel_grid(BVtx *out, int tx0, int ty0, int nx, int ny, int str
     for (int j = 0; j < ny; j++)
         for (int i = 0; i < nx; i++) {
             int tx = tx0 + i*stride, ty = ty0 + j*stride;
-            // U sample offset 0.25 (mid-texel, exact: frac<0.5 so fabric +HALF-
-            // nearest and the SW floor pick the same texel). V uses 0.75 because
-            // mf_draw flips V (v'=1-v): a 0.75 offset flips to an exact 0.25, so
-            // the flipped sample stays boundary-safe on BOTH rasterizers. (U is
-            // never flipped, so it keeps 0.25.)
-            float u = (tx + 0.25f) / (float)tw, uv = (ty + 0.75f) / (float)th;
+            float u = (tx + 0.25f) / (float)tw, uv = (ty + 0.25f) / (float)th;
             float x0 = ox + i*cell, y0 = oy + j*cell, x1 = x0 + cell, y1 = y0 + cell;
             BVtx q[6] = {
                 { x0,y0, u,uv, 1,1,1,1 }, { x1,y0, u,uv, 1,1,1,1 }, { x1,y1, u,uv, 1,1,1,1 },
@@ -840,11 +814,6 @@ static int case_nearfullpage(void) {
 // w-1) so the edge texel is never dropped. The max row/col are a distinct bright
 // colour; mid-texel UV keeps the sample exact, so a dropped/clamped-wrong edge
 // texel diverges past +-1.
-//   Note on the V-flip: mf_draw emits v'=1-v, so a grid built at texel rows
-//   ty0..ty0+3 samples page rows (TH-1-ty). To keep this test exercising the
-//   V MAX-edge (row TH-1) after the flip, ty0 is 0 (post-flip -> rows 12..15);
-//   U is never flipped, so tx0 stays at the max-col edge (12..15). Both max
-//   edges (col 15 AND row 15) still carry the bright marker.
 static int case_edge_sprite(void) {
     enum { TW = 16, TH = 16 };
     static uint8_t tex[TW*TH*4];
@@ -854,7 +823,7 @@ static int case_edge_sprite(void) {
         p[3]=255; }
     RTexture t = { tex, TW, TH, 1, 1, 0, 1 };
     static BVtx v[4*4*6];
-    int tris = build_texel_grid(v, /*tx0*/12,/*ty0*/0, /*nx*/4,/*ny*/4, /*stride*/1,
+    int tris = build_texel_grid(v, /*tx0*/12,/*ty0*/12, /*nx*/4,/*ny*/4, /*stride*/1,
                                 TW, TH, /*cell*/20.f, /*ox*/40.f, /*oy*/40.f);
     RasterBackend_MFGPU_TestReinit(0);
     return battery_case_key("edge-sprite", 5,5,5, &t, v, tris, RB_NONE, next_key());
@@ -885,9 +854,7 @@ static int case_pin_aware_insert(void) {
     static uint16_t mf565[BW*BH];
     RSurface s_sw = { rgba_sw, BW, BH }, s_mf = { rgba_mf, BW, BH };
     backend_sw.clear(&s_sw, 8,8,8,255);
-    static BVtx swv[NX*NY*6];
-    flip_v_copy(swv, v, tris * 3);                          // oracle sees the fabric's V-flip
-    backend_sw.draw(&s_sw, swv, tris, &t, RB_NONE, 0.f, 1); // whole-texture oracle
+    backend_sw.draw(&s_sw, v, tris, &t, RB_NONE, 0.f, 1);   // whole-texture oracle
 
     RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
     RasterBackend_MFGPU_TestReinit(0);
@@ -1041,99 +1008,6 @@ static int case_surface_route(void) {
     return ok;
 }
 
-// ── V-flip (GL bottom-origin -> fabric top-origin) ────────────────────────────
-// Two hand-asserted checks (no oracle, so the RED is unambiguous):
-//  (1) a NORMAL textured draw samples right-side-up: mf_draw must emit v'=1-v so
-//      GL's v=0 (image BOTTOM) maps to the page's bottom row. Texture = top half
-//      RED / bottom half BLUE; a full quad with v=0 at screen-top must therefore
-//      show BLUE at the top of the screen and RED at the bottom. Sampled deep in
-//      each half (far from the mid boundary) so the fabric's +HALF nearest can't
-//      perturb it. Pre-fix (no flip) screen-top samples the texture top = RED -> FAIL.
-//  (2) the app-surface COMPOSITE (src_is_appsurf) must NOT be flipped: it samples
-//      the fabric surface, which already holds correctly-oriented content. Fill
-//      the surface top=GREEN / bottom=MAGENTA (by POSITION), composite it
-//      full-screen, and assert screen-top stays GREEN. If a future change flips
-//      the composite too, screen-top would read MAGENTA -> FAIL (locks the
-//      exclusion the whole fix depends on).
-static int rgb565_is(uint16_t px, int r5, int g5, int b5) {
-    int r=(px>>11)&0x1F, g=(px>>5)&0x3F, b=px&0x1F;
-    return abs(r-r5)<=1 && abs(g-g5)<=1 && abs(b-b5)<=1;
-}
-static int case_vflip(void) {
-    enum { W = 64, H = 64 };
-    int ok = 1;
-
-    // (1) normal textured draw: 4x8 page, rows 0-3 RED, rows 4-7 BLUE.
-    enum { TW = 4, TH = 8 };
-    static uint8_t tex[TW*TH*4];
-    for (int y=0;y<TH;y++) for (int x=0;x<TW;x++){ uint8_t*p=tex+((y*TW+x)*4);
-        int top = (y < TH/2); p[0]= top?200:0; p[1]=0; p[2]= top?0:200; p[3]=255; }
-    RTexture t = { tex, TW, TH, 1, 1, /*RGBA8888*/0, 1 };
-    BVtx v[6] = {   // full quad, v=0 at screen-top, v=1 at screen-bottom
-        {  0.f, 0.f, 0.f,0.f, 1,1,1,1 }, { (float)W, 0.f, 1.f,0.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,1.f, 1,1,1,1 },
-        {  0.f, 0.f, 0.f,0.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,1.f, 1,1,1,1 }, {  0.f,(float)H, 0.f,1.f, 1,1,1,1 },
-    };
-    static uint8_t  rgba_mf[BW*BH*4];
-    static uint16_t mf565[BW*BH];
-    RSurface s_mf = { rgba_mf, BW, BH };
-    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
-    RasterBackend_MFGPU_SetAppSurface(0, 0);
-    RasterBackend_MFGPU_TestReinit(0);
-    backend_mfgpu.frame_begin();
-    backend_mfgpu.clear(&s_mf, 0,0,0,255);
-    backend_mfgpu.draw(&s_mf, v, 2, &t, RB_NONE, 0.f, next_key());
-    backend_mfgpu.frame_end();
-    RasterBackend_MFGPU_TestCopyFB565(BW, BH, mf565);
-    uint16_t top = mf565[(H/10)*BW + W/2];       // deep in top of the quad
-    uint16_t bot = mf565[(H*9/10)*BW + W/2];      // deep in bottom
-    if (!rgb565_is(top, 0,0,25) || !rgb565_is(bot, 25,0,0)) {   // want BLUE top, RED bottom
-        printf("  FAIL vflip-textured top=0x%04X (want BLUE) bot=0x%04X (want RED)\n", top, bot);
-        ok = 0;
-    } else printf("  OK   vflip-textured  top=BLUE bot=RED\n");
-
-    // (2) composite exclusion: fill APPSURF top=GREEN / bottom=MAGENTA by POSITION
-    // (1x1 white page tinted per-vertex; position-based so it is flip-invariant),
-    // then composite full-screen and assert the composite is raw-V (top stays GREEN).
-    const uint32_t APPSURF_FBO = 60, APPSURF_TEX = 61;
-    static const uint8_t whitepx[4] = { 255,255,255,255 };
-    RTexture white = { whitepx, 1, 1, 1, 1, 0, 1 };
-    RSurface s_appsurf = { nullptr, W, H, APPSURF_FBO };
-    static uint8_t  work_mf[BW*BH*4];
-    static uint16_t work565[BW*BH];
-    RSurface s_work = { work_mf, BW, BH, 0 };
-    auto colorquad = [&](float x0,float y0,float x1,float y1,float r,float g,float b, BVtx *q){
-        BVtx a[6] = { {x0,y0,0,0,r,g,b,1},{x1,y0,0,0,r,g,b,1},{x1,y1,0,0,r,g,b,1},
-                      {x0,y0,0,0,r,g,b,1},{x1,y1,0,0,r,g,b,1},{x0,y1,0,0,r,g,b,1} };
-        for (int i=0;i<6;i++) q[i]=a[i];
-    };
-    BVtx greenq[6], magq[6];
-    colorquad(0,0, W,H/2,        0.f,0.784f,0.f, greenq);   // top half GREEN  (~0,200,0)
-    colorquad(0,H/2, W,H,        0.784f,0.f,0.784f, magq);  // bottom half MAGENTA (~200,0,200)
-    BVtx fullVerts[6] = {
-        {   0.f,   0.f, 0.f,0.f, 1,1,1,1 }, { (float)W,   0.f, 1.f,0.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,1.f, 1,1,1,1 },
-        {   0.f,   0.f, 0.f,0.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,1.f, 1,1,1,1 }, {   0.f,(float)H, 0.f,1.f, 1,1,1,1 },
-    };
-    RasterBackend_MFGPU_SetDefaultSurface(work_mf);
-    RasterBackend_MFGPU_SetAppSurface(APPSURF_FBO, APPSURF_TEX);
-    RasterBackend_MFGPU_TestReinit(0);
-    backend_mfgpu.frame_begin();
-    backend_mfgpu.draw(&s_appsurf, greenq, 2, &white, RB_NONE, 0.f, next_key());   // top -> APPSURF
-    backend_mfgpu.draw(&s_appsurf, magq,   2, &white, RB_NONE, 0.f, next_key());   // bottom -> APPSURF
-    backend_mfgpu.clear(&s_work, 0,0,0,255);
-    RTexture surfSrc = { nullptr, W, H, 1, 0, 0, 0 };
-    backend_mfgpu.draw(&s_work, fullVerts, 2, &surfSrc, RB_NONE, 0.f, APPSURF_TEX);  // APPSURF -> WORK
-    backend_mfgpu.frame_end();
-    RasterBackend_MFGPU_TestCopyFB565(BW, BH, work565);
-    RasterBackend_MFGPU_SetAppSurface(0, 0);   // don't leak state
-    uint16_t ctop = work565[(H/8)*BW + W/2];      // deep in top of composite
-    uint16_t cbot = work565[(H*7/8)*BW + W/2];     // deep in bottom
-    if (!rgb565_is(ctop, 0,49,0) || !rgb565_is(cbot, 25,0,25)) {  // GREEN top, MAGENTA bottom (NOT flipped)
-        printf("  FAIL vflip-composite top=0x%04X (want GREEN) bot=0x%04X (want MAGENTA)\n", ctop, cbot);
-        ok = 0;
-    } else printf("  OK   vflip-composite top=GREEN bot=MAGENTA (not flipped)\n");
-    return ok;
-}
-
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -1176,7 +1050,5 @@ int main(void){
     // future case can't be silently affected without noticing).
     if (!case_surface_route()) { printf("FAIL mfgpu-surface-route\n"); ok = 0; }
     else printf("raster_backend mfgpu-surface-route OK\n");
-    if (!case_vflip()) { printf("FAIL mfgpu-vflip\n"); ok = 0; }
-    else printf("raster_backend mfgpu-vflip OK\n");
     return ok ? 0 : 1;
 }
