@@ -113,6 +113,9 @@ static bool          g_inited = false;
 // call frame_begin()/clear()/draw()/frame_end() directly are unaffected: those
 // calls just re-set/consume the same flag along the way.
 static bool          g_frame_active = false;
+// Frames opened since init. Only consumed by the GMLOADER_MFGPU_UVLOG capture
+// (to bound it to the first few frames and to tag its lines).
+static int           g_frame_no = 0;
 
 // Persistent resident-texture cache. Keyed by GL texture id (tex_key). Survives
 // across frames (mf_frame_begin no longer resets the heap); entries are freed on
@@ -409,6 +412,7 @@ static void mf_frame_begin(void) {
     // comment for why this reset (not just the variable's initial value) matters.
     g_cur_target = MF_TARGET_WORK;
     g_frame_active = true;
+    g_frame_no++;
 }
 
 // Task 7: production entry point for clear()/draw() — the frame loop never
@@ -689,6 +693,63 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", nt);
 }
 
+// ── [Y-orientation bring-up capture] GMLOADER_MFGPU_UVLOG ────────────────────
+// The app-surface composite branch below carries a self-flagged assumption:
+// "UNVERIFIED against a real device UV capture (Task 1's frame-graph dump
+// didn't log UV)". That unverified assumption is exactly what produced a wrong
+// V-flip fix (ac41e1e, reverted in d0d5d27), so pin it with real data before
+// touching orientation again.
+//
+// What decides where the flip belongs is the correspondence between SCREEN Y
+// and texcoord V on the composite quad:
+//   v at min-y (screen TOP) == 1  -> GM emits GL's bottom-origin FBO
+//                                    convention; the fabric surface is
+//                                    top-origin, so the composite is the
+//                                    inversion site and must flip.
+//   v at min-y (screen TOP) == 0  -> composite is already top-origin; the
+//                                    inversion is NOT here (look at the RTL
+//                                    scanout or the scene's own y).
+// Also dumps page dims vs the 320x240 used region: if th > 240 the page is
+// padded, and a normalized 1-v would be wrong even on the composite -- the
+// flip has to be taken in ABSOLUTE PIXELS about the used height.
+//
+// APPSURF-scene draws are logged too (their screen-y range), so a flipped
+// scene-into-FBO y is distinguishable from a flipped composite.
+// Capped at the first few frames: one composite per frame, so a short capture
+// is enough and the log stays readable over ssh.
+static int mf_uvlog_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_MFGPU_UVLOG"); v = (e && *e) ? atoi(e) : 0;
+                 if (e && *e && v <= 0) v = 3; }   // bare "=1"/non-numeric -> 3 frames
+    return v;
+}
+static void mf_uvlog(const char *tag, const BVtx *v, int triCount, int tw, int th) {
+    int nv = triCount * 3;
+    if (nv <= 0) return;
+    float ymin = v[0].y, ymax = v[0].y, v_at_ymin = v[0].v, v_at_ymax = v[0].v;
+    float umin = v[0].u, umax = v[0].u, vmin = v[0].v, vmax = v[0].v;
+    float xmin = v[0].x, xmax = v[0].x;
+    for (int i = 1; i < nv; i++) {
+        if (v[i].y < ymin) { ymin = v[i].y; v_at_ymin = v[i].v; }
+        if (v[i].y > ymax) { ymax = v[i].y; v_at_ymax = v[i].v; }
+        if (v[i].x < xmin) xmin = v[i].x;
+        if (v[i].x > xmax) xmax = v[i].x;
+        if (v[i].u < umin) umin = v[i].u;   if (v[i].u > umax) umax = v[i].u;
+        if (v[i].v < vmin) vmin = v[i].v;   if (v[i].v > vmax) vmax = v[i].v;
+    }
+    // The verdict, stated outright so the capture needs no interpretation.
+    const char *verdict = (v_at_ymin > v_at_ymax) ? "V-INVERTED(top-v>bot-v)"
+                        : (v_at_ymin < v_at_ymax) ? "V-UPRIGHT(top-v<bot-v)"
+                                                  : "V-DEGENERATE(equal)";
+    fprintf(stderr, "UVLOG f=%d %s tris=%d page=%dx%d used=%dx%d padded=%s "
+            "screen=[%.1f,%.1f..%.1f,%.1f] uv=[%.4f,%.4f..%.4f,%.4f] "
+            "v@top=%.4f v@bot=%.4f %s\n",
+            g_frame_no, tag, triCount, tw, th, BLT_FB_WIDTH, BLT_FB_HEIGHT,
+            (tw > BLT_FB_WIDTH || th > BLT_FB_HEIGHT) ? "YES" : "no",
+            xmin, ymin, xmax, ymax, umin, vmin, umax, vmax,
+            v_at_ymin, v_at_ymax, verdict);
+}
+
 static void mf_draw(RSurface *d, const BVtx *v, int triCount,
                     const RTexture *t, RBlend bl, float ar, uint32_t tex_key) {
     mf_ensure_frame();
@@ -752,8 +813,20 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         int th = t ? t->h : BLT_FB_HEIGHT;
         if (tw <= 0) tw = BLT_FB_WIDTH;
         if (th <= 0) th = BLT_FB_HEIGHT;
+        if (g_frame_no <= mf_uvlog_on()) mf_uvlog("COMPOSITE(appsurf->screen)", v, triCount, tw, th);
         mf_emit_group(tex, tw, th, v, triCount, bl, /*has_key=*/false, BLT_F_SRC_SURFACE);
         return;
+    }
+
+    // Scene draws INTO the app surface, for the same capture: if GM's
+    // scene-into-FBO y were the flipped one (rather than the composite's v),
+    // it would show up here as sprites whose screen-y is mirrored about the
+    // surface height. A handful per frame is plenty to read the convention.
+    if (g_frame_no <= mf_uvlog_on() && dst_is_appsurf && t) {
+        static int log_frame = -1, log_count = 0;
+        if (log_frame != g_frame_no) { log_frame = g_frame_no; log_count = 0; }
+        if (log_count++ < 4)
+            mf_uvlog("SCENE(->appsurf)", v, triCount, t->w > 0 ? t->w : 1, t->h > 0 ? t->h : 1);
     }
 
     // [Task 9 bring-up diagnostic] Log the UV bbox this draw ACTUALLY touches
