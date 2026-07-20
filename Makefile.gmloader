@@ -100,7 +100,7 @@ ifeq ($(MISTER_BUILD),1)
 CFLAGS   += -DMISTER_NATIVE_VIDEO=1 -DMISTER_WIDTH=320 -DMISTER_HEIGHT=240
 CXXFLAGS += -DMISTER_NATIVE_VIDEO=1 -DMISTER_WIDTH=320 -DMISTER_HEIGHT=240
 LDFLAGS  += -L$(CURDIR)/3rdparty/gles2-sw -lGLES_sw -Wl,-rpath,'$$ORIGIN'
-MISTER_SRCS = gmloader/mister/native_video_writer.c gmloader/mister/frame_capture.cpp gmloader/mister/draw_trace.cpp gmloader/mister/blitter.cpp gmloader/mister/blitter_raster.cpp gmloader/mister/raster_backend_sw.cpp gmloader/mister/raster_backend_mfgpu.cpp
+MISTER_SRCS = gmloader/mister/native_video_writer.c gmloader/mister/frame_capture.cpp gmloader/mister/draw_trace.cpp gmloader/mister/blitter.cpp gmloader/mister/blitter_raster.cpp gmloader/mister/raster_backend_sw.cpp gmloader/mister/raster_backend_mfgpu.cpp gmloader/mister/joy_shm_reader.cpp
 endif
 
 # Used by generate_libc.py to generate the function tables that are exported to the
@@ -194,3 +194,10 @@ blitter-appsurf-test:
 	  gmloader/configuration.cpp \
 	  $(MFGPU_SRC) \
 	  -lm -o /tmp/bat && /tmp/bat
+
+.PHONY: joy-shm-test
+joy-shm-test:
+	c++ -std=c++17 -DMISTER_NATIVE_VIDEO=1 -Igmloader/mister -Igmloader -I. \
+	  gmloader/mister/joy_shm_reader_test.cpp \
+	  gmloader/mister/joy_shm_reader.cpp \
+	  -lm -o /tmp/jst && /tmp/jst
