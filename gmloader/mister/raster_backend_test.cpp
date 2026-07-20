@@ -926,10 +926,35 @@ static int case_surface_route(void) {
         { 40.f,  8.f, 0,0, 1,1,1,1 },
         {  8.f, 36.f, 0,0, 1,1,1,1 },
     };
-    // Fullscreen (over the WxH app-surface region) quad sampling it, UV (0,0)..(1,1).
-    BVtx fullVerts[6] = {
+    // Fullscreen (over the WxH app-surface region) quad sampling the app surface.
+    // TWO vertex sets, deliberately NOT the same UVs -- this is what makes the
+    // comparison a real test of the composite V-flip rather than a tautology:
+    //
+    //   oracleVerts  UPRIGHT (v=0 at screen top). backend_sw has no notion of an
+    //                app surface; it just samples a plain top-origin buffer, so
+    //                these UVs produce THE IMAGE THAT SHOULD APPEAR ON SCREEN.
+    //                This is independent ground truth and is NOT adjusted to
+    //                match the implementation.
+    //   deviceVerts  INVERTED (v=vmax at screen top, v=0 at bottom) -- GL's
+    //                bottom-origin FBO convention, exactly what GM emits per the
+    //                GMLOADER_MFGPU_UVLOG device capture (v@top=0.8438 >
+    //                v@bot=0.0000, 801/801 composite draws over 400 frames).
+    //                This is what the FABRIC path receives.
+    //
+    // So the two backends get different inputs reflecting a real convention
+    // difference, and must still produce the same picture: the fabric's
+    // composite flip has to undo GM's inversion. Drop the flip and the fabric
+    // renders mirrored while the oracle does not -> RED. (Contrast the reverted
+    // ac41e1e, which fed the ORACLE the flipped UVs so both sampled identically
+    // -- that made the oracle blind to orientation, which is precisely how the
+    // upside-down/random-tile bugs got through green tests.)
+    BVtx oracleVerts[6] = {
         {   0.f,   0.f, 0.f,0.f, 1,1,1,1 }, { (float)W,   0.f, 1.f,0.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,1.f, 1,1,1,1 },
         {   0.f,   0.f, 0.f,0.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,1.f, 1,1,1,1 }, {   0.f,(float)H, 0.f,1.f, 1,1,1,1 },
+    };
+    BVtx deviceVerts[6] = {
+        {   0.f,   0.f, 0.f,1.f, 1,1,1,1 }, { (float)W,   0.f, 1.f,1.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,0.f, 1,1,1,1 },
+        {   0.f,   0.f, 0.f,1.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,0.f, 1,1,1,1 }, {   0.f,(float)H, 0.f,0.f, 1,1,1,1 },
     };
 
     // ---- SW oracle: an independent app-surface buffer, then sampled as a
@@ -952,7 +977,7 @@ static int case_surface_route(void) {
     backend_sw.draw(&s_appsurf_sw, spriteVerts, 1, &spriteTex, RB_NONE, 0.f, next_key());
     backend_sw.clear(&s_work_sw, BG_R, BG_G, BG_B, 255);
     RTexture appsurfAsTex = { appsurf_sw, W, H, /*nearest*/1, /*valid*/1, /*RGBA8888*/0, /*opaque*/1 };
-    backend_sw.draw(&s_work_sw, fullVerts, 2, &appsurfAsTex, RB_NONE, 0.f, next_key());
+    backend_sw.draw(&s_work_sw, oracleVerts, 2, &appsurfAsTex, RB_NONE, 0.f, next_key());
 
     // ---- fabric path: through the REAL backend entry points ------------------
     static uint8_t  work_mf[BW*BH*4];
@@ -970,7 +995,7 @@ static int case_surface_route(void) {
     // it) -- only w/h matter, for the UV-to-absolute-pixel scale (see
     // mf_draw's comment). tex_key == APPSURF_TEX is what selects this path.
     RTexture surfSrcTex = { nullptr, W, H, 1, 0, 0, 0 };
-    backend_mfgpu.draw(&s_work_mf, fullVerts, 2, &surfSrcTex, RB_NONE, 0.f, APPSURF_TEX);      // appsurf -> WORK
+    backend_mfgpu.draw(&s_work_mf, deviceVerts, 2, &surfSrcTex, RB_NONE, 0.f, APPSURF_TEX);      // appsurf -> WORK
     backend_mfgpu.frame_end();
     RasterBackend_MFGPU_TestCopyFB565(BW, BH, mf565);
 
@@ -1006,6 +1031,156 @@ static int case_surface_route(void) {
         }
     }
     return ok;
+}
+
+static int rgb565_is(uint16_t px, int r5, int g5, int b5) {
+    int r=(px>>11)&0x1F, g=(px>>5)&0x3F, b=px&0x1F;
+    return abs(r-r5)<=1 && abs(g-g5)<=1 && abs(b-b5)<=1;
+}
+
+// ── app-surface composite V-flip ─────────────────────────────────────────────
+// Locks the ONE place GL's bottom-origin FBO convention actually reaches the
+// fabric. Geometry is taken verbatim from a device capture
+// (GMLOADER_MFGPU_UVLOG, Maldita title screen, 801/801 composite draws
+// identical across 400 frames):
+//
+//   page=512x256  content=288x216  screen=[0,0..320,240]
+//   uv=[0.0000,0.0000 .. 0.5625,0.8438]   v@top=0.8438  v@bot=0.0000
+//
+// v@top > v@bot: GM emits the composite with v=0 at the BOTTOM of the image
+// (GL's FBO origin), while the fabric app surface is top-origin, so sampling it
+// raw renders the whole scene upside-down. mf_draw must invert V on this draw.
+//
+// Note 0.8438 == 216/256 and 0.5625 == 288/512: the page is PADDED (a POT 512x256
+// holding the 288x216 surface). That is why the flip CANNOT be a normalized
+// 1-v -- that would map 0.8438 -> 0.1562 and 0.0 -> 1.0, i.e. straight into the
+// dead padding rows below the content. The flip has to be taken about the
+// sampled band itself. This case would pass under a naive 1-v only if the page
+// were unpadded, so the padded dims here are load-bearing, not decoration.
+//
+// Hand-asserted (no SW oracle): the app surface is filled by POSITION (top half
+// GREEN, bottom half MAGENTA via per-vertex tint on a 1x1 white page), which is
+// flip-invariant, so the only thing under test is the composite's own V.
+static int case_appsurf_composite_vflip(void) {
+    enum { PAGE_W = 512, PAGE_H = 256 };          // padded POT page (device)
+    const float UMAX = (float)BW / PAGE_W;        // 288/512 = 0.5625
+    const float VMAX = (float)BH / PAGE_H;        // 216/256 = 0.8438
+    const uint32_t APPSURF_FBO = 60, APPSURF_TEX = 61;
+    int ok = 1;
+
+    static const uint8_t whitepx[4] = { 255,255,255,255 };
+    RTexture white = { whitepx, 1, 1, 1, 1, 0, 1 };
+    RSurface s_appsurf = { nullptr, BW, BH, APPSURF_FBO };
+    static uint8_t  work_mf[BW*BH*4];
+    static uint16_t work565[BW*BH];
+    RSurface s_work = { work_mf, BW, BH, 0 };
+
+    auto colorquad = [&](float x0,float y0,float x1,float y1,float r,float g,float b, BVtx *q){
+        BVtx a[6] = { {x0,y0,0,0,r,g,b,1},{x1,y0,0,0,r,g,b,1},{x1,y1,0,0,r,g,b,1},
+                      {x0,y0,0,0,r,g,b,1},{x1,y1,0,0,r,g,b,1},{x0,y1,0,0,r,g,b,1} };
+        for (int i=0;i<6;i++) q[i]=a[i];
+    };
+    BVtx greenq[6], magq[6];
+    colorquad(0,0,      BW,BH/2, 0.f,0.784f,0.f,     greenq);   // TOP half  GREEN
+    colorquad(0,BH/2,   BW,BH,   0.784f,0.f,0.784f,  magq);     // BOT half  MAGENTA
+
+    // The composite, exactly as the device emits it: v=VMAX at screen TOP,
+    // v=0 at screen BOTTOM (GL bottom-origin), u spanning only the used width.
+    BVtx comp[6] = {
+        {   0.f,    0.f, 0.f, VMAX, 1,1,1,1 }, { (float)BW,    0.f, UMAX, VMAX, 1,1,1,1 },
+        { (float)BW,(float)BH, UMAX, 0.f,  1,1,1,1 },
+        {   0.f,    0.f, 0.f, VMAX, 1,1,1,1 }, { (float)BW,(float)BH, UMAX, 0.f, 1,1,1,1 },
+        {   0.f,(float)BH, 0.f, 0.f,  1,1,1,1 },
+    };
+
+    RasterBackend_MFGPU_SetDefaultSurface(work_mf);
+    RasterBackend_MFGPU_SetAppSurface(APPSURF_FBO, APPSURF_TEX);
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.draw(&s_appsurf, greenq, 2, &white, RB_NONE, 0.f, next_key());
+    backend_mfgpu.draw(&s_appsurf, magq,   2, &white, RB_NONE, 0.f, next_key());
+    backend_mfgpu.clear(&s_work, 0,0,0,255);
+    RTexture surfSrc = { nullptr, PAGE_W, PAGE_H, 1, 0, 0, 0 };   // padded page dims
+    backend_mfgpu.draw(&s_work, comp, 2, &surfSrc, RB_NONE, 0.f, APPSURF_TEX);
+    backend_mfgpu.frame_end();
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, work565);
+    RasterBackend_MFGPU_SetAppSurface(0, 0);   // don't leak state into later cases
+
+    uint16_t top = work565[(BH/8)*BW + BW/2];       // deep in the top of the composite
+    uint16_t bot = work565[(BH*7/8)*BW + BW/2];     // deep in the bottom
+    if (!rgb565_is(top, 0,49,0) || !rgb565_is(bot, 25,0,25)) {
+        printf("  FAIL composite-vflip top=0x%04X (want GREEN, the surface's TOP) "
+               "bot=0x%04X (want MAGENTA)\n", top, bot);
+        ok = 0;
+    } else printf("  OK   composite-vflip  top=GREEN bot=MAGENTA (surface upright on screen)\n");
+    return ok;
+}
+
+// ── atlas sub-region: the guard that was missing ─────────────────────────────
+// Regression lock for the reverted per-sprite V-flip (ac41e1e / d0d5d27). That
+// commit flipped v'=1-v on EVERY sprite, normalized over the whole page, which
+// silently RELOCATES the sample on an atlas instead of mirroring the sprite --
+// on device it swapped the title screen for unrelated tiles of the same sheet.
+//
+// The old case_vflip could not see this: it drew a FULL-PAGE quad (v spanning
+// 0..1), the single geometry where a page-normalized flip is invisible. Real GM
+// draws are the opposite -- the device capture shows scene sprites sampling
+// narrow bands of a 2048x2048 sheet (e.g. v=0.1084..0.8613).
+//
+// So: a 4x4 grid of distinctly-coloured 16x16 tiles, draw exactly ONE interior
+// tile, and assert the rendered colour is THAT tile's. Tile (1,1) sits at
+// v=[0.25,0.50]; a 1-v flip sends it to v=[0.50,0.75] == tile row 2, a different
+// colour -> unambiguous FAIL. Tile colours are chosen so row 1 and row 2 differ
+// well beyond 565 rounding.
+static int case_atlas_subregion_tile(void) {
+    enum { TW = 64, TH = 64, TILE = 16 };
+    static uint8_t tex[TW*TH*4];
+    for (int y = 0; y < TH; y++)
+        for (int x = 0; x < TW; x++) {
+            uint8_t *p = tex + ((size_t)y*TW + x)*4;
+            int tx = x / TILE, ty = y / TILE;
+            p[0] = (uint8_t)(40*tx + 20); p[1] = (uint8_t)(40*ty + 20); p[2] = 128; p[3] = 255;
+        }
+    RTexture t = { tex, TW, TH, 1, 1, 0, 1 };
+
+    const int TX = 1, TY = 1;                       // the tile under test
+    const float u0 = (float)(TX*TILE)/TW, u1 = (float)((TX+1)*TILE)/TW;   // 0.25..0.50
+    const float v0 = (float)(TY*TILE)/TH, v1 = (float)((TY+1)*TILE)/TH;   // 0.25..0.50
+    // Inset the UVs by a quarter-texel so neither rasterizer's nearest rounding
+    // can drift onto the neighbouring tile at the shared boundary.
+    const float eps = 0.25f / TW;
+    const float su0 = u0+eps, su1 = u1-eps, sv0 = v0+eps, sv1 = v1-eps;
+    const float X0 = 40.f, Y0 = 40.f, X1 = 200.f, Y1 = 160.f;
+    BVtx q[6] = {
+        { X0,Y0, su0,sv0, 1,1,1,1 }, { X1,Y0, su1,sv0, 1,1,1,1 }, { X1,Y1, su1,sv1, 1,1,1,1 },
+        { X0,Y0, su0,sv0, 1,1,1,1 }, { X1,Y1, su1,sv1, 1,1,1,1 }, { X0,Y1, su0,sv1, 1,1,1,1 },
+    };
+
+    static uint8_t  rgba_mf[BW*BH*4];
+    static uint16_t mf565[BW*BH];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_SetAppSurface(0, 0);
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, q, 2, &t, RB_NONE, 0.f, next_key());
+    backend_mfgpu.frame_end();
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, mf565);
+
+    // Expected = tile (1,1) = rgb(60,60,128); the 1-v mis-sample would land on
+    // tile (1,2) = rgb(60,100,128), which differs by 10 in the 6-bit green field.
+    const int want_r5 = 60>>3, want_g6 = 60>>2, want_b5 = 128>>3;
+    uint16_t got = mf565[((int)((Y0+Y1)/2))*BW + (int)((X0+X1)/2)];
+    if (!rgb565_is(got, want_r5, want_g6, want_b5)) {
+        printf("  FAIL atlas-subregion got=0x%04X want=0x%04X (tile %d,%d); "
+               "a page-normalized V-flip would sample tile %d,%d = 0x%04X\n",
+               got, (uint16_t)((want_r5<<11)|(want_g6<<5)|want_b5), TX, TY,
+               TX, TH/TILE-1-TY, (uint16_t)(((60>>3)<<11)|((100>>2)<<5)|(128>>3)));
+        return 0;
+    }
+    printf("  OK   atlas-subregion  tile(%d,%d) sampled correctly (0x%04X)\n", TX, TY, got);
+    return 1;
 }
 
 int main(void){
@@ -1050,5 +1225,9 @@ int main(void){
     // future case can't be silently affected without noticing).
     if (!case_surface_route()) { printf("FAIL mfgpu-surface-route\n"); ok = 0; }
     else printf("raster_backend mfgpu-surface-route OK\n");
+    if (!case_appsurf_composite_vflip()) { printf("FAIL mfgpu-composite-vflip\n"); ok = 0; }
+    else printf("raster_backend mfgpu-composite-vflip OK\n");
+    if (!case_atlas_subregion_tile()) { printf("FAIL mfgpu-atlas-subregion\n"); ok = 0; }
+    else printf("raster_backend mfgpu-atlas-subregion OK\n");
     return ok ? 0 : 1;
 }

@@ -814,7 +814,40 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         if (tw <= 0) tw = BLT_FB_WIDTH;
         if (th <= 0) th = BLT_FB_HEIGHT;
         if (g_frame_no <= mf_uvlog_on()) mf_uvlog("COMPOSITE(appsurf->screen)", v, triCount, tw, th);
-        mf_emit_group(tex, tw, th, v, triCount, bl, /*has_key=*/false, BLT_F_SRC_SURFACE);
+        // ── V-flip, composite ONLY (GL bottom-origin FBO -> top-origin surface)
+        // GM composites the application surface with GL's FBO convention: v=0 is
+        // the BOTTOM of the image. Device capture (GMLOADER_MFGPU_UVLOG, Maldita
+        // title screen, 801/801 composite draws identical over 400 frames):
+        //   page=512x256 content=288x216 screen=[0,0..320,240]
+        //   uv=[0,0 .. 0.5625,0.8438]  v@top=0.8438  v@bot=0.0000
+        // The fabric app surface is top-origin, so sampling that raw renders the
+        // whole scene upside-down. This draw is the ONLY place the bottom-origin
+        // convention reaches the fabric: per-sprite textures are top-origin in
+        // memory (mf_texel565 reads row 0 first) and are bit-exact against the
+        // SW rasterizer with raw UVs -- flipping THOSE is the reverted ac41e1e
+        // bug, which relocated atlas samples instead of mirroring sprites. The
+        // same capture confirms it: scene->appsurf draws are 533/533 V-UPRIGHT.
+        //
+        // Flip about the quad's OWN V extent, NOT a normalized 1-v. 0.8438 is
+        // 216/256 -- the page is a PADDED POT (512x256) holding a 288x216
+        // surface, so 1-v would map 0.8438 -> 0.1562 and 0 -> 1.0, straight into
+        // the dead padding below the content. (vmin+vmax)-v maps vmin<->vmax
+        // exactly, inverting the sampled band in place, and is self-calibrating:
+        // it needs neither the page dims nor the used-region dims. Valid because
+        // this quad by construction spans the whole surface -- blitter.cpp only
+        // detects the app surface from a draw covering the full viewport.
+        // Degenerate (vmin==vmax) collapses to identity, which is harmless.
+        int nverts = triCount * 3;
+        if (nverts > MF_MAX_VERTS) nverts = MF_MAX_VERTS;   // same cap mf_emit_group enforces
+        float vmin = v[0].v, vmax = v[0].v;
+        for (int i = 1; i < nverts; i++) {
+            if (v[i].v < vmin) vmin = v[i].v;
+            if (v[i].v > vmax) vmax = v[i].v;
+        }
+        const float vsum = vmin + vmax;
+        static BVtx compscratch[MF_MAX_VERTS];
+        for (int i = 0; i < nverts; i++) { compscratch[i] = v[i]; compscratch[i].v = vsum - v[i].v; }
+        mf_emit_group(tex, tw, th, compscratch, triCount, bl, /*has_key=*/false, BLT_F_SRC_SURFACE);
         return;
     }
 
