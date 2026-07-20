@@ -508,9 +508,59 @@ static void mf_heaplog_frame_set(const char *tag, int verbose) {
 // insert a cache entry. Returns the ref (.valid==0 if it couldn't fit even after
 // eviction -- the last failed blt_upload leaves g_e.overflow set so the frame
 // drops, which is correct). `what` tags the HEAPLOG lines.
+// ── [Y-orientation bring-up capture] GMLOADER_MFGPU_TEXDUMP ──────────────────
+// Writes the EXACT RGB565 texels about to be uploaded+staged, in the exact row
+// order they are written to the heap, as a P6 PPM under /tmp/mfgpu-tex/.
+//
+// This is the experiment that separates the two remaining candidate layers for
+// the residual per-sprite V inversion (glyphs mirrored in place on device while
+// the whole-frame orientation is correct):
+//   dump reads UPRIGHT  -> the page IS staged top-origin, exactly as the SW
+//                          oracle and the RTL texel formula both assume, so the
+//                          mirror is introduced DOWNSTREAM (staging/scanout) and
+//                          an emitter-side V-flip would only mask it.
+//   dump reads MIRRORED -> the source rows really do arrive bottom-origin, the
+//                          emitter is the right layer, and the fix is a
+//                          band-local (per-triangle) flip -- NOT ac41e1e's
+//                          page-normalized 1-v, which relocates atlas samples.
+// Row 0 of the PPM is row 0 of the staged page by construction (no reordering
+// here), so the file's own top IS the page's top -- that is what makes the
+// comparison against the screen meaningful.
+static int mf_texdump_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_MFGPU_TEXDUMP"); v = (e && *e) ? atoi(e) : 0;
+                 if (e && *e && v <= 0) v = 40; }
+    return v;
+}
+static void mf_texdump(uint32_t key, int w, int h, int rx, int ry, const char *what) {
+    static int dumped = 0;
+    if (dumped >= mf_texdump_on()) return;
+    if (w <= 0 || h <= 0) return;
+    static bool mkdir_done = false;
+    if (!mkdir_done) { system("mkdir -p /tmp/mfgpu-tex"); mkdir_done = true; }
+    char path[256];
+    snprintf(path, sizeof path, "/tmp/mfgpu-tex/%03d_%s_key%u_r%d,%d_%dx%d.ppm",
+             dumped, what, key, rx, ry, w, h);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    for (int y = 0; y < h; y++)                    // row 0 first == page row 0
+        for (int x = 0; x < w; x++) {
+            uint16_t p = g_texscratch[(size_t)y * w + x];
+            uint8_t rgb[3] = { (uint8_t)(((p >> 11) & 0x1F) << 3),
+                               (uint8_t)(((p >>  5) & 0x3F) << 2),
+                               (uint8_t)(( p        & 0x1F) << 3) };
+            fwrite(rgb, 1, 3, f);
+        }
+    fclose(f);
+    fprintf(stderr, "TEXDUMP %s\n", path);
+    dumped++;
+}
+
 static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
                                              int rx, int ry, bool has_key,
                                              const char *what) {
+    if (mf_texdump_on()) mf_texdump(key, w, h, rx, ry, what);
     bool ov_before = g_e.overflow;                    // preserve any overflow already set this frame
     blt_surface_ref_t ref = blt_upload(&g_e, g_texscratch, w, h, w * 2);
     int evicted = 0;
