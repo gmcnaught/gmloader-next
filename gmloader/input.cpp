@@ -8,8 +8,17 @@
 #include "libyoyo.h"
 #include "configuration.h"
 
+#ifdef MISTER_NATIVE_VIDEO
+#include "mister/joy_shm_reader.h"
+#include "mister/mister_joy_shm.h"
+#endif
+
 int app_in_focus = 0;
 int mouse_has_warped = 0;
+
+#ifdef MISTER_NATIVE_VIDEO
+static int g_joyshm_ready = -1;   // -1 = untried, 0 = inactive, 1 = active
+#endif
 
 typedef struct controller_t {
     SDL_GameController *controller;
@@ -291,6 +300,26 @@ int update_inputs(SDL_Window *win)
 
     // Synchronize gamepad<->yoyogamepad states
     SDL_GameControllerUpdate();
+
+#ifdef MISTER_NATIVE_VIDEO
+    if (g_joyshm_ready == -1) g_joyshm_ready = JoyShm_Init() ? 1 : 0;
+    if (g_joyshm_ready == 1) {
+        // MiSTer OSD is the authoritative input source: drive yoyo_gamepads[]
+        // straight from the /dev/shm mask instead of polling SDL controllers.
+        for (int p = 0; p < MALDITA_JOY_MAX_PLAYERS; p++) {
+            uint32_t mask = JoyShm_ReadMask(p);
+            unsigned char raw[16];
+            JoyShm_MaskToButtons(mask, raw);
+
+            yoyo_gamepads[p].is_available = 1;
+            for (int j = 0; j < 16; j++)
+                yoyo_gamepads[p].buttons[j] =
+                    (double)update_button(raw[j], (int)yoyo_gamepads[p].buttons[j]);
+            for (int a = 0; a < 4; a++)
+                yoyo_gamepads[p].axis[a] = 0.0;
+        }
+    } else
+#endif
     for (int i = 0; i < ARRAY_SIZE(sdl_controllers); i++) {
         controller_t *controller = &sdl_controllers[i];
         int slot = controller->slot;
