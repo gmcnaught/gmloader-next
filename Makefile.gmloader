@@ -41,12 +41,38 @@ ifeq ($(DEVICE_ARCH), armhf)
 # -mtune only affects scheduling (no ISA/ABI change), so it is safe tree-wide.
 CFLAGS   += -mtune=cortex-a9
 CXXFLAGS += -mtune=cortex-a9
+# .ARM.exidx unwind tables so the SIGABRT/SIGSEGV crash handler's backtrace()
+# can walk through C frames too (C++ gets them anyway via exceptions). Costs
+# binary size only — no codegen change on the hot paths.
+CFLAGS   += -funwind-tables
+CXXFLAGS += -funwind-tables
+
+# Opt-in AddressSanitizer build (ASAN=1) for hunting the intermittent glibc
+# heap corruption. -static-libasan because the MiSTer rootfs has no libasan.so.
+# The game's own libyoyo.so is NOT instrumented (gmloader hand-loads it), so an
+# out-of-bounds write from game code is caught at free/realloc via redzone
+# checks rather than at the store; a bad write from gmloader's own code IS
+# trapped exactly where it happens. Requires a full rebuild — the flags change
+# codegen, and make will not rebuild unchanged sources on its own.
+ifeq ($(ASAN),1)
+ASAN_FLAGS := -fsanitize=address -fno-omit-frame-pointer -static-libasan
+CFLAGS   += $(ASAN_FLAGS)
+CXXFLAGS += $(ASAN_FLAGS)
+# NOTE: LDFLAGS is assigned with := further down, so the link-side flags are
+# appended AFTER that assignment (see the second ASAN block) — appending here
+# would be silently wiped.
+endif
 # Enable NEON only for the software blitter's rasterizer, so its vectorized inner
 # loop is active without changing the ISA for the rest of the tree (loader
 # trampolines / thunks).
 build/${ARCH}/gmloader/mister/blitter_raster.cpp.o: CXXFLAGS += -march=armv7-a -mfpu=neon-vfpv3
 endif
 LDFLAGS:=${OPTM} -Wl,--gc-sections -Wl,--defsym,BUILD_DATE_$(BUILD_DATE)=0 -Wl,--defsym,GIT_HASH_$(GITHUB_SHA)=0 -Wl,--defsym,GIT_BRANCH_$(GIT_BRANCH_FRIENDLY)=0
+# ASAN link flags — must come after the := above (see the ASAN block near the
+# compile flags). --gc-sections is kept; libasan is linked statically.
+ifeq ($(ASAN),1)
+LDFLAGS += $(ASAN_FLAGS)
+endif
 
 # General pre-processing flags
 LLVM_FILE?=
@@ -194,3 +220,13 @@ blitter-appsurf-test:
 	  gmloader/configuration.cpp \
 	  $(MFGPU_SRC) \
 	  -lm -o /tmp/bat && /tmp/bat
+.PHONY: strl-test
+# Host-native test for the bionic strlcpy/strlcat thunks. Links the REAL
+# stdio.cpp (ABI_ATTR is empty off-ARM) so it exercises shipped code, and uses
+# canary bytes to catch writes past the destination buffer.
+strl-test:
+	c++ -std=c++17 -O0 -g -I. -Iloader -Ithunks -Ithunks/libc -Ijni \
+	  -I3rdparty/libbsd/include -I3rdparty/libbsd-config -I3rdparty/libbsd/include/bsd \
+	  -DLIBBSD_OVERLAY -DLIBBSD_DISABLE_DEPRECATED -D__REENTRANT \
+	  thunks/libc/stdio.cpp tests/strl_test.cpp \
+	  -o /tmp/strl && /tmp/strl

@@ -5,6 +5,10 @@
 #include <signal.h>
 #include <unistd.h>
 #include <zip.h>
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #include "platform.h"
 #include "so_util.h"
@@ -80,6 +84,47 @@ so_module *libyoyo = NULL;
 
 int RunnerJNILib_MoveTaskToBackCalled = 0;
 
+/* The GameMaker runner assembles "<save_dir><filename>" into a fixed ~34-byte
+ * heap buffer. It is compiled with _FORTIFY_SOURCE, so it passes that size to
+ * __strcpy_chk — but gmloader's fortify layer stubs the bounds check out
+ * (thunks/libc/fortify.cpp: __check_buffer_access / __fortify_fatal are no-ops),
+ * so the copy runs unbounded and silently smashes the next heap chunk. That is
+ * the corruption behind the intermittent glibc "malloc(): invalid size" abort.
+ *
+ * Measured on device with ASan: a 3-char save path is clean and reaches the
+ * render loop; 14, 19, 32 and 60 chars all overflow. A real save directory
+ * cannot be that short ("/media/fat/" is 11 before you name anything), so hand
+ * the runner a short SYMLINK and leave the actual data where it belongs.
+ *
+ * The link lives on the RAM-overlay rootfs, so it is (re)created every launch.
+ * Any failure is non-fatal: fall back to the real path and warn. */
+static const char *kSaveDirAlias  = "/s";
+static const size_t kSaveDirMaxLen = 8;   /* conservative: 14 already overflows */
+
+static fs::path alias_save_dir(const fs::path &save_dir)
+{
+    /* save_dir is built with a trailing separator (`/ ""`); symlink() wants the
+     * directory itself. */
+    fs::path target = save_dir;
+    if (target.filename().empty()) target = target.parent_path();
+
+    struct stat st;
+    if (lstat(kSaveDirAlias, &st) == 0 && !S_ISLNK(st.st_mode)) {
+        warning("save_dir: %s exists and is not a symlink; using the long path "
+                "(the runner may overflow its path buffer)\n", kSaveDirAlias);
+        return save_dir;
+    }
+    unlink(kSaveDirAlias);   /* stale link from a previous run; ENOENT is fine */
+    if (symlink(target.c_str(), kSaveDirAlias) != 0) {
+        warning("save_dir: could not link %s -> %s (%s); using the long path\n",
+                kSaveDirAlias, target.c_str(), strerror(errno));
+        return save_dir;
+    }
+    warning("save_dir: %s -> %s (short path for the runner's fixed path buffer)\n",
+            kSaveDirAlias, target.c_str());
+    return fs::path(kSaveDirAlias) / "";   /* keep the trailing-separator convention */
+}
+
 static fs::path get_absolute_path(const char* path, fs::path work_dir){
 
     fs::path fs_path = fs::path(path);
@@ -91,13 +136,106 @@ static fs::path get_absolute_path(const char* path, fs::path work_dir){
     return fs_path;
 }
 
+/* PIE load base, cached at startup. The engine is deliberately NOT linked
+ * -rdynamic (exporting every symbol would let the executable interpose over the
+ * dlopen'd Mesa/GLES libs), so backtrace_symbols_fd prints bare addresses.
+ * Resolve them offline against the unstripped ELF:
+ *     arm-linux-gnueabihf-addr2line -f -C -e gmloadernext.armhf <addr - base>  */
+static void *g_exe_base = NULL;
+static uintptr_t g_text_lo = 0, g_text_hi = 0;   /* our own executable text range */
+
+/* Cache the main executable's text range from /proc/self/maps. Done at startup
+ * (where allocating and using stdio is safe), used by the signal handler. */
+static void cache_text_range(void)
+{
+    char exe[512];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return;
+    exe[n] = '\0';
+
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    char line[600];
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long lo, hi;
+        char perms[8], path[512];
+        path[0] = '\0';
+        if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %511[^\n]", &lo, &hi, perms, path) < 3) continue;
+        if (perms[2] != 'x') continue;
+        char *p = path;
+        while (*p == ' ') p++;
+        if (strcmp(p, exe) != 0) continue;
+        if (!g_text_lo || lo < g_text_lo) g_text_lo = (uintptr_t)lo;
+        if ((uintptr_t)hi > g_text_hi)    g_text_hi = (uintptr_t)hi;
+    }
+    fclose(f);
+}
+
+/* Async-signal-safe: backtrace_symbols_fd does not allocate, and backtrace()
+ * itself is pre-warmed in main() so it never has to dlopen/malloc here — which
+ * matters because the case we are chasing reaches this path with a corrupt heap. */
+static void crash_backtrace(void)
+{
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    static const char hdr[] = "  --- backtrace (exe frames: addr2line on exe+0x...) ---\n";
+    (void)!write(STDERR_FILENO, hdr, sizeof(hdr) - 1);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+}
+
+/* glibc has no .ARM.exidx unwind tables, so backtrace() stops dead at the first
+ * libc frame. A heap abort is raised from inside malloc/free, so the unwound
+ * trace shows ONLY libc — never the engine code that owns the bad chunk, which
+ * is the entire thing we need. Scanning the stack for words pointing into our
+ * own text recovers those frames. It is heuristic: stale slots yield false
+ * positives, so read the list as candidates, newest (lowest sp) first. */
+static void crash_stack_scan(uintptr_t sp)
+{
+    static const char hdr[] = "  --- stack scan: candidate exe return addrs (heuristic) ---\n";
+    (void)!write(STDERR_FILENO, hdr, sizeof(hdr) - 1);
+    if (!g_text_lo || !sp) return;
+
+    const uintptr_t *p = (const uintptr_t *)(sp & ~(uintptr_t)3);
+    char buf[128];
+    int printed = 0;
+    /* 2048 words = 8 KB upward (toward older frames); the main stack is far
+     * larger, so this stays inside the mapping. */
+    for (int i = 0; i < 2048 && printed < 40; i++) {
+        uintptr_t v = p[i];
+        if (v < g_text_lo || v >= g_text_hi) continue;
+        int len = snprintf(buf, sizeof(buf), "    [sp+%04x] exe+0x%lx\n",
+                           (unsigned)(i * 4),
+                           (unsigned long)(v - (uintptr_t)g_exe_base));
+        if (len > 0) (void)!write(STDERR_FILENO, buf, (size_t)len);
+        printed++;
+    }
+}
+
+/* Deliberate heap overflow, then free — reproduces the exact topology of the
+ * bug we are hunting (glibc aborts from inside free(), called by engine code)
+ * so the handler can be proven to surface the engine frame. */
+static __attribute__((noinline)) void selftest_heap_corrupt(void)
+{
+    unsigned char *p = (unsigned char *)malloc(64);
+    volatile unsigned char *q = p;
+    for (int i = 0; i < 96; i++) q[i] = 0xAB;   /* overflow past the chunk */
+    free(p);
+}
+
 static void crash_handler(int sig, siginfo_t *info, void *ctx)
 {
+    /* One-shot: if dumping state itself faults, die rather than loop. */
+    static volatile sig_atomic_t in_handler = 0;
+    if (in_handler) { signal(sig, SIG_DFL); raise(sig); return; }
+    in_handler = 1;
+
     ucontext_t *uc = (ucontext_t *)ctx;
     uintptr_t fault_addr = (uintptr_t)info->si_addr;
     const char *name = sig == SIGSEGV ? "SIGSEGV" :
                        sig == SIGILL  ? "SIGILL"  :
-                       sig == SIGBUS  ? "SIGBUS"  : "SIGNAL";
+                       sig == SIGBUS  ? "SIGBUS"  :
+                       sig == SIGABRT ? "SIGABRT" :
+                       sig == SIGFPE  ? "SIGFPE"  : "SIGNAL";
 #if defined(__arm__)
     uintptr_t pc = uc->uc_mcontext.arm_pc;
     uintptr_t lr = uc->uc_mcontext.arm_lr;
@@ -117,18 +255,48 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx)
 #else
     fprintf(stderr, "%s: fault_addr=%p\n", name, (void*)fault_addr);
 #endif
+    fprintf(stderr, "  exe_load_base=%p text=[%08lx,%08lx)\n", g_exe_base,
+            (unsigned long)g_text_lo, (unsigned long)g_text_hi);
+    fflush(stderr);
+    crash_backtrace();
+#if defined(__arm__)
+    crash_stack_scan(uc->uc_mcontext.arm_sp);
+#endif
     signal(sig, SIG_DFL);
     raise(sig);
 }
 
 int main(int argc, char *argv[])
 {
+    // Pre-warm the unwinder and cache the PIE load base BEFORE anything can
+    // crash. backtrace() lazily dlopen()s libgcc's unwinder and allocates on
+    // first use — exactly what we cannot afford inside a heap-corruption abort,
+    // which is the case this handler exists to capture.
+    {
+        void *warm[4];
+        (void)backtrace(warm, 4);
+        Dl_info di;
+        if (dladdr((void *)&crash_handler, &di)) g_exe_base = di.dli_fbase;
+        cache_text_range();
+    }
+
     struct sigaction sa = {};
     sa.sa_sigaction = crash_handler;
     sa.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+    // SIGABRT is what glibc raises from malloc_printerr ("malloc(): invalid
+    // size", "corrupted double-linked list"). Without it a heap abort took the
+    // default action and died with no diagnostic at all.
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+
+    // Verification hook: forces the exact failure mode we are trying to capture,
+    // so the handler can be proven end-to-end instead of first being exercised
+    // by a real, intermittent crash.
+    if (getenv("GMLOADER_SELFTEST_ABORT")) abort();
+    if (getenv("GMLOADER_SELFTEST_HEAP")) selftest_heap_corrupt();
 
     // Store the program name from argv[0]
     if (argc > 0 && argv[0]) {
@@ -196,6 +364,11 @@ int main(int argc, char *argv[])
     }
 
     save_dir = get_absolute_path(gmloader_config.save_dir.c_str(), work_dir) / "";
+    /* Keep the path the runner sees inside its fixed buffer (see alias_save_dir).
+     * Everything downstream uses the alias, which resolves to the same directory,
+     * so saves still land in the configured location. */
+    if (strlen(save_dir.c_str()) > kSaveDirMaxLen)
+        save_dir = alias_save_dir(save_dir);
     apk_path = get_absolute_path(gmloader_config.apk_path.c_str(), work_dir);
 
     int err;
