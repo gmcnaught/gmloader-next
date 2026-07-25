@@ -109,12 +109,28 @@ static fs::path alias_save_dir(const fs::path &save_dir)
     if (target.filename().empty()) target = target.parent_path();
 
     struct stat st;
-    if (lstat(kSaveDirAlias, &st) == 0 && !S_ISLNK(st.st_mode)) {
-        warning("save_dir: %s exists and is not a symlink; using the long path "
-                "(the runner may overflow its path buffer)\n", kSaveDirAlias);
-        return save_dir;
+    if (lstat(kSaveDirAlias, &st) == 0) {
+        if (!S_ISLNK(st.st_mode)) {
+            warning("save_dir: %s exists and is not a symlink; using the long path "
+                    "(the runner may overflow its path buffer)\n", kSaveDirAlias);
+            return save_dir;
+        }
+        /* An existing link that already points where we want is the common case
+         * on MiSTer, where / is mounted READ-ONLY: unlink() and symlink() both
+         * fail there, so recreating it unconditionally made this fall back to
+         * the long path — silently reinstating the heap corruption this alias
+         * exists to prevent. Reuse it instead. */
+        char cur[512];
+        ssize_t n = readlink(kSaveDirAlias, cur, sizeof(cur) - 1);
+        if (n > 0) {
+            cur[n] = '\0';
+            if (!strcmp(cur, target.c_str())) {
+                warning("save_dir: reusing existing %s -> %s\n", kSaveDirAlias, cur);
+                return fs::path(kSaveDirAlias) / "";
+            }
+        }
     }
-    unlink(kSaveDirAlias);   /* stale link from a previous run; ENOENT is fine */
+    unlink(kSaveDirAlias);   /* stale link pointing elsewhere; ENOENT is fine */
     if (symlink(target.c_str(), kSaveDirAlias) != 0) {
         warning("save_dir: could not link %s -> %s (%s); using the long path\n",
                 kSaveDirAlias, target.c_str(), strerror(errno));
