@@ -138,6 +138,7 @@ static bool     g_frame_dropped    = false;  // this frame is being dropped (emi
 static uint32_t g_drop_count       = 0;      // frames dropped since reinit (test hook)
 static int      g_test_fabric_busy = -1;     // host tests force the predicate (-1 = ask for real)
 static uint32_t g_drop_run         = 0;      // consecutive drops (bounded by MF_DROP_LIMIT)
+static int      g_last_trilist_blend = -1;   // blend mode of the last TRILIST emitted (test hook)
 // Default ~1s at 60Hz: long enough that a short stall is covered by dropping rather than
 // stomping, short enough that a fabric which never acks costs a second of black instead of a
 // permanent freeze. Overridable with GMLOADER_MFGPU_DROP_LIMIT because the right value is an
@@ -332,6 +333,29 @@ static int mf_nowait_on(void) {
     if (v < 0) { const char *e = getenv("GMLOADER_MFSUBMIT_NOWAIT"); v = (e && *e) ? 1 : 0; }
     return v;
 }
+// How long to sleep between C_DONE polls once the initial spin is exhausted, in
+// microseconds (GMLOADER_MFGPU_POLL_US; 0 = pure spin, the default).
+//
+// MEASURED, DEFAULT DELIBERATELY OFF: the pure spin issues ~25000 UNCACHED C_DONE reads
+// per frame for the whole ~30ms the fabric works, so this looked like free DDR bandwidth
+// to hand back. A/B on device (120s per arm, same RBF/scene) says it is not:
+//   poll_us=0   ~25000 polls/frame  fabric frame ~30.6ms  timeouts 44 reclaims 38
+//   poll_us=250  ~2095 polls/frame  fabric frame ~32.6ms  timeouts 58 reclaims 50
+// A 12x cut in poll traffic bought no fabric speedup and no fewer stalls (both arms sit
+// inside scene-to-scene variation), so host poll pressure is NOT what the fabric is
+// waiting on. Kept as a knob because it does idle a core that otherwise spins at 100%,
+// which is worth re-testing against the frame-1 wedge rate if that turns out to be
+// thermal — the HPS shares a die with the fabric.
+enum { MF_POLL_SPIN_ITERS = 2000, MF_POLL_US_DEFAULT = 0 };
+static long mf_poll_us(void) {
+    static long v = -1;
+    if (v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_POLL_US");
+        v = (e && *e) ? atol(e) : (long)MF_POLL_US_DEFAULT;
+        if (v < 0) v = 0;
+    }
+    return v;
+}
 // Doorbell->C_DONE wait budget, overridable with GMLOADER_MFGPU_TIMEOUT_MS (default
 // MF_DEV_DONE_TIMEOUT_MS). Giving up on the wait has the SAME hazard NOWAIT documents
 // above: the next frame re-emits the in-place DDR ring / vertex buffer / texture heap
@@ -393,12 +417,24 @@ static void mf_device_submit(void) {
     struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     if (mf_nowait_on()) { mf_submit_stat(&t0, 0, /*timeout=*/0); return; }  // probe: no poll
     long iters = 0;
+    const long poll_us = mf_poll_us();
     for (;;) {
         if (mf_ctrl_rd(MF_C_DONE) == g_e.submit_seq) {   // fabric consumed it
             mf_submit_stat(&t0, iters, /*timeout=*/0);
             return;
         }
         iters++;
+        // Back off instead of spinning. A pure spin issued 24k-43k UNCACHED C_DONE reads
+        // per frame (measured on device) for the whole ~30ms the fabric was working —
+        // roughly a million a second, all of them full round trips through the same DDR
+        // controller the fabric fetches commands, vertices and textures through. The CPU
+        // freed is not the point (this path is blocking either way): the point is handing
+        // that memory bandwidth back to the fabric. Sleeping costs at most poll_us of
+        // extra latency on a ~30ms frame. poll_us=0 restores the old pure spin for A/B.
+        if (poll_us > 0 && iters > MF_POLL_SPIN_ITERS) {
+            struct timespec ts = { 0, poll_us * 1000L };
+            nanosleep(&ts, NULL);
+        }
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         long ms = (now.tv_sec - t0.tv_sec) * 1000L + (now.tv_nsec - t0.tv_nsec) / 1000000L;
         if (ms >= mf_timeout_ms()) {
@@ -830,8 +866,27 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         colorkey = MF_COLORKEY;
     } else {
         blend_mode = rblend_to_blt(bl);
+        // A fully-opaque ALPHA draw over a source with no per-texel alpha IS a copy, and
+        // the difference is not free on the fabric. BLT_BLEND_CONST_ALPHA sets the RTL's
+        // tri_need_dst, which inserts the B_DSTW/B_DSTC comp_fbram read into EVERY pixel's
+        // walk (8 states per pixel instead of 6); BLT_BLEND_COPY skips it. With cmd.alpha
+        // 255 and every vertex alpha at 1.0 the blend reduces to out = src exactly, so the
+        // output is bit-identical either way -- this only stops paying for the read.
+        //
+        // Safe by the same reasoning as the has_key branch above: !has_key means the staged
+        // region contained no colorkey sentinel, i.e. no transparent texels (mf_texel565
+        // maps transparency onto MF_COLORKEY and sets has_key), and a triangle list has no
+        // per-texel alpha channel at all (see the note at the top of this file). So an
+        // opaque, un-keyed ALPHA draw has nothing to blend against.
+        //
+        // Worth real time here: the measured frame graph is THREE full-screen 320x240 ALPHA
+        // draws every frame (two app-surface composites plus the border) = 230400 pixels,
+        // each of which was paying for a destination read it could not use.
+        if (blend_mode == BLT_BLEND_CONST_ALPHA && min_vtx_a * 255.0f >= 254.0f)
+            blend_mode = BLT_BLEND_COPY;
         colorkey = 0;
     }
+    g_last_trilist_blend = blend_mode;   // host-test hook (opaque-ALPHA -> COPY promotion)
     if (blt_trilist(&g_e, tex, blend_mode, colorkey, /*alpha=*/255,
                     eoff, nt, extra_flags) != 0)
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", nt);
@@ -1232,6 +1287,9 @@ extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy) {
     if (busy > 0) { g_fabric_pending = true; g_pending_seq = g_e.submit_seq; }
 }
 extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void) { return g_drop_count; }
+// Blend mode the last TRILIST went out with, so a test can pin the opaque-ALPHA -> COPY
+// promotion (and, just as importantly, that a NON-opaque draw is left alone).
+extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void) { return g_last_trilist_blend; }
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_inited = false; g_frame_active = false;
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap

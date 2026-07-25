@@ -110,6 +110,7 @@ struct cfg {
     int    upload;      /* texture pages re-written ARM->DDR per frame (host bus traffic) */
     int    tex_kb;      /* size of each staged texture page                            */
     int    appsurf;     /* 1 = render to APPSURF then sample it back (real frame graph) */
+    int    cblend;      /* composite blend: 0 = COPY, 1 = CONST_ALPHA (costs a dst read) */
     double rate_hz;     /* submit pacing; 0 = as fast as the fabric will ack            */
     double stall_ms;    /* latency above this counts as a stall episode                 */
     double giveup_ms;   /* abandon a wait after this (report, never re-emit under it)   */
@@ -128,6 +129,10 @@ static void usage(const char *me) {
       "                 the fabric reads through, and is absent from a stage-only soak.\n"
       "  --tex-kb=N     KiB per staged texture page (default 32)\n"
       "  --appsurf=0|1  emit the real two-target frame graph (default 1)\n"
+      "  --cblend=0|1   full-screen composite blend: 0=COPY (default), 1=CONST_ALPHA.\n"
+      "                 ALPHA sets the RTL's tri_need_dst, inserting a comp_fbram read\n"
+      "                 into every pixel's walk. Diffing the two arms measures what that\n"
+      "                 read actually costs, on identical geometry with no game variance.\n"
       "  --rate=HZ      submit pacing (default 60; 0 = unpaced)\n"
       "  --stall-ms=N   latency above this counts as a stall (default 250)\n"
       "  --giveup-ms=N  abandon one wait after this many ms (default 30000)\n"
@@ -228,8 +233,9 @@ static int build_frame(blt_emitter_t *e, const struct cfg *c,
             uint32_t off = blt_push_tris(e, q, 2);
             if (off == 0xFFFFFFFFu) return -1;
             /* tex fields are ignored under BLT_F_SRC_SURFACE (blt_emitter.h) */
-            if (blt_trilist(e, texs[0], BLT_BLEND_COPY, 0, 255, off, 2,
-                            BLT_F_SRC_SURFACE) != 0) return -1;
+            if (blt_trilist(e, texs[0],
+                            c->cblend ? BLT_BLEND_CONST_ALPHA : BLT_BLEND_COPY,
+                            0, 255, off, 2, BLT_F_SRC_SURFACE) != 0) return -1;
         }
     }
 
@@ -239,7 +245,7 @@ static int build_frame(blt_emitter_t *e, const struct cfg *c,
 
 int main(int argc, char **argv) {
     struct cfg c = { .secs = 60, .tris = 322, .draws = 10, .stage = 24, .upload = 0, .tex_kb = 32,
-                     .appsurf = 1, .rate_hz = 60.0, .stall_ms = 250.0, .giveup_ms = 30000.0 };
+                     .appsurf = 1, .cblend = 0, .rate_hz = 60.0, .stall_ms = 250.0, .giveup_ms = 30000.0 };
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
@@ -250,6 +256,7 @@ int main(int argc, char **argv) {
         if (arg_int(a, "--upload=", &c.upload)  ) continue;
         if (arg_int(a, "--tex-kb=", &c.tex_kb)  ) continue;
         if (arg_int(a, "--appsurf=", &c.appsurf)) continue;
+        if (arg_int(a, "--cblend=", &c.cblend)  ) continue;
         if (arg_dbl(a, "--rate=", &c.rate_hz)   ) continue;
         if (arg_dbl(a, "--stall-ms=", &c.stall_ms)) continue;
         if (arg_dbl(a, "--giveup-ms=", &c.giveup_ms)) continue;
@@ -295,9 +302,9 @@ int main(int argc, char **argv) {
     free(px);
 
     printf("fabric_soak: tris=%d draws=%d stage=%d upload=%d tex=%dx%d(%dKiB) appsurf=%d "
-           "rate=%.0fHz secs=%d stall_ms=%.0f\n",
-           c.tris, c.draws, c.stage, c.upload, tex_w, tex_h, c.tex_kb, c.appsurf, c.rate_hz,
-           c.secs, c.stall_ms);
+           "cblend=%s rate=%.0fHz secs=%d stall_ms=%.0f\n",
+           c.tris, c.draws, c.stage, c.upload, tex_w, tex_h, c.tex_kb, c.appsurf,
+           c.cblend ? "ALPHA" : "COPY", c.rate_hz, c.secs, c.stall_ms);
     printf("fabric_soak: NOTE this harness never re-emits under an unacked batch — every\n"
            "             number below is the fabric's own behaviour, not host corruption.\n");
 
@@ -442,9 +449,9 @@ int main(int argc, char **argv) {
                                  : "scanout kept running (blitter slow, not parked)");
 
     /* one machine-comparable line: diff this between RBFs or knob settings */
-    printf("SOAK tris=%d stage=%d upload=%d appsurf=%d rate=%.0f | frames=%u stalls=%u "
+    printf("SOAK tris=%d stage=%d upload=%d appsurf=%d cblend=%d rate=%.0f | frames=%u stalls=%u "
            "stalled_pct=%.1f max_ms=%.0f p99_ms=%.1f wd=%u giveups=%u scan_frozen=%d\n",
-           c.tris, c.stage, c.upload, c.appsurf, c.rate_hz, frames, stalls,
+           c.tris, c.stage, c.upload, c.appsurf, c.cblend, c.rate_hz, frames, stalls,
            elapsed > 0 ? 100.0 * (stalled_ms_total / 1000.0) / elapsed : 0.0,
            maxl, p99, wd_fires, giveups, worst_scan_frozen ? 1 : 0);
 

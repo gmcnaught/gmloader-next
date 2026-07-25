@@ -54,6 +54,8 @@ extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes);
 // read how many whole frames the guard has dropped since reinit.
 extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy);
 extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void);
+// blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
+extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
 
 extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
 
@@ -1316,6 +1318,49 @@ static int case_inflight_drop_limit(void) {
     return 1;
 }
 
+// [opaque-ALPHA -> COPY] A fully-opaque ALPHA draw over a source with no per-texel alpha is
+// a copy, but BLT_BLEND_CONST_ALPHA makes the RTL read the destination for every pixel
+// (tri_need_dst -> B_DSTW/B_DSTC, 8 states per pixel instead of 6). The measured device frame
+// graph is three full-screen 320x240 ALPHA draws per frame, so that read was being paid for
+// 230400 pixels that could not use it. This pins BOTH directions: opaque un-keyed ALPHA is
+// promoted to COPY, and a NON-opaque draw is left alone. The parity battery above separately
+// proves the promotion is output-identical (it compares against the SW oracle per pixel).
+static int case_opaque_alpha_to_copy(void) {
+    static uint8_t opaque[4*4*4];               // fully opaque, no colorkey texels
+    for (int i = 0; i < 4*4; i++) { opaque[i*4+0]=200; opaque[i*4+1]=180; opaque[i*4+2]=60; opaque[i*4+3]=255; }
+    RTexture t = { opaque, 4, 4, 4, 4, 0, 1 };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_TestReinit(0);
+
+    BVtx solid[3] = { {2,2,0,0,1,1,1,1}, {40,4,1,0,1,1,1,1}, {4,40,0,1,1,1,1,1} };
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, solid, 1, &t, RB_ALPHA, 1.0f, next_key());
+    backend_mfgpu.present(&s_mf);
+    int b_opaque = RasterBackend_MFGPU_TestLastTrilistBlend();
+
+    BVtx faded[3] = { {2,2,0,0,1,1,1,0.5f}, {40,4,1,0,1,1,1,0.5f}, {4,40,0,1,1,1,1,0.5f} };
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, faded, 1, &t, RB_ALPHA, 1.0f, next_key());
+    backend_mfgpu.present(&s_mf);
+    int b_faded = RasterBackend_MFGPU_TestLastTrilistBlend();
+
+    if (b_opaque != BLT_BLEND_COPY) {
+        printf("  FAIL opaque-alpha-copy  opaque ALPHA draw emitted blend=%d, expected COPY(%d)\n",
+               b_opaque, BLT_BLEND_COPY);
+        return 0;
+    }
+    if (b_faded != BLT_BLEND_CONST_ALPHA) {
+        printf("  FAIL opaque-alpha-copy  half-alpha draw emitted blend=%d, expected CONST_ALPHA(%d) "
+               "-- promotion must not fire when there is something to blend\n",
+               b_faded, BLT_BLEND_CONST_ALPHA);
+        return 0;
+    }
+    printf("  OK   opaque-alpha-copy  opaque->COPY, translucent->CONST_ALPHA\n");
+    return 1;
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -1366,5 +1411,7 @@ int main(void){
     else printf("raster_backend mfgpu-inflight-drop OK\n");
     if (!case_inflight_drop_limit()) { printf("FAIL mfgpu-inflight-drop-limit\n"); ok = 0; }
     else printf("raster_backend mfgpu-inflight-drop-limit OK\n");
+    if (!case_opaque_alpha_to_copy()) { printf("FAIL mfgpu-opaque-alpha-copy\n"); ok = 0; }
+    else printf("raster_backend mfgpu-opaque-alpha-copy OK\n");
     return ok ? 0 : 1;
 }
