@@ -267,14 +267,18 @@ ABI_ATTR char *__strncat_chk_impl(char *s1, const char *s2, size_t n, size_t s1l
 ABI_ATTR size_t strlcat_impl(char * dst, const char * src, size_t maxlen) {
     const size_t srclen = strlen(src);
     const size_t dstlen = strnlen(dst, maxlen);
-    if (dstlen == maxlen) return maxlen+srclen;
-    if (srclen < maxlen-dstlen) {
+    if (dstlen == maxlen) return maxlen+srclen;   /* dst not terminated within maxlen */
+    /* Space left in dst, INCLUDING the slot for the terminator. The truncation
+     * branch must be bounded by this, not by maxlen — bounding by maxlen wrote
+     * dstlen bytes past the end of the buffer (and put the NUL past that). */
+    const size_t avail = maxlen - dstlen;
+    if (srclen < avail) {
         memcpy(dst+dstlen, src, srclen+1);
     } else {
-        memcpy(dst+dstlen, src, maxlen-1);
-        dst[dstlen+maxlen-1] = '\0';
+        memcpy(dst+dstlen, src, avail-1);
+        dst[dstlen+avail-1] = '\0';
     }
-    return dstlen + srclen;
+    return dstlen + srclen;                        /* BSD: length it TRIED to build */
 }
 
 ABI_ATTR size_t strlcpy_impl(char * dst, const char * src, size_t maxlen) {
