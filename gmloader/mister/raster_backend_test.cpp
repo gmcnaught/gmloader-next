@@ -49,6 +49,11 @@ extern "C" void RasterBackend_MFGPU_SetAppSurface(uint32_t fbo, uint32_t tex);
 extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestStageCount(void);   // FO Task 3
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes);
+// in-flight-batch guard: force the "is the fabric still chewing on the last submit?"
+// predicate (-1 = ask for real; on a host build the real answer is always "no"), and
+// read how many whole frames the guard has dropped since reinit.
+extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy);
+extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void);
 
 extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
 
@@ -1183,6 +1188,86 @@ static int case_atlas_subregion_tile(void) {
     return 1;
 }
 
+// [in-flight-batch guard] The emitter builds the command ring, the vertex buffer and the
+// texture heap IN PLACE in the memory the fabric reads. On device the ONLY thing stopping the
+// host from overwriting a batch the fabric is still executing is the blocking C_DONE poll --
+// and its timeout abandons exactly that guarantee, after which the next frame's
+// blt_begin_frame(cmd_count=0, vtx_used=0) plus texture staging lands on top of the live batch.
+// Device-measured 2026-07-24: that is what escalated isolated fabric hiccups into 15s cascades
+// of garbage geometry. The guard drops WHOLE frames while a submit is unacked. This case locks
+// the invariant that a dropped frame touches NOTHING: no emit, no upload, no stage, no cursor
+// reset. It drives the real vtable (clear/draw/present) and asserts via the host oracle that
+// the previously executed frame's pixels survive the dropped frame untouched.
+static int case_inflight_drop(void) {
+    static const uint8_t red[4]  = { 255, 0, 0, 255 };
+    static const uint8_t blue[4] = { 0, 0, 255, 255 };
+    RTexture t_red  = { red,  1, 1, 1, 1, 0, 1 };
+    RTexture t_blue = { blue, 1, 1, 1, 1, 0, 1 };
+    // a fat triangle so the compared pixels sit comfortably inside it
+    BVtx v[3] = { {1,1,0,0,1,1,1,1}, {60,1,1,0,1,1,1,1}, {1,60,0,1,1,1,1,1} };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);   // real predicate (never busy off-device)
+
+    // frame A: executes normally -> the oracle FB holds the RED triangle
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, v, 1, &t_red, RB_NONE, 0.f, next_key());
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fbA[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbA);
+    const uint32_t up_after_A = RasterBackend_MFGPU_TestUploadCount();
+    const uint32_t st_after_A = RasterBackend_MFGPU_TestStageCount();
+    const uint32_t dr_after_A = RasterBackend_MFGPU_TestDropCount();
+
+    // frame B: the fabric has not acked -> must be dropped whole
+    RasterBackend_MFGPU_TestSetFabricBusy(1);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, next_key());
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fbB[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbB);
+
+    if (RasterBackend_MFGPU_TestDropCount() != dr_after_A + 1) {
+        printf("  FAIL inflight-drop  drop_count=%u want=%u (frame B was not dropped)\n",
+               RasterBackend_MFGPU_TestDropCount(), dr_after_A + 1);
+        return 0;
+    }
+    if (RasterBackend_MFGPU_TestUploadCount() != up_after_A ||
+        RasterBackend_MFGPU_TestStageCount()  != st_after_A) {
+        printf("  FAIL inflight-drop  dropped frame still touched the heap "
+               "(upload %u->%u, stage %u->%u)\n", up_after_A,
+               RasterBackend_MFGPU_TestUploadCount(), st_after_A,
+               RasterBackend_MFGPU_TestStageCount());
+        return 0;
+    }
+    if (memcmp(fbA, fbB, sizeof fbA) != 0) {
+        printf("  FAIL inflight-drop  dropped frame still executed (framebuffer changed)\n");
+        return 0;
+    }
+
+    // frame C: fabric acked -> normal service resumes and the BLUE triangle lands
+    RasterBackend_MFGPU_TestSetFabricBusy(0);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, next_key());
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fbC[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbC);
+    if (memcmp(fbA, fbC, sizeof fbA) == 0) {
+        printf("  FAIL inflight-drop  frame C did not execute (guard stuck on)\n");
+        return 0;
+    }
+    if (RasterBackend_MFGPU_TestDropCount() != dr_after_A + 1) {
+        printf("  FAIL inflight-drop  frame C was dropped too (drop_count=%u)\n",
+               RasterBackend_MFGPU_TestDropCount());
+        return 0;
+    }
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+    printf("  OK   inflight-drop  1 frame dropped intact, service resumed\n");
+    return 1;
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -1229,5 +1314,7 @@ int main(void){
     else printf("raster_backend mfgpu-composite-vflip OK\n");
     if (!case_atlas_subregion_tile()) { printf("FAIL mfgpu-atlas-subregion\n"); ok = 0; }
     else printf("raster_backend mfgpu-atlas-subregion OK\n");
+    if (!case_inflight_drop()) { printf("FAIL mfgpu-inflight-drop\n"); ok = 0; }
+    else printf("raster_backend mfgpu-inflight-drop OK\n");
     return ok ? 0 : 1;
 }

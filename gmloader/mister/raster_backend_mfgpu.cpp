@@ -132,6 +132,12 @@ static MfTexEntry g_texcache[MF_TEX_CACHE_N];
 static uint64_t   g_lru_clock   = 0;
 static uint32_t   g_upload_count = 0;   // real blt_upload calls since reinit (test hook)
 static uint32_t   g_stage_count  = 0;   // BLT_OP_STAGE emits since reinit (FO Task 3 test hook)
+static bool     g_fabric_pending   = false;  // a submitted batch has not been acked yet
+static uint32_t g_pending_seq      = 0;      // the submit_seq we are waiting on
+static bool     g_frame_dropped    = false;  // this frame is being dropped (emit nothing)
+static uint32_t g_drop_count       = 0;      // frames dropped since reinit (test hook)
+static int      g_test_fabric_busy = -1;     // host tests force the predicate (-1 = ask for real)
+
 static uint32_t   g_tex_heap_cap = 0;   // 0 => full MF_TEX_HEAP; else test override
 
 // Snapshot of g_lru_clock taken at the start of the current frame (see
@@ -307,6 +313,21 @@ static int mf_nowait_on(void) {
     if (v < 0) { const char *e = getenv("GMLOADER_MFSUBMIT_NOWAIT"); v = (e && *e) ? 1 : 0; }
     return v;
 }
+// Doorbell->C_DONE wait budget, overridable with GMLOADER_MFGPU_TIMEOUT_MS (default
+// MF_DEV_DONE_TIMEOUT_MS). Giving up on the wait has the SAME hazard NOWAIT documents
+// above: the next frame re-emits the in-place DDR ring / vertex buffer / texture heap
+// while the fabric is still reading them. This knob exists to measure how much of an
+// observed stall is a genuine fabric stall versus that re-emit corrupting the batch
+// in flight (raise it far above a stall to remove the host from the equation).
+static long mf_timeout_ms(void) {
+    static long v = -1;
+    if (v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_TIMEOUT_MS");
+        long n = (e && *e) ? atol(e) : 0;
+        v = (n > 0) ? n : (long)MF_DEV_DONE_TIMEOUT_MS;
+    }
+    return v;
+}
 // clk_sys = 98.4375 MHz (PLL outclk_0 / DDRAM_CLK). Fabric perf counters are in
 // clk_sys cycles: C_DONE high word = perf_frame_cyc (total fabric-busy: new-submit
 // detect → done write), C_STATUS high word = perf_pipe_cyc (composite pipeline busy).
@@ -361,10 +382,15 @@ static void mf_device_submit(void) {
         iters++;
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         long ms = (now.tv_sec - t0.tv_sec) * 1000L + (now.tv_nsec - t0.tv_nsec) / 1000000L;
-        if (ms >= MF_DEV_DONE_TIMEOUT_MS) {
-            fprintf(stderr, "backend_mfgpu: fabric submit timeout (submit=%u done=%u status=%u)\n",
-                    g_e.submit_seq, mf_ctrl_rd(MF_C_DONE), mf_ctrl_rd(MF_C_STATUS));
+        if (ms >= mf_timeout_ms()) {
+            fprintf(stderr, "backend_mfgpu: fabric submit timeout (submit=%u done=%u status=%u waited=%ldms)\n",
+                    g_e.submit_seq, mf_ctrl_rd(MF_C_DONE), mf_ctrl_rd(MF_C_STATUS), ms);
             mf_submit_stat(&t0, iters, /*timeout=*/1);
+            // [in-flight-batch guard] We are abandoning the wait, NOT the batch: the fabric
+            // is still reading this ring. Remember the sequence so the next frames drop
+            // whole rather than rebuilding the ring underneath it.
+            g_fabric_pending = true;
+            g_pending_seq    = g_e.submit_seq;
             return;
         }
     }
@@ -394,11 +420,48 @@ static void mf_init_once(void) {
 #endif
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
+    g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0;
     g_inited = true;
+}
+
+// [in-flight-batch guard] The emitter builds the command ring, the vertex buffer and the
+// texture heap IN PLACE in the DDR the fabric reads (mf_init_once binds g_dev_ring/g_dev_src).
+// The ONLY thing keeping the host from overwriting a batch the fabric is still executing is
+// the blocking C_DONE poll in mf_device_submit -- and its timeout abandons exactly that
+// guarantee. Device-measured 2026-07-24: with the stock 200ms budget a single stalled frame
+// produced ~78 timeouts, i.e. 78 successive frames that called blt_begin_frame (cmd_count=0,
+// vtx_used=0) and re-staged textures straight over the batch the fabric was mid-way through
+// reading. That is the mechanism behind the garbage geometry, "the game's stored tilemap
+// rendered directly", and the escalation of isolated hiccups into 15-second cascades.
+// (It is an AMPLIFIER, not the initiator: raising the budget to 5s left the underlying
+// ~18s fabric stalls intact, so the fabric-side bug is tracked separately.)
+// So: once a submit times out, drop WHOLE frames -- emit nothing, stage nothing, reset no
+// cursors -- until the fabric acks the sequence it is still working on.
+// Is the fabric still chewing on g_pending_seq? Only meaningful while g_fabric_pending.
+static bool mf_fabric_still_busy(void) {
+    if (g_test_fabric_busy >= 0) return g_test_fabric_busy != 0;
+#ifdef MISTER_NATIVE_VIDEO
+    if (g_dev_ok) return mf_ctrl_rd(MF_C_DONE) != g_pending_seq;
+#endif
+    return false;   // host oracle: blt_execute is synchronous, nothing is ever in flight
 }
 
 static void mf_frame_begin(void) {
     mf_init_once();
+    // [in-flight-batch guard] Decide BEFORE blt_begin_frame: it is the call that would
+    // rewind the cursors over a live batch.
+    if (g_fabric_pending) {
+        if (mf_fabric_still_busy()) {
+            g_frame_dropped = true;
+            g_frame_active  = true;   // so present() still closes the frame
+            if ((g_drop_count++ % 60u) == 0u)
+                fprintf(stderr, "backend_mfgpu: fabric still on seq=%u - frame dropped "
+                        "(ring left intact; %u dropped)\n", g_pending_seq, g_drop_count);
+            return;
+        }
+        g_fabric_pending = false;     // acked: the ring is ours again
+    }
+    g_frame_dropped = false;
     // Snapshot the pin floor for this frame: any g_texcache entry touched
     // (hit or staged) from here through mf_frame_end gets .lru > this value
     // and is thus protected from eviction until the NEXT frame begins (see
@@ -436,6 +499,7 @@ static void mf_select_target(uint32_t fbo) {
 
 static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     mf_ensure_frame();
+    if (g_frame_dropped) return;   // [in-flight-batch guard] emit nothing this frame
     mf_select_target(d->fbo);
     (void)a;   // fabric FILL writes opaque RGB565; no alpha channel on the wire
     int w = d->w < BLT_FB_WIDTH  ? d->w : BLT_FB_WIDTH;
@@ -803,6 +867,7 @@ static void mf_uvlog(const char *tag, const BVtx *v, int triCount, int tw, int t
 static void mf_draw(RSurface *d, const BVtx *v, int triCount,
                     const RTexture *t, RBlend bl, float ar, uint32_t tex_key) {
     mf_ensure_frame();
+    if (g_frame_dropped) return;   // [in-flight-batch guard] no emit, and no texture staging
     // [app-surface render target, step 1] d->fbo identifies the target FBO
     // (blitter.cpp's get_render_target); tex_key identifies the sampled GL
     // texture. Either can alias the detected application surface.
@@ -1051,6 +1116,10 @@ static void mf_present(const RSurface *) {
 }
 
 static void mf_frame_end(void) {
+    // [in-flight-batch guard] Nothing was emitted and the cursors were never rewound: the
+    // ring still holds the batch the fabric is reading. blt_end_frame would bump submit_seq
+    // and the doorbell would then ack a batch that was never rebuilt, so return before both.
+    if (g_frame_dropped) return;
     // [Task 9 bring-up diagnostic] Log BEFORE blt_end_frame touches anything --
     // g_lru_frame_floor (set in mf_frame_begin) still delimits exactly this
     // frame's pinned working set at this point.
@@ -1123,6 +1192,16 @@ extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba) {
 extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void) { return g_upload_count; }
 // FO Task 3 host hook: BLT_OP_STAGE emits since reinit (proves stage-once-per-page).
 extern "C" uint32_t RasterBackend_MFGPU_TestStageCount(void) { return g_stage_count; }
+// [in-flight-batch guard] host-test hooks: force the "fabric still busy" predicate
+// (-1 = ask for real) and read the dropped-frame tally.
+extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy) {
+    g_test_fabric_busy = busy;
+    // busy>0 simulates the whole device condition, not just the predicate: a submit that
+    // timed out and left a batch unacked. busy==0 deliberately LEAVES g_fabric_pending set,
+    // so the next frame exercises the "acked -> clear the flag and resume" branch.
+    if (busy > 0) { g_fabric_pending = true; g_pending_seq = g_e.submit_seq; }
+}
+extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void) { return g_drop_count; }
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_inited = false; g_frame_active = false;
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap
