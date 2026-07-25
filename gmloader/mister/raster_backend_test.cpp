@@ -49,6 +49,15 @@ extern "C" void RasterBackend_MFGPU_SetAppSurface(uint32_t fbo, uint32_t tex);
 extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestStageCount(void);   // FO Task 3
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes);
+// in-flight-batch guard: force the "is the fabric still chewing on the last submit?"
+// predicate (-1 = ask for real; on a host build the real answer is always "no"), and
+// read how many whole frames the guard has dropped since reinit.
+extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy);
+extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void);
+// blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
+extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestCrtStripped(void);
 
 extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
 
@@ -1183,6 +1192,416 @@ static int case_atlas_subregion_tile(void) {
     return 1;
 }
 
+// [in-flight-batch guard] The emitter builds the command ring, the vertex buffer and the
+// texture heap IN PLACE in the memory the fabric reads. On device the ONLY thing stopping the
+// host from overwriting a batch the fabric is still executing is the blocking C_DONE poll --
+// and its timeout abandons exactly that guarantee, after which the next frame's
+// blt_begin_frame(cmd_count=0, vtx_used=0) plus texture staging lands on top of the live batch.
+// Device-measured 2026-07-24: that is what escalated isolated fabric hiccups into 15s cascades
+// of garbage geometry. The guard drops WHOLE frames while a submit is unacked. This case locks
+// the invariant that a dropped frame touches NOTHING: no emit, no upload, no stage, no cursor
+// reset. It drives the real vtable (clear/draw/present) and asserts via the host oracle that
+// the previously executed frame's pixels survive the dropped frame untouched.
+static int case_inflight_drop(void) {
+    static const uint8_t red[4]  = { 255, 0, 0, 255 };
+    static const uint8_t blue[4] = { 0, 0, 255, 255 };
+    RTexture t_red  = { red,  1, 1, 1, 1, 0, 1 };
+    RTexture t_blue = { blue, 1, 1, 1, 1, 0, 1 };
+    // a fat triangle so the compared pixels sit comfortably inside it
+    BVtx v[3] = { {1,1,0,0,1,1,1,1}, {60,1,1,0,1,1,1,1}, {1,60,0,1,1,1,1,1} };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);   // real predicate (never busy off-device)
+
+    // frame A: executes normally -> the oracle FB holds the RED triangle
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, v, 1, &t_red, RB_NONE, 0.f, next_key());
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fbA[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbA);
+    const uint32_t up_after_A = RasterBackend_MFGPU_TestUploadCount();
+    const uint32_t st_after_A = RasterBackend_MFGPU_TestStageCount();
+    const uint32_t dr_after_A = RasterBackend_MFGPU_TestDropCount();
+
+    // frame B: the fabric has not acked -> must be dropped whole
+    RasterBackend_MFGPU_TestSetFabricBusy(1);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, next_key());
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fbB[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbB);
+
+    if (RasterBackend_MFGPU_TestDropCount() != dr_after_A + 1) {
+        printf("  FAIL inflight-drop  drop_count=%u want=%u (frame B was not dropped)\n",
+               RasterBackend_MFGPU_TestDropCount(), dr_after_A + 1);
+        return 0;
+    }
+    if (RasterBackend_MFGPU_TestUploadCount() != up_after_A ||
+        RasterBackend_MFGPU_TestStageCount()  != st_after_A) {
+        printf("  FAIL inflight-drop  dropped frame still touched the heap "
+               "(upload %u->%u, stage %u->%u)\n", up_after_A,
+               RasterBackend_MFGPU_TestUploadCount(), st_after_A,
+               RasterBackend_MFGPU_TestStageCount());
+        return 0;
+    }
+    if (memcmp(fbA, fbB, sizeof fbA) != 0) {
+        printf("  FAIL inflight-drop  dropped frame still executed (framebuffer changed)\n");
+        return 0;
+    }
+
+    // frame C: fabric acked -> normal service resumes and the BLUE triangle lands
+    RasterBackend_MFGPU_TestSetFabricBusy(0);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, next_key());
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fbC[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbC);
+    if (memcmp(fbA, fbC, sizeof fbA) == 0) {
+        printf("  FAIL inflight-drop  frame C did not execute (guard stuck on)\n");
+        return 0;
+    }
+    if (RasterBackend_MFGPU_TestDropCount() != dr_after_A + 1) {
+        printf("  FAIL inflight-drop  frame C was dropped too (drop_count=%u)\n",
+               RasterBackend_MFGPU_TestDropCount());
+        return 0;
+    }
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+    printf("  OK   inflight-drop  1 frame dropped intact, service resumed\n");
+    return 1;
+}
+
+// [in-flight-batch guard] The guard must never DEADLOCK. Device-observed 2026-07-24: the
+// fabric can wedge on seq=1 and never ack at all, at which point an unbounded guard drops
+// every frame forever and the game never renders — strictly worse than the corruption the
+// guard prevents. So after MF_DROP_LIMIT consecutive drops it reclaims the ring and rebuilds.
+// This case holds the predicate at "busy" indefinitely and asserts that service resumes anyway.
+static int case_inflight_drop_limit(void) {
+    static const uint8_t red[4]  = { 255, 0, 0, 255 };
+    static const uint8_t blue[4] = { 0, 0, 255, 255 };
+    RTexture t_red  = { red,  1, 1, 1, 1, 0, 1 };
+    RTexture t_blue = { blue, 1, 1, 1, 1, 0, 1 };
+    BVtx v[3] = { {1,1,0,0,1,1,1,1}, {60,1,1,0,1,1,1,1}, {1,60,0,1,1,1,1,1} };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, v, 1, &t_red, RB_NONE, 0.f, next_key());
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fbA[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbA);
+
+    // the fabric never acks -- hold "busy" for far longer than the limit
+    RasterBackend_MFGPU_TestSetFabricBusy(1);
+    int executed_at = -1;
+    static uint16_t fbN[BW*BH];
+    for (int f = 0; f < 200; f++) {
+        backend_mfgpu.clear(&s_mf, 0,0,0,255);
+        backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, next_key());
+        backend_mfgpu.present(&s_mf);
+        RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbN);
+        if (memcmp(fbA, fbN, sizeof fbA) != 0) { executed_at = f; break; }
+    }
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+    if (executed_at < 0) {
+        printf("  FAIL inflight-drop-limit  guard deadlocked: 200 frames dropped, none executed\n");
+        return 0;
+    }
+    if (executed_at < 30) {
+        printf("  FAIL inflight-drop-limit  gave up after only %d frames (limit is meant to be ~60)\n",
+               executed_at);
+        return 0;
+    }
+    printf("  OK   inflight-drop-limit  reclaimed the ring at frame %d (no deadlock)\n", executed_at);
+    return 1;
+}
+
+// [opaque-ALPHA -> COPY] A fully-opaque ALPHA draw over a source with no per-texel alpha is
+// a copy, but BLT_BLEND_CONST_ALPHA makes the RTL read the destination for every pixel
+// (tri_need_dst -> B_DSTW/B_DSTC, 8 states per pixel instead of 6). The measured device frame
+// graph is three full-screen 320x240 ALPHA draws per frame, so that read was being paid for
+// 230400 pixels that could not use it. This pins BOTH directions: opaque un-keyed ALPHA is
+// promoted to COPY, and a NON-opaque draw is left alone. The parity battery above separately
+// proves the promotion is output-identical (it compares against the SW oracle per pixel).
+static int case_opaque_alpha_to_copy(void) {
+    static uint8_t opaque[4*4*4];               // fully opaque, no colorkey texels
+    for (int i = 0; i < 4*4; i++) { opaque[i*4+0]=200; opaque[i*4+1]=180; opaque[i*4+2]=60; opaque[i*4+3]=255; }
+    RTexture t = { opaque, 4, 4, 4, 4, 0, 1 };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_TestReinit(0);
+
+    BVtx solid[3] = { {2,2,0,0,1,1,1,1}, {40,4,1,0,1,1,1,1}, {4,40,0,1,1,1,1,1} };
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, solid, 1, &t, RB_ALPHA, 1.0f, next_key());
+    backend_mfgpu.present(&s_mf);
+    int b_opaque = RasterBackend_MFGPU_TestLastTrilistBlend();
+
+    BVtx faded[3] = { {2,2,0,0,1,1,1,0.5f}, {40,4,1,0,1,1,1,0.5f}, {4,40,0,1,1,1,1,0.5f} };
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, faded, 1, &t, RB_ALPHA, 1.0f, next_key());
+    backend_mfgpu.present(&s_mf);
+    int b_faded = RasterBackend_MFGPU_TestLastTrilistBlend();
+
+    if (b_opaque != BLT_BLEND_COPY) {
+        printf("  FAIL opaque-alpha-copy  opaque ALPHA draw emitted blend=%d, expected COPY(%d)\n",
+               b_opaque, BLT_BLEND_COPY);
+        return 0;
+    }
+    if (b_faded != BLT_BLEND_CONST_ALPHA) {
+        printf("  FAIL opaque-alpha-copy  half-alpha draw emitted blend=%d, expected CONST_ALPHA(%d) "
+               "-- promotion must not fire when there is something to blend\n",
+               b_faded, BLT_BLEND_CONST_ALPHA);
+        return 0;
+    }
+    printf("  OK   opaque-alpha-copy  opaque->COPY, translucent->CONST_ALPHA\n");
+    return 1;
+}
+
+// [duplicate-draw elimination] The device frame graph draws the app-surface composite TWICE,
+// byte-identical, and each pass is 2 triangles that each walk the full-screen bounding box
+// (~16ms for the pair, measured in fabric_soak) -- so the repeat is ~8ms, about a quarter of
+// the frame. Skipping it needs no visual judgement: an OPAQUE draw goes out as COPY (or
+// COLORKEY), and re-running either over its own output lands on identical pixels. A
+// TRANSLUCENT draw composites, so a repeat genuinely darkens and must be kept. Both
+// directions are asserted here against the real pixels, not just the skip counter.
+static int case_dup_draw_elision(void) {
+    static const uint8_t opaque[4] = { 220, 40, 40, 255 };
+    RTexture t = { opaque, 1, 1, 1, 1, 0, 1 };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+
+    BVtx solid[3] = { {2,2,0,0,1,1,1,1}, {50,4,1,0,1,1,1,1}, {4,50,0,1,1,1,1,1} };
+    BVtx faded[3] = { {2,2,0,0,1,1,1,0.5f}, {50,4,1,0,1,1,1,0.5f}, {4,50,0,1,1,1,1,0.5f} };
+
+    // opaque drawn ONCE
+    RasterBackend_MFGPU_TestReinit(0);
+    const uint32_t k1 = next_key();
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, solid, 1, &t, RB_ALPHA, 0.0f, k1);   // 0.0f = the real call site's alphaRef
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fb_once[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb_once);
+
+    // opaque drawn TWICE: must elide the repeat and land on identical pixels
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, solid, 1, &t, RB_ALPHA, 0.0f, k1);   // 0.0f = the real call site's alphaRef
+    backend_mfgpu.draw(&s_mf, solid, 1, &t, RB_ALPHA, 0.0f, k1);   // 0.0f = the real call site's alphaRef
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fb_twice[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb_twice);
+    const uint32_t skipped_opaque = RasterBackend_MFGPU_TestDupSkipped();
+
+    if (skipped_opaque != 1) {
+        printf("  FAIL dup-draw  repeated opaque draw not elided (skipped=%u want 1)\n", skipped_opaque);
+        return 0;
+    }
+    if (memcmp(fb_once, fb_twice, sizeof fb_once) != 0) {
+        printf("  FAIL dup-draw  eliding changed the image\n");
+        return 0;
+    }
+
+    // translucent drawn TWICE: must NOT be elided, and must genuinely differ from once
+    RasterBackend_MFGPU_TestReinit(0);
+    const uint32_t k2 = next_key();
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, faded, 1, &t, RB_ALPHA, 0.0f, k2);
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fa_once[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fa_once);
+
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, faded, 1, &t, RB_ALPHA, 0.0f, k2);
+    backend_mfgpu.draw(&s_mf, faded, 1, &t, RB_ALPHA, 0.0f, k2);
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fa_twice[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fa_twice);
+
+    if (RasterBackend_MFGPU_TestDupSkipped() != 0) {
+        printf("  FAIL dup-draw  translucent repeat was elided (%u) - it composites, so it counts\n",
+               RasterBackend_MFGPU_TestDupSkipped());
+        return 0;
+    }
+    if (memcmp(fa_once, fa_twice, sizeof fa_once) == 0) {
+        printf("  FAIL dup-draw  translucent double-draw looks identical to a single one; "
+               "this case cannot tell elision from correctness\n");
+        return 0;
+    }
+    printf("  OK   dup-draw  opaque repeat elided (pixels identical), translucent repeat kept\n");
+    return 1;
+}
+
+// [strip in-game CRT simulation] obj_old_tv redraws the app surface over itself at ~70% alpha
+// to fake phosphor ghosting. We drop that: the display path already applies real CRT treatment,
+// so it is wasted fabric time AND double-applied. This case pins the rule and, more importantly,
+// pins its SAFETY CONDITION -- obj_fade_in/obj_fade_out legitimately draw the app surface
+// TRANSLUCENTLY over a cleared target, and swallowing that would blank the screen for the whole
+// transition. So a translucent app-surface pass is dropped ONLY once an opaque present of that
+// surface has already landed this frame.
+static int case_strip_crt_ghost(void) {
+    enum { W = 64, H = 48 };
+    const uint32_t APPSURF_FBO = 60, APPSURF_TEX = 61;
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+
+    // full-screen quad over the app surface; alpha filled in per-case
+    BVtx q[6] = {
+        {   0.f,   0.f, 0.f,1.f, 1,1,1,1 }, { (float)W,   0.f, 1.f,1.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,0.f, 1,1,1,1 },
+        {   0.f,   0.f, 0.f,1.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,0.f, 1,1,1,1 }, {   0.f,(float)H, 0.f,0.f, 1,1,1,1 },
+    };
+    static const uint8_t px[4] = { 200, 120, 40, 255 };
+    RTexture t = { px, 1, 1, 1, 1, 0, 1 };
+
+    // --- present (opaque) then ghost (translucent): the ghost must be dropped -------
+    RasterBackend_MFGPU_SetAppSurface(APPSURF_FBO, APPSURF_TEX);
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    for (int i = 0; i < 6; i++) q[i].a = 1.0f;
+    backend_mfgpu.draw(&s_mf, q, 2, &t, RB_ALPHA, 0.0f, APPSURF_TEX);   // present
+    for (int i = 0; i < 6; i++) q[i].a = 0.698f;
+    backend_mfgpu.draw(&s_mf, q, 2, &t, RB_ALPHA, 0.0f, APPSURF_TEX);   // obj_old_tv ghost
+    backend_mfgpu.present(&s_mf);
+    const uint32_t stripped = RasterBackend_MFGPU_TestCrtStripped();
+    if (stripped != 1) {
+        printf("  FAIL strip-crt  ghost pass not dropped (stripped=%u want 1)\n", stripped);
+        return 0;
+    }
+
+    // --- fade: translucent app-surface draw with NO preceding opaque present --------
+    // This is obj_fade_in's shape. It MUST survive, or transitions go black.
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    for (int i = 0; i < 6; i++) q[i].a = 0.35f;
+    backend_mfgpu.draw(&s_mf, q, 2, &t, RB_ALPHA, 0.0f, APPSURF_TEX);   // mid-fade
+    backend_mfgpu.present(&s_mf);
+    if (RasterBackend_MFGPU_TestCrtStripped() != 0) {
+        printf("  FAIL strip-crt  a FADE was swallowed (stripped=%u) - transitions would go black\n",
+               RasterBackend_MFGPU_TestCrtStripped());
+        return 0;
+    }
+    static uint16_t fb_fade[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb_fade);
+    bool any = false;
+    for (int i = 0; i < BW*BH; i++) if (fb_fade[i]) { any = true; break; }
+    if (!any) {
+        printf("  FAIL strip-crt  fade frame rendered empty - the fade draw did not survive\n");
+        return 0;
+    }
+
+    RasterBackend_MFGPU_SetAppSurface(0, 0);
+    printf("  OK   strip-crt  old-TV ghost dropped, fade-from-black preserved\n");
+    return 1;
+}
+
+// [strip in-game CRT simulation] obj_old_tv also draws a FULL-SCREEN tube/iris mask: a region
+// holding nothing but transparent and black, whose whole contribution is darkening the edges.
+// Device dumps show its frames are 100% black+colorkey with the black fraction animating
+// (4.7% -> 47.8%). We drop it -- that darkening is the display path's job here, and it costs a
+// full-screen pass. The SAFETY half is what this case really pins: plenty of ordinary art is
+// black + transparent (shadows, silhouettes), so only a FULL-SCREEN such overlay may be
+// dropped, and only once the image has already been presented.
+static int case_strip_crt_mask(void) {
+    const uint32_t APPSURF_FBO = 70, APPSURF_TEX = 71;
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+
+    // 64x64 page: opaque BLACK top-left quadrant, transparent elsewhere. Sampling a 16x16
+    // sub-rect of it keeps this on the sub-region staging path (not the whole-page fallback).
+    // Modelled on the REAL overlay measured on device: pure black bezel plus SCANLINE shading
+    // in very dark browns. Using (40,28,8) rather than pure black is deliberate -- it is the
+    // actual scanline colour, and a "black only" rule rejected it, which is what let the CRT
+    // overlay through the first time.
+    static uint8_t page[64*64*4];
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 64; x++) {
+            uint8_t *q = &page[(y*64+x)*4];
+            bool inmask = (x < 32 && y < 32);
+            bool scan   = inmask && (y & 1);
+            q[0] = scan ? 40 : 0; q[1] = scan ? 28 : 0; q[2] = scan ? 8 : 0;
+            q[3] = inmask ? 255 : 0;
+        }
+    RTexture mask = { page, 64, 64, 64, 64, 0, 1 };
+    // Bright art of the same shape: must NEVER be stripped, whatever its size.
+    static uint8_t bright[64*64*4];
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 64; x++) {
+            uint8_t *q = &bright[(y*64+x)*4];
+            bool on = (x < 32 && y < 32);
+            q[0]=200; q[1]=180; q[2]=90; q[3] = on ? 255 : 0;
+        }
+    RTexture art = { bright, 64, 64, 64, 64, 0, 1 };
+    static const uint8_t opaque[4] = { 200, 120, 40, 255 };
+    RTexture surf = { opaque, 1, 1, 1, 1, 0, 1 };
+
+    auto quad = [](BVtx *q, float w, float h) {
+        const float u0=0.f, u1=0.25f, v0=0.f, v1=0.25f;   // 16x16 of the 64x64 page
+        q[0]={0,0,u0,v0,1,1,1,1}; q[1]={w,0,u1,v0,1,1,1,1}; q[2]={w,h,u1,v1,1,1,1,1};
+        q[3]={0,0,u0,v0,1,1,1,1}; q[4]={w,h,u1,v1,1,1,1,1}; q[5]={0,h,u0,v1,1,1,1,1};
+    };
+    BVtx present[6]; quad(present, (float)BW, (float)BH);
+
+    // --- full-screen mask after a present: dropped ---------------------------------
+    RasterBackend_MFGPU_SetAppSurface(APPSURF_FBO, APPSURF_TEX);
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, present, 2, &surf, RB_ALPHA, 0.0f, APPSURF_TEX);   // present
+    BVtx big[6]; quad(big, (float)BW, (float)BH);
+    backend_mfgpu.draw(&s_mf, big, 2, &mask, RB_ALPHA, 0.0f, next_key());        // iris mask
+    backend_mfgpu.present(&s_mf);
+    if (RasterBackend_MFGPU_TestCrtStripped() != 1) {
+        printf("  FAIL strip-mask  full-screen black/transparent overlay not dropped (%u)\n",
+               RasterBackend_MFGPU_TestCrtStripped());
+        return 0;
+    }
+
+    // --- SMALL black/transparent sprite (a shadow): must still draw ------------------
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.clear(&s_mf, 255,255,255,255);
+    backend_mfgpu.draw(&s_mf, present, 2, &surf, RB_ALPHA, 0.0f, APPSURF_TEX);   // present
+    BVtx small[6]; quad(small, 24.f, 18.f);
+    backend_mfgpu.draw(&s_mf, small, 2, &mask, RB_ALPHA, 0.0f, next_key());      // shadow
+    backend_mfgpu.present(&s_mf);
+    if (RasterBackend_MFGPU_TestCrtStripped() != 0) {
+        printf("  FAIL strip-mask  a SMALL black sprite was dropped (%u) - shadows would vanish\n",
+               RasterBackend_MFGPU_TestCrtStripped());
+        return 0;
+    }
+    static uint16_t fb[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb);
+    bool any_black = false;
+    for (int y = 0; y < 12; y++) for (int x = 0; x < 16; x++) if (fb[y*BW+x] == 0) any_black = true;
+    if (!any_black) {
+        printf("  FAIL strip-mask  small black sprite did not render\n");
+        return 0;
+    }
+
+    // --- FULL-SCREEN BRIGHT art after a present: must survive ------------------------
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, present, 2, &surf, RB_ALPHA, 0.0f, APPSURF_TEX);
+    backend_mfgpu.draw(&s_mf, big, 2, &art, RB_ALPHA, 0.0f, next_key());
+    backend_mfgpu.present(&s_mf);
+    if (RasterBackend_MFGPU_TestCrtStripped() != 0) {
+        printf("  FAIL strip-mask  BRIGHT full-screen art was stripped (%u) - the rule must key "
+               "on darkness, not on covering the screen\n", RasterBackend_MFGPU_TestCrtStripped());
+        return 0;
+    }
+
+    RasterBackend_MFGPU_SetAppSurface(0, 0);
+    printf("  OK   strip-mask  scanline overlay dropped; small dark sprite and bright art kept\n");
+    return 1;
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -1229,5 +1648,17 @@ int main(void){
     else printf("raster_backend mfgpu-composite-vflip OK\n");
     if (!case_atlas_subregion_tile()) { printf("FAIL mfgpu-atlas-subregion\n"); ok = 0; }
     else printf("raster_backend mfgpu-atlas-subregion OK\n");
+    if (!case_inflight_drop()) { printf("FAIL mfgpu-inflight-drop\n"); ok = 0; }
+    else printf("raster_backend mfgpu-inflight-drop OK\n");
+    if (!case_inflight_drop_limit()) { printf("FAIL mfgpu-inflight-drop-limit\n"); ok = 0; }
+    else printf("raster_backend mfgpu-inflight-drop-limit OK\n");
+    if (!case_opaque_alpha_to_copy()) { printf("FAIL mfgpu-opaque-alpha-copy\n"); ok = 0; }
+    else printf("raster_backend mfgpu-opaque-alpha-copy OK\n");
+    if (!case_dup_draw_elision()) { printf("FAIL mfgpu-dup-draw\n"); ok = 0; }
+    else printf("raster_backend mfgpu-dup-draw OK\n");
+    if (!case_strip_crt_ghost()) { printf("FAIL mfgpu-strip-crt\n"); ok = 0; }
+    else printf("raster_backend mfgpu-strip-crt OK\n");
+    if (!case_strip_crt_mask()) { printf("FAIL mfgpu-strip-mask\n"); ok = 0; }
+    else printf("raster_backend mfgpu-strip-mask OK\n");
     return ok ? 0 : 1;
 }

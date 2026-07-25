@@ -126,12 +126,110 @@ static int           g_frame_no = 0;
 // rw=full-w, rh=full-h). Two draws of the same texture that sample different
 // sub-rects get distinct entries; invalidate frees every entry with a matching
 // key regardless of rect.
-struct MfTexEntry { uint32_t key; bool used; bool has_key; blt_surface_ref_t ref; uint64_t lru;
+struct MfTexEntry { uint32_t key; bool used; bool has_key; bool mask_only; blt_surface_ref_t ref; uint64_t lru;
                     uint16_t rx, ry, rw, rh; };
 static MfTexEntry g_texcache[MF_TEX_CACHE_N];
 static uint64_t   g_lru_clock   = 0;
 static uint32_t   g_upload_count = 0;   // real blt_upload calls since reinit (test hook)
 static uint32_t   g_stage_count  = 0;   // BLT_OP_STAGE emits since reinit (FO Task 3 test hook)
+static bool     g_fabric_pending   = false;  // a submitted batch has not been acked yet
+static uint32_t g_pending_seq      = 0;      // the submit_seq we are waiting on
+static bool     g_frame_dropped    = false;  // this frame is being dropped (emit nothing)
+static uint32_t g_drop_count       = 0;      // frames dropped since reinit (test hook)
+static int      g_test_fabric_busy = -1;     // host tests force the predicate (-1 = ask for real)
+static uint32_t g_drop_run         = 0;      // consecutive drops (bounded by MF_DROP_LIMIT)
+static int      g_last_trilist_blend = -1;   // blend mode of the last TRILIST emitted (test hook)
+
+// [duplicate-draw elimination] The measured device frame graph emits the app-surface
+// composite TWICE per frame, byte-identical: same target, same source texture, same
+// full-screen rect, same blend (see the frame-graph capture in the ledger). Each of those
+// passes is 2 triangles that each walk the FULL-SCREEN bounding box, and a harness A/B
+// prices the pair at ~16ms of a frame -- so the redundant one is ~8ms, about a quarter of
+// the whole frame.
+//
+// Dropping it needs no visual judgement, because a repeat is provably a no-op when the
+// blend is idempotent. An opaque draw goes out as BLT_BLEND_COPY (or BLT_BLEND_COLORKEY
+// when the region is keyed); COPY writes src over dst and COLORKEY writes src where it is
+// not the key, so running either a second time over its own output lands on exactly the
+// same pixels. A translucent draw does NOT qualify -- CONST_ALPHA composites, so a repeat
+// darkens -- and is deliberately left alone.
+//
+// Self-verifying: if the two draws are ever not truly identical (different UVs, a moved
+// vertex), the comparison simply fails and both are emitted, costing one memcmp.
+enum { MF_DUP_MAX_TRIS = 16 };   // covers full-screen quads; keeps the compare trivial
+static struct {
+    bool     valid;
+    uint32_t fbo, tex_key;
+    int      bl;
+    float    ar;
+    int      triCount;
+    BVtx     v[MF_DUP_MAX_TRIS * 3];
+} g_last_draw;
+static uint32_t g_dup_skipped = 0;   // draws elided this run (test hook + device log)
+
+// [strip in-game CRT simulation] The game ships its own old-TV effect (obj_old_tv, with
+// Draw_0 + Draw_64 events -- confirmed in game.droid; there are no shd_* shader assets and
+// every draw runs under one program, so it is done with plain geometry and alpha). We do not
+// want it: the output is always driven either to a real CRT or through the MiSTer framework,
+// which applies its own CRT treatment, so the in-game simulation is both wasted fabric time
+// and double-applied. There is no in-game option to disable it (options.ini holds only
+// DisplayName), so it has to be dropped here.
+//
+// Signature, from the measured frame graph: after the app surface is presented opaquely to
+// the default target, the SAME surface is drawn over itself again at ~70% alpha. That second
+// pass is the ghost. It is a full-screen pass, and a screen-aligned quad is 2 triangles that
+// EACH walk the full-screen bounding box, so dropping it is worth ~8ms of a ~31ms frame.
+//
+// THE PRECEDING-OPAQUE-PRESENT CONDITION IS LOAD-BEARING, not a nicety: obj_fade_in /
+// obj_fade_out are legitimate transitions, and a fade-from-black can legitimately draw the
+// app surface TRANSLUCENTLY over a cleared target. Dropping that would blank the screen for
+// the whole transition. Requiring that an opaque present already landed THIS FRAME means the
+// image is provably on screen before we drop anything, so a fade can never be swallowed.
+static bool     g_appsurf_presented = false;   // an opaque app-surface present landed this frame
+static uint32_t g_crt_stripped      = 0;       // ghost passes dropped (test hook + device log)
+static int mf_strip_crt(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_STRIP_CRT");
+        v = (e && *e) ? atoi(e) : 1;   // on by default: we never want the in-game CRT sim
+    }
+    return v;
+}
+
+// Would this draw go out with an idempotent blend? Mirrors mf_emit_group's decision:
+// fully opaque => COPY or COLORKEY (both idempotent), anything else => CONST_ALPHA.
+//
+// NOTE `ar` is alphaRef -- the ALPHA-TEST THRESHOLD (gm_AlphaRefValue), not an opacity
+// multiplier, and blitter.cpp:599 passes a constant 0.0f. An earlier version of this
+// function required ar >= 0.999 as if it were opacity, which made the elision dead on
+// arrival: it could never fire on a real draw. The threshold is irrelevant to idempotency
+// anyway -- alpha test discards the same pixels every time -- and the signature comparison
+// at the call site still requires the two draws to share the same ar, so a differing
+// threshold blocks elision there.
+static bool mf_draw_is_idempotent(const BVtx *v, int nverts, RBlend bl) {
+    if (bl != RB_NONE && bl != RB_ALPHA) return false;   // ADD/MULTIPLY accumulate
+    for (int i = 0; i < nverts; i++) if (v[i].a < 0.999f) return false;   // per-vertex opacity
+    return true;
+}
+// Default ~1s at 60Hz: long enough that a short stall is covered by dropping rather than
+// stomping, short enough that a fabric which never acks costs a second of black instead of a
+// permanent freeze. Overridable with GMLOADER_MFGPU_DROP_LIMIT because the right value is an
+// open experimental question: measured stalls run to ~18s, so 60 frames still crosses a long
+// one ~6 times, and each crossing rebuilds the ring under a live batch. Setting it above a
+// full stall (>=400 frames at the game's ~19fps) makes an episode completely stomp-free, which
+// is how we test whether recurring stalls are partly a self-sustaining tail of earlier stomps
+// (staged texture bytes and the ring persist across frames) rather than independent events.
+enum { MF_DROP_LIMIT_DEFAULT = 60 };
+static uint32_t mf_drop_limit(void) {
+    static uint32_t v = 0;
+    if (!v) {
+        const char *e = getenv("GMLOADER_MFGPU_DROP_LIMIT");
+        long n = (e && *e) ? atol(e) : 0;
+        v = (n > 0) ? (uint32_t)n : (uint32_t)MF_DROP_LIMIT_DEFAULT;
+    }
+    return v;
+}
+
 static uint32_t   g_tex_heap_cap = 0;   // 0 => full MF_TEX_HEAP; else test override
 
 // Snapshot of g_lru_clock taken at the start of the current frame (see
@@ -307,6 +405,44 @@ static int mf_nowait_on(void) {
     if (v < 0) { const char *e = getenv("GMLOADER_MFSUBMIT_NOWAIT"); v = (e && *e) ? 1 : 0; }
     return v;
 }
+// How long to sleep between C_DONE polls once the initial spin is exhausted, in
+// microseconds (GMLOADER_MFGPU_POLL_US; 0 = pure spin, the default).
+//
+// MEASURED, DEFAULT DELIBERATELY OFF: the pure spin issues ~25000 UNCACHED C_DONE reads
+// per frame for the whole ~30ms the fabric works, so this looked like free DDR bandwidth
+// to hand back. A/B on device (120s per arm, same RBF/scene) says it is not:
+//   poll_us=0   ~25000 polls/frame  fabric frame ~30.6ms  timeouts 44 reclaims 38
+//   poll_us=250  ~2095 polls/frame  fabric frame ~32.6ms  timeouts 58 reclaims 50
+// A 12x cut in poll traffic bought no fabric speedup and no fewer stalls (both arms sit
+// inside scene-to-scene variation), so host poll pressure is NOT what the fabric is
+// waiting on. Kept as a knob because it does idle a core that otherwise spins at 100%,
+// which is worth re-testing against the frame-1 wedge rate if that turns out to be
+// thermal — the HPS shares a die with the fabric.
+enum { MF_POLL_SPIN_ITERS = 2000, MF_POLL_US_DEFAULT = 0 };
+static long mf_poll_us(void) {
+    static long v = -1;
+    if (v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_POLL_US");
+        v = (e && *e) ? atol(e) : (long)MF_POLL_US_DEFAULT;
+        if (v < 0) v = 0;
+    }
+    return v;
+}
+// Doorbell->C_DONE wait budget, overridable with GMLOADER_MFGPU_TIMEOUT_MS (default
+// MF_DEV_DONE_TIMEOUT_MS). Giving up on the wait has the SAME hazard NOWAIT documents
+// above: the next frame re-emits the in-place DDR ring / vertex buffer / texture heap
+// while the fabric is still reading them. This knob exists to measure how much of an
+// observed stall is a genuine fabric stall versus that re-emit corrupting the batch
+// in flight (raise it far above a stall to remove the host from the equation).
+static long mf_timeout_ms(void) {
+    static long v = -1;
+    if (v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_TIMEOUT_MS");
+        long n = (e && *e) ? atol(e) : 0;
+        v = (n > 0) ? n : (long)MF_DEV_DONE_TIMEOUT_MS;
+    }
+    return v;
+}
 // clk_sys = 98.4375 MHz (PLL outclk_0 / DDRAM_CLK). Fabric perf counters are in
 // clk_sys cycles: C_DONE high word = perf_frame_cyc (total fabric-busy: new-submit
 // detect → done write), C_STATUS high word = perf_pipe_cyc (composite pipeline busy).
@@ -353,18 +489,35 @@ static void mf_device_submit(void) {
     struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     if (mf_nowait_on()) { mf_submit_stat(&t0, 0, /*timeout=*/0); return; }  // probe: no poll
     long iters = 0;
+    const long poll_us = mf_poll_us();
     for (;;) {
         if (mf_ctrl_rd(MF_C_DONE) == g_e.submit_seq) {   // fabric consumed it
             mf_submit_stat(&t0, iters, /*timeout=*/0);
             return;
         }
         iters++;
+        // Back off instead of spinning. A pure spin issued 24k-43k UNCACHED C_DONE reads
+        // per frame (measured on device) for the whole ~30ms the fabric was working —
+        // roughly a million a second, all of them full round trips through the same DDR
+        // controller the fabric fetches commands, vertices and textures through. The CPU
+        // freed is not the point (this path is blocking either way): the point is handing
+        // that memory bandwidth back to the fabric. Sleeping costs at most poll_us of
+        // extra latency on a ~30ms frame. poll_us=0 restores the old pure spin for A/B.
+        if (poll_us > 0 && iters > MF_POLL_SPIN_ITERS) {
+            struct timespec ts = { 0, poll_us * 1000L };
+            nanosleep(&ts, NULL);
+        }
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         long ms = (now.tv_sec - t0.tv_sec) * 1000L + (now.tv_nsec - t0.tv_nsec) / 1000000L;
-        if (ms >= MF_DEV_DONE_TIMEOUT_MS) {
-            fprintf(stderr, "backend_mfgpu: fabric submit timeout (submit=%u done=%u status=%u)\n",
-                    g_e.submit_seq, mf_ctrl_rd(MF_C_DONE), mf_ctrl_rd(MF_C_STATUS));
+        if (ms >= mf_timeout_ms()) {
+            fprintf(stderr, "backend_mfgpu: fabric submit timeout (submit=%u done=%u status=%u waited=%ldms)\n",
+                    g_e.submit_seq, mf_ctrl_rd(MF_C_DONE), mf_ctrl_rd(MF_C_STATUS), ms);
             mf_submit_stat(&t0, iters, /*timeout=*/1);
+            // [in-flight-batch guard] We are abandoning the wait, NOT the batch: the fabric
+            // is still reading this ring. Remember the sequence so the next frames drop
+            // whole rather than rebuilding the ring underneath it.
+            g_fabric_pending = true;
+            g_pending_seq    = g_e.submit_seq;
             return;
         }
     }
@@ -394,11 +547,63 @@ static void mf_init_once(void) {
 #endif
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
+    g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
+    g_last_draw.valid = false; g_dup_skipped = 0;
+    g_appsurf_presented = false; g_crt_stripped = 0;
     g_inited = true;
+}
+
+// [in-flight-batch guard] The emitter builds the command ring, the vertex buffer and the
+// texture heap IN PLACE in the DDR the fabric reads (mf_init_once binds g_dev_ring/g_dev_src).
+// The ONLY thing keeping the host from overwriting a batch the fabric is still executing is
+// the blocking C_DONE poll in mf_device_submit -- and its timeout abandons exactly that
+// guarantee. Device-measured 2026-07-24: with the stock 200ms budget a single stalled frame
+// produced ~78 timeouts, i.e. 78 successive frames that called blt_begin_frame (cmd_count=0,
+// vtx_used=0) and re-staged textures straight over the batch the fabric was mid-way through
+// reading. That is the mechanism behind the garbage geometry, "the game's stored tilemap
+// rendered directly", and the escalation of isolated hiccups into 15-second cascades.
+// (It is an AMPLIFIER, not the initiator: raising the budget to 5s left the underlying
+// ~18s fabric stalls intact, so the fabric-side bug is tracked separately.)
+// So: once a submit times out, drop WHOLE frames -- emit nothing, stage nothing, reset no
+// cursors -- until the fabric acks the sequence it is still working on.
+// Is the fabric still chewing on g_pending_seq? Only meaningful while g_fabric_pending.
+static bool mf_fabric_still_busy(void) {
+    if (g_test_fabric_busy >= 0) return g_test_fabric_busy != 0;
+#ifdef MISTER_NATIVE_VIDEO
+    if (g_dev_ok) return mf_ctrl_rd(MF_C_DONE) != g_pending_seq;
+#endif
+    return false;   // host oracle: blt_execute is synchronous, nothing is ever in flight
 }
 
 static void mf_frame_begin(void) {
     mf_init_once();
+    // [in-flight-batch guard] Decide BEFORE blt_begin_frame: it is the call that would
+    // rewind the cursors over a live batch.
+    if (g_fabric_pending) {
+        if (mf_fabric_still_busy() && g_drop_run < mf_drop_limit()) {
+            g_frame_dropped = true;
+            g_frame_active  = true;   // so present() still closes the frame
+            g_drop_run++;
+            if ((g_drop_count++ % 60u) == 0u)
+                fprintf(stderr, "backend_mfgpu: fabric still on seq=%u - frame dropped "
+                        "(ring left intact; %u dropped)\n", g_pending_seq, g_drop_count);
+            return;
+        }
+        // Give up rather than deadlock. A fabric that NEVER acks — device-observed on
+        // 2026-07-24: the permanent frame-1 wedge, sub=1 done=0 — would otherwise make
+        // this guard drop every frame forever, so the game would never render at all.
+        // That is strictly worse than the corruption the guard exists to prevent. After
+        // MF_DROP_LIMIT consecutive drops, reclaim the ring and rebuild: one deliberate
+        // stomp as a last resort, instead of one per frame.
+        if (g_drop_run >= mf_drop_limit())
+            fprintf(stderr, "backend_mfgpu: fabric never acked seq=%u after %u frames - "
+                    "reclaiming the ring\n", g_pending_seq, mf_drop_limit());
+        g_fabric_pending = false;     // acked (or reclaimed): the ring is ours again
+    }
+    g_drop_run = 0;
+    g_frame_dropped = false;
+    g_last_draw.valid = false;   // [duplicate-draw elimination] never span frames
+    g_appsurf_presented = false; // [strip CRT] the present must re-land every frame
     // Snapshot the pin floor for this frame: any g_texcache entry touched
     // (hit or staged) from here through mf_frame_end gets .lru > this value
     // and is thus protected from eviction until the NEXT frame begins (see
@@ -436,6 +641,8 @@ static void mf_select_target(uint32_t fbo) {
 
 static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     mf_ensure_frame();
+    if (g_frame_dropped) return;   // [in-flight-batch guard] emit nothing this frame
+    g_last_draw.valid = false;     // [duplicate-draw elimination] a clear breaks the run
     mf_select_target(d->fbo);
     (void)a;   // fabric FILL writes opaque RGB565; no alpha channel on the wire
     int w = d->w < BLT_FB_WIDTH  ? d->w : BLT_FB_WIDTH;
@@ -558,7 +765,7 @@ static void mf_texdump(uint32_t key, int w, int h, int rx, int ry, const char *w
 }
 
 static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
-                                             int rx, int ry, bool has_key,
+                                             int rx, int ry, bool has_key, bool mask_only,
                                              const char *what) {
     if (mf_texdump_on()) mf_texdump(key, w, h, rx, ry, what);
     bool ov_before = g_e.overflow;                    // preserve any overflow already set this frame
@@ -615,9 +822,23 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
     }
     if (g_texcache[slot].used)
         blt_emitter_free(&g_e, g_texcache[slot].ref.off, g_texcache[slot].ref.size);
-    g_texcache[slot] = MfTexEntry{ key, true, has_key, ref, ++g_lru_clock,
+    g_texcache[slot] = MfTexEntry{ key, true, has_key, mask_only, ref, ++g_lru_clock,
                                    (uint16_t)rx, (uint16_t)ry, (uint16_t)w, (uint16_t)h };
     return ref;
+}
+
+// [strip in-game CRT simulation] Is this staged texel incapable of doing anything but darken?
+// The old-TV overlay is the CRT tube: rounded bezel, transparent centre, and SCANLINE shading
+// in the surround. Device dump of the region it actually samples (578x434 of the atlas):
+// 76.8% transparent, 19.2% pure black, 3.9% very dark browns -- 44 distinct colours whose
+// BRIGHTEST is luminance 46 of 255. So "black only" was too strict (it rejected the scanlines);
+// the real property is that nothing in it is bright. 64 sits far above the measured 46 and far
+// below any real art.
+enum { MF_DARK_MAX = 64 };
+static inline bool mf_texel_is_dark(uint16_t px) {
+    if (px == MF_COLORKEY) return true;                       // transparent: draws nothing
+    int r = ((px >> 11) & 0x1F) << 3, g = ((px >> 5) & 0x3F) << 2, b = (px & 0x1F) << 3;
+    return ((r * 77 + g * 151 + b * 28) >> 8) <= MF_DARK_MAX;  // Rec.601 luma
 }
 
 static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *out_has_key) {
@@ -636,14 +857,20 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
             return g_texcache[i].ref;
         }
     bool has_key = false;
+    // [strip in-game CRT simulation] classify while already visiting every texel -- see the
+    // sub-region path for why a black+transparent-only page is interesting.
+    bool mask_only = textured;
     if (textured) {
         for (int y = 0; y < th; y++)
-            for (int x = 0; x < tw; x++)
-                g_texscratch[(size_t)y * tw + x] = mf_texel565(t, x, y, &has_key);
+            for (int x = 0; x < tw; x++) {
+                uint16_t px = mf_texel565(t, x, y, &has_key);
+                g_texscratch[(size_t)y * tw + x] = px;
+                if (!mf_texel_is_dark(px)) mask_only = false;
+            }
     } else {
         g_texscratch[0] = 0xFFFF;   // 1x1 opaque white
     }
-    blt_surface_ref_t ref = mf_upload_and_cache(key, tw, th, 0, 0, has_key, "whole");
+    blt_surface_ref_t ref = mf_upload_and_cache(key, tw, th, 0, 0, has_key, mask_only, "whole");
     *out_has_key = ref.valid ? has_key : false;
     return ref;
 }
@@ -679,7 +906,8 @@ static void mf_crop_rect(const RTexture *t, float u0, float v0, float u1, float 
 
 static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
                                               float u0, float v0, float u1, float v1,
-                                              bool *out_has_key, int *out_rx, int *out_ry) {
+                                              bool *out_has_key, int *out_rx, int *out_ry,
+                                              bool *out_mask_only) {
     int rx, ry, rw, rh;
     mf_crop_rect(t, u0, v0, u1, v1, &rx, &ry, &rw, &rh);
     *out_rx = rx; *out_ry = ry;
@@ -689,17 +917,29 @@ static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
             g_texcache[i].rw == rw && g_texcache[i].rh == rh) {
             g_texcache[i].lru = ++g_lru_clock;
             *out_has_key = g_texcache[i].has_key;
+            if (out_mask_only) *out_mask_only = g_texcache[i].mask_only;
             return g_texcache[i].ref;
         }
     if ((size_t)rw * rh > MF_TEX_TEXELS) {
-        blt_surface_ref_t bad; bad.valid = 0; *out_has_key = false; return bad;
+        blt_surface_ref_t bad; bad.valid = 0; *out_has_key = false;
+        if (out_mask_only) *out_mask_only = false;
+        return bad;
     }
     bool has_key = false;
+    // [strip in-game CRT simulation] A region containing NOTHING but transparent and black can
+    // only ever darken what is under it. obj_old_tv's tube/iris mask is exactly that: device
+    // dumps of its frames measure 100% black+colorkey with the black fraction ANIMATING
+    // (4.7% -> 27.1% -> 38.2% -> 47.8%), i.e. a tube iris opening and closing over the image.
+    bool mask_only = true;
     for (int y = 0; y < rh; y++)
-        for (int x = 0; x < rw; x++)
-            g_texscratch[(size_t)y * rw + x] = mf_texel565(t, rx + x, ry + y, &has_key);
-    blt_surface_ref_t ref = mf_upload_and_cache(key, rw, rh, rx, ry, has_key, "region");
+        for (int x = 0; x < rw; x++) {
+            uint16_t px = mf_texel565(t, rx + x, ry + y, &has_key);
+            g_texscratch[(size_t)y * rw + x] = px;
+            if (!mf_texel_is_dark(px)) mask_only = false;
+        }
+    blt_surface_ref_t ref = mf_upload_and_cache(key, rw, rh, rx, ry, has_key, mask_only, "region");
     *out_has_key = ref.valid ? has_key : false;
+    if (out_mask_only) *out_mask_only = ref.valid ? mask_only : false;
     return ref;
 }
 
@@ -736,8 +976,27 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         colorkey = MF_COLORKEY;
     } else {
         blend_mode = rblend_to_blt(bl);
+        // A fully-opaque ALPHA draw over a source with no per-texel alpha IS a copy, and
+        // the difference is not free on the fabric. BLT_BLEND_CONST_ALPHA sets the RTL's
+        // tri_need_dst, which inserts the B_DSTW/B_DSTC comp_fbram read into EVERY pixel's
+        // walk (8 states per pixel instead of 6); BLT_BLEND_COPY skips it. With cmd.alpha
+        // 255 and every vertex alpha at 1.0 the blend reduces to out = src exactly, so the
+        // output is bit-identical either way -- this only stops paying for the read.
+        //
+        // Safe by the same reasoning as the has_key branch above: !has_key means the staged
+        // region contained no colorkey sentinel, i.e. no transparent texels (mf_texel565
+        // maps transparency onto MF_COLORKEY and sets has_key), and a triangle list has no
+        // per-texel alpha channel at all (see the note at the top of this file). So an
+        // opaque, un-keyed ALPHA draw has nothing to blend against.
+        //
+        // Worth real time here: the measured frame graph is THREE full-screen 320x240 ALPHA
+        // draws every frame (two app-surface composites plus the border) = 230400 pixels,
+        // each of which was paying for a destination read it could not use.
+        if (blend_mode == BLT_BLEND_CONST_ALPHA && min_vtx_a * 255.0f >= 254.0f)
+            blend_mode = BLT_BLEND_COPY;
         colorkey = 0;
     }
+    g_last_trilist_blend = blend_mode;   // host-test hook (opaque-ALPHA -> COPY promotion)
     if (blt_trilist(&g_e, tex, blend_mode, colorkey, /*alpha=*/255,
                     eoff, nt, extra_flags) != 0)
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", nt);
@@ -803,6 +1062,7 @@ static void mf_uvlog(const char *tag, const BVtx *v, int triCount, int tw, int t
 static void mf_draw(RSurface *d, const BVtx *v, int triCount,
                     const RTexture *t, RBlend bl, float ar, uint32_t tex_key) {
     mf_ensure_frame();
+    if (g_frame_dropped) return;   // [in-flight-batch guard] no emit, and no texture staging
     // [app-surface render target, step 1] d->fbo identifies the target FBO
     // (blitter.cpp's get_render_target); tex_key identifies the sampled GL
     // texture. Either can alias the detected application surface.
@@ -822,6 +1082,71 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
     if (dst_is_appsurf && src_is_appsurf) {
         fprintf(stderr, "backend_mfgpu: self-referential APPSURF draw (dst==src) - unsupported, dropped\n");
         return;
+    }
+
+    // [strip in-game CRT simulation] Classify this draw against the app-surface present.
+    if (src_is_appsurf && !dst_is_appsurf) {
+        float mina = 1.0f;
+        for (int i = 0; i < triCount * 3; i++) if (v[i].a < mina) mina = v[i].a;
+        if (mina >= 0.999f) {
+            g_appsurf_presented = true;        // the real present: always emitted
+        } else if (g_appsurf_presented && mf_strip_crt()) {
+            g_crt_stripped++;                  // obj_old_tv's ghost over an already-present image
+            return;
+        }
+    }
+
+    // [duplicate-draw elimination] Identical to the draw immediately before it, with an
+    // idempotent blend => re-running it cannot change a pixel. Skip the whole thing:
+    // no staging, no vertex push, no command.
+#ifdef MISTER_NATIVE_VIDEO
+    // [composite characterisation] Is the second full-screen pass a BLUR/BLOOM (offset or
+    // scaled UVs, genuinely new pixels) or the SAME image re-blended over itself? The latter
+    // is a mathematical no-op whatever its alpha, because the first pass already wrote
+    // dst = src, so a*src + (1-a)*dst == src. Dump both draws' vertices once to tell them
+    // apart -- position, UV, tint and alpha, since only alpha may differ for the no-op case.
+    if (mf_stat_on()) {
+        static int shots = 0;
+        static bool have_prev = false;
+        static uint32_t p_fbo, p_key; static int p_tri;
+        static BVtx p_v[MF_DUP_MAX_TRIS * 3];
+        if (have_prev && shots < 2 && p_fbo == d->fbo && p_key == tex_key &&
+            p_tri == triCount && triCount == 2) {
+            for (int i = 0; i < 6; i++)
+                fprintf(stderr, "MFVTX prev[%d] xy=%.2f,%.2f uv=%.4f,%.4f rgba=%.3f,%.3f,%.3f,%.3f | "
+                        "cur[%d] xy=%.2f,%.2f uv=%.4f,%.4f rgba=%.3f,%.3f,%.3f,%.3f\n",
+                        i, (double)p_v[i].x, (double)p_v[i].y, (double)p_v[i].u, (double)p_v[i].v,
+                        (double)p_v[i].r, (double)p_v[i].g, (double)p_v[i].b, (double)p_v[i].a,
+                        i, (double)v[i].x, (double)v[i].y, (double)v[i].u, (double)v[i].v,
+                        (double)v[i].r, (double)v[i].g, (double)v[i].b, (double)v[i].a);
+            shots++;
+        }
+        if (triCount <= MF_DUP_MAX_TRIS) {
+            p_fbo = d->fbo; p_key = tex_key; p_tri = triCount;
+            memcpy(p_v, v, sizeof(BVtx) * (size_t)triCount * 3);
+            have_prev = true;
+        } else have_prev = false;
+    }
+#endif
+
+    if (triCount > 0 && triCount <= MF_DUP_MAX_TRIS &&
+        mf_draw_is_idempotent(v, triCount * 3, bl)) {
+        if (g_last_draw.valid && g_last_draw.fbo == d->fbo && g_last_draw.tex_key == tex_key &&
+            g_last_draw.bl == (int)bl && g_last_draw.ar == ar &&
+            g_last_draw.triCount == triCount &&
+            memcmp(g_last_draw.v, v, sizeof(BVtx) * (size_t)triCount * 3) == 0) {
+            g_dup_skipped++;
+            return;
+        }
+        g_last_draw.valid    = true;
+        g_last_draw.fbo      = d->fbo;
+        g_last_draw.tex_key  = tex_key;
+        g_last_draw.bl       = (int)bl;
+        g_last_draw.ar       = ar;
+        g_last_draw.triCount = triCount;
+        memcpy(g_last_draw.v, v, sizeof(BVtx) * (size_t)triCount * 3);
+    } else {
+        g_last_draw.valid = false;   // anything non-qualifying breaks the run
     }
 
     // Any OTHER (non-default, non-appsurf) render-to-texture target: the
@@ -1014,8 +1339,29 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
             continue;
         }
 
-        bool has_key = false; int srx = 0, sry = 0;
-        blt_surface_ref_t tex = stage_texture_region(tex_key, t, u0, v0, u1, v1, &has_key, &srx, &sry);
+        bool has_key = false; int srx = 0, sry = 0; bool mask_only = false;
+        blt_surface_ref_t tex = stage_texture_region(tex_key, t, u0, v0, u1, v1, &has_key, &srx, &sry,
+                                                    &mask_only);
+        // [strip in-game CRT simulation] obj_old_tv's CRT overlay: a FULL-SCREEN pass whose
+        // staged region holds nothing but transparent and very dark texels -- the tube bezel
+        // plus its SCANLINE shading -- drawn over the image
+        // after it has already been presented. Its entire contribution is darkening the edges,
+        // which is the framework's job on this hardware, and it costs a whole full-screen pass
+        // (a screen-aligned quad is 2 triangles that EACH walk the full-screen bbox).
+        //
+        // The full-screen test is what keeps ordinary art safe: plenty of sprites are black +
+        // transparent (shadows, silhouettes, letterboxing bars), and those must still draw.
+        if (mask_only && mf_strip_crt() && g_appsurf_presented && !dst_is_appsurf) {
+            float qx0 = gv[0].x, qx1 = gv[0].x, qy0 = gv[0].y, qy1 = gv[0].y;
+            for (int i = 1; i < 6; i++) {
+                if (gv[i].x < qx0) qx0 = gv[i].x;   if (gv[i].x > qx1) qx1 = gv[i].x;
+                if (gv[i].y < qy0) qy0 = gv[i].y;   if (gv[i].y > qy1) qy1 = gv[i].y;
+            }
+            if ((qx1 - qx0) >= 0.8f * (float)d->w && (qy1 - qy0) >= 0.8f * (float)d->h) {
+                g_crt_stripped++;
+                continue;
+            }
+        }
         if (!tex.valid) {
             // The failed upload left g_e.overflow set -> the whole frame drops at
             // frame_end (correct: a texture that can't fit -- heap or cache-table
@@ -1051,10 +1397,26 @@ static void mf_present(const RSurface *) {
 }
 
 static void mf_frame_end(void) {
+    // [in-flight-batch guard] Nothing was emitted and the cursors were never rewound: the
+    // ring still holds the batch the fabric is reading. blt_end_frame would bump submit_seq
+    // and the doorbell would then ack a batch that was never rebuilt, so return before both.
+    if (g_frame_dropped) return;
     // [Task 9 bring-up diagnostic] Log BEFORE blt_end_frame touches anything --
     // g_lru_frame_floor (set in mf_frame_begin) still delimits exactly this
     // frame's pinned working set at this point.
     mf_heaplog_frame_set(g_e.overflow ? "frame-end(OVERFLOWED)" : "frame-end(ok)", /*verbose=*/1);
+    // [duplicate-draw elimination] report periodically so a device run shows whether the
+    // repeat the frame graph captured is actually being elided, and how often.
+#ifdef MISTER_NATIVE_VIDEO
+    if (mf_stat_on()) {
+        static uint32_t nf = 0, last = 0;
+        if (++nf % 300 == 0) {
+            fprintf(stderr, "MFDUP frames=%u dup_draws_elided=%u (+%u since last) crt_ghost_stripped=%u\n",
+                    nf, g_dup_skipped, g_dup_skipped - last, g_crt_stripped);
+            last = g_dup_skipped;
+        }
+    }
+#endif
     blt_end_frame(&g_e);
 #ifdef MISTER_NATIVE_VIDEO
     // Device: the ring + heap are already resident in the mmap'd DDR (the emitter
@@ -1123,6 +1485,23 @@ extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba) {
 extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void) { return g_upload_count; }
 // FO Task 3 host hook: BLT_OP_STAGE emits since reinit (proves stage-once-per-page).
 extern "C" uint32_t RasterBackend_MFGPU_TestStageCount(void) { return g_stage_count; }
+// [in-flight-batch guard] host-test hooks: force the "fabric still busy" predicate
+// (-1 = ask for real) and read the dropped-frame tally.
+extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy) {
+    g_test_fabric_busy = busy;
+    // busy>0 simulates the whole device condition, not just the predicate: a submit that
+    // timed out and left a batch unacked. busy==0 deliberately LEAVES g_fabric_pending set,
+    // so the next frame exercises the "acked -> clear the flag and resume" branch.
+    if (busy > 0) { g_fabric_pending = true; g_pending_seq = g_e.submit_seq; }
+}
+extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void) { return g_drop_count; }
+// Blend mode the last TRILIST went out with, so a test can pin the opaque-ALPHA -> COPY
+// promotion (and, just as importantly, that a NON-opaque draw is left alone).
+extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void) { return g_last_trilist_blend; }
+// [duplicate-draw elimination] draws elided because they repeated the previous one verbatim.
+extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void) { return g_dup_skipped; }
+// [strip in-game CRT simulation] old-TV ghost passes dropped.
+extern "C" uint32_t RasterBackend_MFGPU_TestCrtStripped(void) { return g_crt_stripped; }
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_inited = false; g_frame_active = false;
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap
