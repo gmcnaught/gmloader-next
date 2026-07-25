@@ -126,7 +126,7 @@ static int           g_frame_no = 0;
 // rw=full-w, rh=full-h). Two draws of the same texture that sample different
 // sub-rects get distinct entries; invalidate frees every entry with a matching
 // key regardless of rect.
-struct MfTexEntry { uint32_t key; bool used; bool has_key; blt_surface_ref_t ref; uint64_t lru;
+struct MfTexEntry { uint32_t key; bool used; bool has_key; bool mask_only; blt_surface_ref_t ref; uint64_t lru;
                     uint16_t rx, ry, rw, rh; };
 static MfTexEntry g_texcache[MF_TEX_CACHE_N];
 static uint64_t   g_lru_clock   = 0;
@@ -166,6 +166,35 @@ static struct {
     BVtx     v[MF_DUP_MAX_TRIS * 3];
 } g_last_draw;
 static uint32_t g_dup_skipped = 0;   // draws elided this run (test hook + device log)
+
+// [strip in-game CRT simulation] The game ships its own old-TV effect (obj_old_tv, with
+// Draw_0 + Draw_64 events -- confirmed in game.droid; there are no shd_* shader assets and
+// every draw runs under one program, so it is done with plain geometry and alpha). We do not
+// want it: the output is always driven either to a real CRT or through the MiSTer framework,
+// which applies its own CRT treatment, so the in-game simulation is both wasted fabric time
+// and double-applied. There is no in-game option to disable it (options.ini holds only
+// DisplayName), so it has to be dropped here.
+//
+// Signature, from the measured frame graph: after the app surface is presented opaquely to
+// the default target, the SAME surface is drawn over itself again at ~70% alpha. That second
+// pass is the ghost. It is a full-screen pass, and a screen-aligned quad is 2 triangles that
+// EACH walk the full-screen bounding box, so dropping it is worth ~8ms of a ~31ms frame.
+//
+// THE PRECEDING-OPAQUE-PRESENT CONDITION IS LOAD-BEARING, not a nicety: obj_fade_in /
+// obj_fade_out are legitimate transitions, and a fade-from-black can legitimately draw the
+// app surface TRANSLUCENTLY over a cleared target. Dropping that would blank the screen for
+// the whole transition. Requiring that an opaque present already landed THIS FRAME means the
+// image is provably on screen before we drop anything, so a fade can never be swallowed.
+static bool     g_appsurf_presented = false;   // an opaque app-surface present landed this frame
+static uint32_t g_crt_stripped      = 0;       // ghost passes dropped (test hook + device log)
+static int mf_strip_crt(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_STRIP_CRT");
+        v = (e && *e) ? atoi(e) : 1;   // on by default: we never want the in-game CRT sim
+    }
+    return v;
+}
 
 // Would this draw go out with an idempotent blend? Mirrors mf_emit_group's decision:
 // fully opaque => COPY or COLORKEY (both idempotent), anything else => CONST_ALPHA.
@@ -520,6 +549,7 @@ static void mf_init_once(void) {
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
     g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
     g_last_draw.valid = false; g_dup_skipped = 0;
+    g_appsurf_presented = false; g_crt_stripped = 0;
     g_inited = true;
 }
 
@@ -573,6 +603,7 @@ static void mf_frame_begin(void) {
     g_drop_run = 0;
     g_frame_dropped = false;
     g_last_draw.valid = false;   // [duplicate-draw elimination] never span frames
+    g_appsurf_presented = false; // [strip CRT] the present must re-land every frame
     // Snapshot the pin floor for this frame: any g_texcache entry touched
     // (hit or staged) from here through mf_frame_end gets .lru > this value
     // and is thus protected from eviction until the NEXT frame begins (see
@@ -734,7 +765,7 @@ static void mf_texdump(uint32_t key, int w, int h, int rx, int ry, const char *w
 }
 
 static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
-                                             int rx, int ry, bool has_key,
+                                             int rx, int ry, bool has_key, bool mask_only,
                                              const char *what) {
     if (mf_texdump_on()) mf_texdump(key, w, h, rx, ry, what);
     bool ov_before = g_e.overflow;                    // preserve any overflow already set this frame
@@ -791,9 +822,23 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
     }
     if (g_texcache[slot].used)
         blt_emitter_free(&g_e, g_texcache[slot].ref.off, g_texcache[slot].ref.size);
-    g_texcache[slot] = MfTexEntry{ key, true, has_key, ref, ++g_lru_clock,
+    g_texcache[slot] = MfTexEntry{ key, true, has_key, mask_only, ref, ++g_lru_clock,
                                    (uint16_t)rx, (uint16_t)ry, (uint16_t)w, (uint16_t)h };
     return ref;
+}
+
+// [strip in-game CRT simulation] Is this staged texel incapable of doing anything but darken?
+// The old-TV overlay is the CRT tube: rounded bezel, transparent centre, and SCANLINE shading
+// in the surround. Device dump of the region it actually samples (578x434 of the atlas):
+// 76.8% transparent, 19.2% pure black, 3.9% very dark browns -- 44 distinct colours whose
+// BRIGHTEST is luminance 46 of 255. So "black only" was too strict (it rejected the scanlines);
+// the real property is that nothing in it is bright. 64 sits far above the measured 46 and far
+// below any real art.
+enum { MF_DARK_MAX = 64 };
+static inline bool mf_texel_is_dark(uint16_t px) {
+    if (px == MF_COLORKEY) return true;                       // transparent: draws nothing
+    int r = ((px >> 11) & 0x1F) << 3, g = ((px >> 5) & 0x3F) << 2, b = (px & 0x1F) << 3;
+    return ((r * 77 + g * 151 + b * 28) >> 8) <= MF_DARK_MAX;  // Rec.601 luma
 }
 
 static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *out_has_key) {
@@ -812,14 +857,20 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
             return g_texcache[i].ref;
         }
     bool has_key = false;
+    // [strip in-game CRT simulation] classify while already visiting every texel -- see the
+    // sub-region path for why a black+transparent-only page is interesting.
+    bool mask_only = textured;
     if (textured) {
         for (int y = 0; y < th; y++)
-            for (int x = 0; x < tw; x++)
-                g_texscratch[(size_t)y * tw + x] = mf_texel565(t, x, y, &has_key);
+            for (int x = 0; x < tw; x++) {
+                uint16_t px = mf_texel565(t, x, y, &has_key);
+                g_texscratch[(size_t)y * tw + x] = px;
+                if (!mf_texel_is_dark(px)) mask_only = false;
+            }
     } else {
         g_texscratch[0] = 0xFFFF;   // 1x1 opaque white
     }
-    blt_surface_ref_t ref = mf_upload_and_cache(key, tw, th, 0, 0, has_key, "whole");
+    blt_surface_ref_t ref = mf_upload_and_cache(key, tw, th, 0, 0, has_key, mask_only, "whole");
     *out_has_key = ref.valid ? has_key : false;
     return ref;
 }
@@ -855,7 +906,8 @@ static void mf_crop_rect(const RTexture *t, float u0, float v0, float u1, float 
 
 static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
                                               float u0, float v0, float u1, float v1,
-                                              bool *out_has_key, int *out_rx, int *out_ry) {
+                                              bool *out_has_key, int *out_rx, int *out_ry,
+                                              bool *out_mask_only) {
     int rx, ry, rw, rh;
     mf_crop_rect(t, u0, v0, u1, v1, &rx, &ry, &rw, &rh);
     *out_rx = rx; *out_ry = ry;
@@ -865,17 +917,29 @@ static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
             g_texcache[i].rw == rw && g_texcache[i].rh == rh) {
             g_texcache[i].lru = ++g_lru_clock;
             *out_has_key = g_texcache[i].has_key;
+            if (out_mask_only) *out_mask_only = g_texcache[i].mask_only;
             return g_texcache[i].ref;
         }
     if ((size_t)rw * rh > MF_TEX_TEXELS) {
-        blt_surface_ref_t bad; bad.valid = 0; *out_has_key = false; return bad;
+        blt_surface_ref_t bad; bad.valid = 0; *out_has_key = false;
+        if (out_mask_only) *out_mask_only = false;
+        return bad;
     }
     bool has_key = false;
+    // [strip in-game CRT simulation] A region containing NOTHING but transparent and black can
+    // only ever darken what is under it. obj_old_tv's tube/iris mask is exactly that: device
+    // dumps of its frames measure 100% black+colorkey with the black fraction ANIMATING
+    // (4.7% -> 27.1% -> 38.2% -> 47.8%), i.e. a tube iris opening and closing over the image.
+    bool mask_only = true;
     for (int y = 0; y < rh; y++)
-        for (int x = 0; x < rw; x++)
-            g_texscratch[(size_t)y * rw + x] = mf_texel565(t, rx + x, ry + y, &has_key);
-    blt_surface_ref_t ref = mf_upload_and_cache(key, rw, rh, rx, ry, has_key, "region");
+        for (int x = 0; x < rw; x++) {
+            uint16_t px = mf_texel565(t, rx + x, ry + y, &has_key);
+            g_texscratch[(size_t)y * rw + x] = px;
+            if (!mf_texel_is_dark(px)) mask_only = false;
+        }
+    blt_surface_ref_t ref = mf_upload_and_cache(key, rw, rh, rx, ry, has_key, mask_only, "region");
     *out_has_key = ref.valid ? has_key : false;
+    if (out_mask_only) *out_mask_only = ref.valid ? mask_only : false;
     return ref;
 }
 
@@ -1020,9 +1084,51 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         return;
     }
 
+    // [strip in-game CRT simulation] Classify this draw against the app-surface present.
+    if (src_is_appsurf && !dst_is_appsurf) {
+        float mina = 1.0f;
+        for (int i = 0; i < triCount * 3; i++) if (v[i].a < mina) mina = v[i].a;
+        if (mina >= 0.999f) {
+            g_appsurf_presented = true;        // the real present: always emitted
+        } else if (g_appsurf_presented && mf_strip_crt()) {
+            g_crt_stripped++;                  // obj_old_tv's ghost over an already-present image
+            return;
+        }
+    }
+
     // [duplicate-draw elimination] Identical to the draw immediately before it, with an
     // idempotent blend => re-running it cannot change a pixel. Skip the whole thing:
     // no staging, no vertex push, no command.
+#ifdef MISTER_NATIVE_VIDEO
+    // [composite characterisation] Is the second full-screen pass a BLUR/BLOOM (offset or
+    // scaled UVs, genuinely new pixels) or the SAME image re-blended over itself? The latter
+    // is a mathematical no-op whatever its alpha, because the first pass already wrote
+    // dst = src, so a*src + (1-a)*dst == src. Dump both draws' vertices once to tell them
+    // apart -- position, UV, tint and alpha, since only alpha may differ for the no-op case.
+    if (mf_stat_on()) {
+        static int shots = 0;
+        static bool have_prev = false;
+        static uint32_t p_fbo, p_key; static int p_tri;
+        static BVtx p_v[MF_DUP_MAX_TRIS * 3];
+        if (have_prev && shots < 2 && p_fbo == d->fbo && p_key == tex_key &&
+            p_tri == triCount && triCount == 2) {
+            for (int i = 0; i < 6; i++)
+                fprintf(stderr, "MFVTX prev[%d] xy=%.2f,%.2f uv=%.4f,%.4f rgba=%.3f,%.3f,%.3f,%.3f | "
+                        "cur[%d] xy=%.2f,%.2f uv=%.4f,%.4f rgba=%.3f,%.3f,%.3f,%.3f\n",
+                        i, (double)p_v[i].x, (double)p_v[i].y, (double)p_v[i].u, (double)p_v[i].v,
+                        (double)p_v[i].r, (double)p_v[i].g, (double)p_v[i].b, (double)p_v[i].a,
+                        i, (double)v[i].x, (double)v[i].y, (double)v[i].u, (double)v[i].v,
+                        (double)v[i].r, (double)v[i].g, (double)v[i].b, (double)v[i].a);
+            shots++;
+        }
+        if (triCount <= MF_DUP_MAX_TRIS) {
+            p_fbo = d->fbo; p_key = tex_key; p_tri = triCount;
+            memcpy(p_v, v, sizeof(BVtx) * (size_t)triCount * 3);
+            have_prev = true;
+        } else have_prev = false;
+    }
+#endif
+
     if (triCount > 0 && triCount <= MF_DUP_MAX_TRIS &&
         mf_draw_is_idempotent(v, triCount * 3, bl)) {
         if (g_last_draw.valid && g_last_draw.fbo == d->fbo && g_last_draw.tex_key == tex_key &&
@@ -1233,8 +1339,29 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
             continue;
         }
 
-        bool has_key = false; int srx = 0, sry = 0;
-        blt_surface_ref_t tex = stage_texture_region(tex_key, t, u0, v0, u1, v1, &has_key, &srx, &sry);
+        bool has_key = false; int srx = 0, sry = 0; bool mask_only = false;
+        blt_surface_ref_t tex = stage_texture_region(tex_key, t, u0, v0, u1, v1, &has_key, &srx, &sry,
+                                                    &mask_only);
+        // [strip in-game CRT simulation] obj_old_tv's CRT overlay: a FULL-SCREEN pass whose
+        // staged region holds nothing but transparent and very dark texels -- the tube bezel
+        // plus its SCANLINE shading -- drawn over the image
+        // after it has already been presented. Its entire contribution is darkening the edges,
+        // which is the framework's job on this hardware, and it costs a whole full-screen pass
+        // (a screen-aligned quad is 2 triangles that EACH walk the full-screen bbox).
+        //
+        // The full-screen test is what keeps ordinary art safe: plenty of sprites are black +
+        // transparent (shadows, silhouettes, letterboxing bars), and those must still draw.
+        if (mask_only && mf_strip_crt() && g_appsurf_presented && !dst_is_appsurf) {
+            float qx0 = gv[0].x, qx1 = gv[0].x, qy0 = gv[0].y, qy1 = gv[0].y;
+            for (int i = 1; i < 6; i++) {
+                if (gv[i].x < qx0) qx0 = gv[i].x;   if (gv[i].x > qx1) qx1 = gv[i].x;
+                if (gv[i].y < qy0) qy0 = gv[i].y;   if (gv[i].y > qy1) qy1 = gv[i].y;
+            }
+            if ((qx1 - qx0) >= 0.8f * (float)d->w && (qy1 - qy0) >= 0.8f * (float)d->h) {
+                g_crt_stripped++;
+                continue;
+            }
+        }
         if (!tex.valid) {
             // The failed upload left g_e.overflow set -> the whole frame drops at
             // frame_end (correct: a texture that can't fit -- heap or cache-table
@@ -1284,8 +1411,8 @@ static void mf_frame_end(void) {
     if (mf_stat_on()) {
         static uint32_t nf = 0, last = 0;
         if (++nf % 300 == 0) {
-            fprintf(stderr, "MFDUP frames=%u dup_draws_elided=%u (+%u since last)\n",
-                    nf, g_dup_skipped, g_dup_skipped - last);
+            fprintf(stderr, "MFDUP frames=%u dup_draws_elided=%u (+%u since last) crt_ghost_stripped=%u\n",
+                    nf, g_dup_skipped, g_dup_skipped - last, g_crt_stripped);
             last = g_dup_skipped;
         }
     }
@@ -1373,6 +1500,8 @@ extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void) { return g_drop_coun
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void) { return g_last_trilist_blend; }
 // [duplicate-draw elimination] draws elided because they repeated the previous one verbatim.
 extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void) { return g_dup_skipped; }
+// [strip in-game CRT simulation] old-TV ghost passes dropped.
+extern "C" uint32_t RasterBackend_MFGPU_TestCrtStripped(void) { return g_crt_stripped; }
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_inited = false; g_frame_active = false;
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap

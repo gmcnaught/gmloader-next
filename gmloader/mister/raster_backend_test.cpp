@@ -57,6 +57,7 @@ extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void);
 // blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestCrtStripped(void);
 
 extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
 
@@ -1438,6 +1439,169 @@ static int case_dup_draw_elision(void) {
     return 1;
 }
 
+// [strip in-game CRT simulation] obj_old_tv redraws the app surface over itself at ~70% alpha
+// to fake phosphor ghosting. We drop that: the display path already applies real CRT treatment,
+// so it is wasted fabric time AND double-applied. This case pins the rule and, more importantly,
+// pins its SAFETY CONDITION -- obj_fade_in/obj_fade_out legitimately draw the app surface
+// TRANSLUCENTLY over a cleared target, and swallowing that would blank the screen for the whole
+// transition. So a translucent app-surface pass is dropped ONLY once an opaque present of that
+// surface has already landed this frame.
+static int case_strip_crt_ghost(void) {
+    enum { W = 64, H = 48 };
+    const uint32_t APPSURF_FBO = 60, APPSURF_TEX = 61;
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+
+    // full-screen quad over the app surface; alpha filled in per-case
+    BVtx q[6] = {
+        {   0.f,   0.f, 0.f,1.f, 1,1,1,1 }, { (float)W,   0.f, 1.f,1.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,0.f, 1,1,1,1 },
+        {   0.f,   0.f, 0.f,1.f, 1,1,1,1 }, { (float)W,(float)H, 1.f,0.f, 1,1,1,1 }, {   0.f,(float)H, 0.f,0.f, 1,1,1,1 },
+    };
+    static const uint8_t px[4] = { 200, 120, 40, 255 };
+    RTexture t = { px, 1, 1, 1, 1, 0, 1 };
+
+    // --- present (opaque) then ghost (translucent): the ghost must be dropped -------
+    RasterBackend_MFGPU_SetAppSurface(APPSURF_FBO, APPSURF_TEX);
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    for (int i = 0; i < 6; i++) q[i].a = 1.0f;
+    backend_mfgpu.draw(&s_mf, q, 2, &t, RB_ALPHA, 0.0f, APPSURF_TEX);   // present
+    for (int i = 0; i < 6; i++) q[i].a = 0.698f;
+    backend_mfgpu.draw(&s_mf, q, 2, &t, RB_ALPHA, 0.0f, APPSURF_TEX);   // obj_old_tv ghost
+    backend_mfgpu.present(&s_mf);
+    const uint32_t stripped = RasterBackend_MFGPU_TestCrtStripped();
+    if (stripped != 1) {
+        printf("  FAIL strip-crt  ghost pass not dropped (stripped=%u want 1)\n", stripped);
+        return 0;
+    }
+
+    // --- fade: translucent app-surface draw with NO preceding opaque present --------
+    // This is obj_fade_in's shape. It MUST survive, or transitions go black.
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    for (int i = 0; i < 6; i++) q[i].a = 0.35f;
+    backend_mfgpu.draw(&s_mf, q, 2, &t, RB_ALPHA, 0.0f, APPSURF_TEX);   // mid-fade
+    backend_mfgpu.present(&s_mf);
+    if (RasterBackend_MFGPU_TestCrtStripped() != 0) {
+        printf("  FAIL strip-crt  a FADE was swallowed (stripped=%u) - transitions would go black\n",
+               RasterBackend_MFGPU_TestCrtStripped());
+        return 0;
+    }
+    static uint16_t fb_fade[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb_fade);
+    bool any = false;
+    for (int i = 0; i < BW*BH; i++) if (fb_fade[i]) { any = true; break; }
+    if (!any) {
+        printf("  FAIL strip-crt  fade frame rendered empty - the fade draw did not survive\n");
+        return 0;
+    }
+
+    RasterBackend_MFGPU_SetAppSurface(0, 0);
+    printf("  OK   strip-crt  old-TV ghost dropped, fade-from-black preserved\n");
+    return 1;
+}
+
+// [strip in-game CRT simulation] obj_old_tv also draws a FULL-SCREEN tube/iris mask: a region
+// holding nothing but transparent and black, whose whole contribution is darkening the edges.
+// Device dumps show its frames are 100% black+colorkey with the black fraction animating
+// (4.7% -> 47.8%). We drop it -- that darkening is the display path's job here, and it costs a
+// full-screen pass. The SAFETY half is what this case really pins: plenty of ordinary art is
+// black + transparent (shadows, silhouettes), so only a FULL-SCREEN such overlay may be
+// dropped, and only once the image has already been presented.
+static int case_strip_crt_mask(void) {
+    const uint32_t APPSURF_FBO = 70, APPSURF_TEX = 71;
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+
+    // 64x64 page: opaque BLACK top-left quadrant, transparent elsewhere. Sampling a 16x16
+    // sub-rect of it keeps this on the sub-region staging path (not the whole-page fallback).
+    // Modelled on the REAL overlay measured on device: pure black bezel plus SCANLINE shading
+    // in very dark browns. Using (40,28,8) rather than pure black is deliberate -- it is the
+    // actual scanline colour, and a "black only" rule rejected it, which is what let the CRT
+    // overlay through the first time.
+    static uint8_t page[64*64*4];
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 64; x++) {
+            uint8_t *q = &page[(y*64+x)*4];
+            bool inmask = (x < 32 && y < 32);
+            bool scan   = inmask && (y & 1);
+            q[0] = scan ? 40 : 0; q[1] = scan ? 28 : 0; q[2] = scan ? 8 : 0;
+            q[3] = inmask ? 255 : 0;
+        }
+    RTexture mask = { page, 64, 64, 64, 64, 0, 1 };
+    // Bright art of the same shape: must NEVER be stripped, whatever its size.
+    static uint8_t bright[64*64*4];
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 64; x++) {
+            uint8_t *q = &bright[(y*64+x)*4];
+            bool on = (x < 32 && y < 32);
+            q[0]=200; q[1]=180; q[2]=90; q[3] = on ? 255 : 0;
+        }
+    RTexture art = { bright, 64, 64, 64, 64, 0, 1 };
+    static const uint8_t opaque[4] = { 200, 120, 40, 255 };
+    RTexture surf = { opaque, 1, 1, 1, 1, 0, 1 };
+
+    auto quad = [](BVtx *q, float w, float h) {
+        const float u0=0.f, u1=0.25f, v0=0.f, v1=0.25f;   // 16x16 of the 64x64 page
+        q[0]={0,0,u0,v0,1,1,1,1}; q[1]={w,0,u1,v0,1,1,1,1}; q[2]={w,h,u1,v1,1,1,1,1};
+        q[3]={0,0,u0,v0,1,1,1,1}; q[4]={w,h,u1,v1,1,1,1,1}; q[5]={0,h,u0,v1,1,1,1,1};
+    };
+    BVtx present[6]; quad(present, (float)BW, (float)BH);
+
+    // --- full-screen mask after a present: dropped ---------------------------------
+    RasterBackend_MFGPU_SetAppSurface(APPSURF_FBO, APPSURF_TEX);
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, present, 2, &surf, RB_ALPHA, 0.0f, APPSURF_TEX);   // present
+    BVtx big[6]; quad(big, (float)BW, (float)BH);
+    backend_mfgpu.draw(&s_mf, big, 2, &mask, RB_ALPHA, 0.0f, next_key());        // iris mask
+    backend_mfgpu.present(&s_mf);
+    if (RasterBackend_MFGPU_TestCrtStripped() != 1) {
+        printf("  FAIL strip-mask  full-screen black/transparent overlay not dropped (%u)\n",
+               RasterBackend_MFGPU_TestCrtStripped());
+        return 0;
+    }
+
+    // --- SMALL black/transparent sprite (a shadow): must still draw ------------------
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.clear(&s_mf, 255,255,255,255);
+    backend_mfgpu.draw(&s_mf, present, 2, &surf, RB_ALPHA, 0.0f, APPSURF_TEX);   // present
+    BVtx small[6]; quad(small, 24.f, 18.f);
+    backend_mfgpu.draw(&s_mf, small, 2, &mask, RB_ALPHA, 0.0f, next_key());      // shadow
+    backend_mfgpu.present(&s_mf);
+    if (RasterBackend_MFGPU_TestCrtStripped() != 0) {
+        printf("  FAIL strip-mask  a SMALL black sprite was dropped (%u) - shadows would vanish\n",
+               RasterBackend_MFGPU_TestCrtStripped());
+        return 0;
+    }
+    static uint16_t fb[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb);
+    bool any_black = false;
+    for (int y = 0; y < 12; y++) for (int x = 0; x < 16; x++) if (fb[y*BW+x] == 0) any_black = true;
+    if (!any_black) {
+        printf("  FAIL strip-mask  small black sprite did not render\n");
+        return 0;
+    }
+
+    // --- FULL-SCREEN BRIGHT art after a present: must survive ------------------------
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, present, 2, &surf, RB_ALPHA, 0.0f, APPSURF_TEX);
+    backend_mfgpu.draw(&s_mf, big, 2, &art, RB_ALPHA, 0.0f, next_key());
+    backend_mfgpu.present(&s_mf);
+    if (RasterBackend_MFGPU_TestCrtStripped() != 0) {
+        printf("  FAIL strip-mask  BRIGHT full-screen art was stripped (%u) - the rule must key "
+               "on darkness, not on covering the screen\n", RasterBackend_MFGPU_TestCrtStripped());
+        return 0;
+    }
+
+    RasterBackend_MFGPU_SetAppSurface(0, 0);
+    printf("  OK   strip-mask  scanline overlay dropped; small dark sprite and bright art kept\n");
+    return 1;
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -1492,5 +1656,9 @@ int main(void){
     else printf("raster_backend mfgpu-opaque-alpha-copy OK\n");
     if (!case_dup_draw_elision()) { printf("FAIL mfgpu-dup-draw\n"); ok = 0; }
     else printf("raster_backend mfgpu-dup-draw OK\n");
+    if (!case_strip_crt_ghost()) { printf("FAIL mfgpu-strip-crt\n"); ok = 0; }
+    else printf("raster_backend mfgpu-strip-crt OK\n");
+    if (!case_strip_crt_mask()) { printf("FAIL mfgpu-strip-mask\n"); ok = 0; }
+    else printf("raster_backend mfgpu-strip-mask OK\n");
     return ok ? 0 : 1;
 }
