@@ -1268,6 +1268,54 @@ static int case_inflight_drop(void) {
     return 1;
 }
 
+// [in-flight-batch guard] The guard must never DEADLOCK. Device-observed 2026-07-24: the
+// fabric can wedge on seq=1 and never ack at all, at which point an unbounded guard drops
+// every frame forever and the game never renders — strictly worse than the corruption the
+// guard prevents. So after MF_DROP_LIMIT consecutive drops it reclaims the ring and rebuilds.
+// This case holds the predicate at "busy" indefinitely and asserts that service resumes anyway.
+static int case_inflight_drop_limit(void) {
+    static const uint8_t red[4]  = { 255, 0, 0, 255 };
+    static const uint8_t blue[4] = { 0, 0, 255, 255 };
+    RTexture t_red  = { red,  1, 1, 1, 1, 0, 1 };
+    RTexture t_blue = { blue, 1, 1, 1, 1, 0, 1 };
+    BVtx v[3] = { {1,1,0,0,1,1,1,1}, {60,1,1,0,1,1,1,1}, {1,60,0,1,1,1,1,1} };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, v, 1, &t_red, RB_NONE, 0.f, next_key());
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fbA[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbA);
+
+    // the fabric never acks -- hold "busy" for far longer than the limit
+    RasterBackend_MFGPU_TestSetFabricBusy(1);
+    int executed_at = -1;
+    static uint16_t fbN[BW*BH];
+    for (int f = 0; f < 200; f++) {
+        backend_mfgpu.clear(&s_mf, 0,0,0,255);
+        backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, next_key());
+        backend_mfgpu.present(&s_mf);
+        RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbN);
+        if (memcmp(fbA, fbN, sizeof fbA) != 0) { executed_at = f; break; }
+    }
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+    if (executed_at < 0) {
+        printf("  FAIL inflight-drop-limit  guard deadlocked: 200 frames dropped, none executed\n");
+        return 0;
+    }
+    if (executed_at < 30) {
+        printf("  FAIL inflight-drop-limit  gave up after only %d frames (limit is meant to be ~60)\n",
+               executed_at);
+        return 0;
+    }
+    printf("  OK   inflight-drop-limit  reclaimed the ring at frame %d (no deadlock)\n", executed_at);
+    return 1;
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -1316,5 +1364,7 @@ int main(void){
     else printf("raster_backend mfgpu-atlas-subregion OK\n");
     if (!case_inflight_drop()) { printf("FAIL mfgpu-inflight-drop\n"); ok = 0; }
     else printf("raster_backend mfgpu-inflight-drop OK\n");
+    if (!case_inflight_drop_limit()) { printf("FAIL mfgpu-inflight-drop-limit\n"); ok = 0; }
+    else printf("raster_backend mfgpu-inflight-drop-limit OK\n");
     return ok ? 0 : 1;
 }

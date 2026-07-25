@@ -137,6 +137,11 @@ static uint32_t g_pending_seq      = 0;      // the submit_seq we are waiting on
 static bool     g_frame_dropped    = false;  // this frame is being dropped (emit nothing)
 static uint32_t g_drop_count       = 0;      // frames dropped since reinit (test hook)
 static int      g_test_fabric_busy = -1;     // host tests force the predicate (-1 = ask for real)
+static uint32_t g_drop_run         = 0;      // consecutive drops (bounded by MF_DROP_LIMIT)
+// ~1s at 60Hz. Long enough that every recovering stall measured on device (0.5s-18s) is
+// covered by dropping rather than stomping for its first second, short enough that a fabric
+// which never acks at all costs a second of black instead of a permanent freeze.
+enum { MF_DROP_LIMIT = 60 };
 
 static uint32_t   g_tex_heap_cap = 0;   // 0 => full MF_TEX_HEAP; else test override
 
@@ -420,7 +425,7 @@ static void mf_init_once(void) {
 #endif
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
-    g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0;
+    g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
     g_inited = true;
 }
 
@@ -451,16 +456,27 @@ static void mf_frame_begin(void) {
     // [in-flight-batch guard] Decide BEFORE blt_begin_frame: it is the call that would
     // rewind the cursors over a live batch.
     if (g_fabric_pending) {
-        if (mf_fabric_still_busy()) {
+        if (mf_fabric_still_busy() && g_drop_run < MF_DROP_LIMIT) {
             g_frame_dropped = true;
             g_frame_active  = true;   // so present() still closes the frame
+            g_drop_run++;
             if ((g_drop_count++ % 60u) == 0u)
                 fprintf(stderr, "backend_mfgpu: fabric still on seq=%u - frame dropped "
                         "(ring left intact; %u dropped)\n", g_pending_seq, g_drop_count);
             return;
         }
-        g_fabric_pending = false;     // acked: the ring is ours again
+        // Give up rather than deadlock. A fabric that NEVER acks — device-observed on
+        // 2026-07-24: the permanent frame-1 wedge, sub=1 done=0 — would otherwise make
+        // this guard drop every frame forever, so the game would never render at all.
+        // That is strictly worse than the corruption the guard exists to prevent. After
+        // MF_DROP_LIMIT consecutive drops, reclaim the ring and rebuild: one deliberate
+        // stomp as a last resort, instead of one per frame.
+        if (g_drop_run >= MF_DROP_LIMIT)
+            fprintf(stderr, "backend_mfgpu: fabric never acked seq=%u after %u frames - "
+                    "reclaiming the ring\n", g_pending_seq, (unsigned)MF_DROP_LIMIT);
+        g_fabric_pending = false;     // acked (or reclaimed): the ring is ours again
     }
+    g_drop_run = 0;
     g_frame_dropped = false;
     // Snapshot the pin floor for this frame: any g_texcache entry touched
     // (hit or staged) from here through mf_frame_end gets .lru > this value
