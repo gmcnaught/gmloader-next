@@ -138,10 +138,24 @@ static bool     g_frame_dropped    = false;  // this frame is being dropped (emi
 static uint32_t g_drop_count       = 0;      // frames dropped since reinit (test hook)
 static int      g_test_fabric_busy = -1;     // host tests force the predicate (-1 = ask for real)
 static uint32_t g_drop_run         = 0;      // consecutive drops (bounded by MF_DROP_LIMIT)
-// ~1s at 60Hz. Long enough that every recovering stall measured on device (0.5s-18s) is
-// covered by dropping rather than stomping for its first second, short enough that a fabric
-// which never acks at all costs a second of black instead of a permanent freeze.
-enum { MF_DROP_LIMIT = 60 };
+// Default ~1s at 60Hz: long enough that a short stall is covered by dropping rather than
+// stomping, short enough that a fabric which never acks costs a second of black instead of a
+// permanent freeze. Overridable with GMLOADER_MFGPU_DROP_LIMIT because the right value is an
+// open experimental question: measured stalls run to ~18s, so 60 frames still crosses a long
+// one ~6 times, and each crossing rebuilds the ring under a live batch. Setting it above a
+// full stall (>=400 frames at the game's ~19fps) makes an episode completely stomp-free, which
+// is how we test whether recurring stalls are partly a self-sustaining tail of earlier stomps
+// (staged texture bytes and the ring persist across frames) rather than independent events.
+enum { MF_DROP_LIMIT_DEFAULT = 60 };
+static uint32_t mf_drop_limit(void) {
+    static uint32_t v = 0;
+    if (!v) {
+        const char *e = getenv("GMLOADER_MFGPU_DROP_LIMIT");
+        long n = (e && *e) ? atol(e) : 0;
+        v = (n > 0) ? (uint32_t)n : (uint32_t)MF_DROP_LIMIT_DEFAULT;
+    }
+    return v;
+}
 
 static uint32_t   g_tex_heap_cap = 0;   // 0 => full MF_TEX_HEAP; else test override
 
@@ -456,7 +470,7 @@ static void mf_frame_begin(void) {
     // [in-flight-batch guard] Decide BEFORE blt_begin_frame: it is the call that would
     // rewind the cursors over a live batch.
     if (g_fabric_pending) {
-        if (mf_fabric_still_busy() && g_drop_run < MF_DROP_LIMIT) {
+        if (mf_fabric_still_busy() && g_drop_run < mf_drop_limit()) {
             g_frame_dropped = true;
             g_frame_active  = true;   // so present() still closes the frame
             g_drop_run++;
@@ -471,9 +485,9 @@ static void mf_frame_begin(void) {
         // That is strictly worse than the corruption the guard exists to prevent. After
         // MF_DROP_LIMIT consecutive drops, reclaim the ring and rebuild: one deliberate
         // stomp as a last resort, instead of one per frame.
-        if (g_drop_run >= MF_DROP_LIMIT)
+        if (g_drop_run >= mf_drop_limit())
             fprintf(stderr, "backend_mfgpu: fabric never acked seq=%u after %u frames - "
-                    "reclaiming the ring\n", g_pending_seq, (unsigned)MF_DROP_LIMIT);
+                    "reclaiming the ring\n", g_pending_seq, mf_drop_limit());
         g_fabric_pending = false;     // acked (or reclaimed): the ring is ours again
     }
     g_drop_run = 0;
