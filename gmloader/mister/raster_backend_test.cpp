@@ -56,6 +56,7 @@ extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy);
 extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void);
 // blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void);
 
 extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
 
@@ -1361,6 +1362,82 @@ static int case_opaque_alpha_to_copy(void) {
     return 1;
 }
 
+// [duplicate-draw elimination] The device frame graph draws the app-surface composite TWICE,
+// byte-identical, and each pass is 2 triangles that each walk the full-screen bounding box
+// (~16ms for the pair, measured in fabric_soak) -- so the repeat is ~8ms, about a quarter of
+// the frame. Skipping it needs no visual judgement: an OPAQUE draw goes out as COPY (or
+// COLORKEY), and re-running either over its own output lands on identical pixels. A
+// TRANSLUCENT draw composites, so a repeat genuinely darkens and must be kept. Both
+// directions are asserted here against the real pixels, not just the skip counter.
+static int case_dup_draw_elision(void) {
+    static const uint8_t opaque[4] = { 220, 40, 40, 255 };
+    RTexture t = { opaque, 1, 1, 1, 1, 0, 1 };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+
+    BVtx solid[3] = { {2,2,0,0,1,1,1,1}, {50,4,1,0,1,1,1,1}, {4,50,0,1,1,1,1,1} };
+    BVtx faded[3] = { {2,2,0,0,1,1,1,0.5f}, {50,4,1,0,1,1,1,0.5f}, {4,50,0,1,1,1,1,0.5f} };
+
+    // opaque drawn ONCE
+    RasterBackend_MFGPU_TestReinit(0);
+    const uint32_t k1 = next_key();
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, solid, 1, &t, RB_ALPHA, 0.0f, k1);   // 0.0f = the real call site's alphaRef
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fb_once[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb_once);
+
+    // opaque drawn TWICE: must elide the repeat and land on identical pixels
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, solid, 1, &t, RB_ALPHA, 0.0f, k1);   // 0.0f = the real call site's alphaRef
+    backend_mfgpu.draw(&s_mf, solid, 1, &t, RB_ALPHA, 0.0f, k1);   // 0.0f = the real call site's alphaRef
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fb_twice[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb_twice);
+    const uint32_t skipped_opaque = RasterBackend_MFGPU_TestDupSkipped();
+
+    if (skipped_opaque != 1) {
+        printf("  FAIL dup-draw  repeated opaque draw not elided (skipped=%u want 1)\n", skipped_opaque);
+        return 0;
+    }
+    if (memcmp(fb_once, fb_twice, sizeof fb_once) != 0) {
+        printf("  FAIL dup-draw  eliding changed the image\n");
+        return 0;
+    }
+
+    // translucent drawn TWICE: must NOT be elided, and must genuinely differ from once
+    RasterBackend_MFGPU_TestReinit(0);
+    const uint32_t k2 = next_key();
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, faded, 1, &t, RB_ALPHA, 0.0f, k2);
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fa_once[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fa_once);
+
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.clear(&s_mf, 0,0,0,255);
+    backend_mfgpu.draw(&s_mf, faded, 1, &t, RB_ALPHA, 0.0f, k2);
+    backend_mfgpu.draw(&s_mf, faded, 1, &t, RB_ALPHA, 0.0f, k2);
+    backend_mfgpu.present(&s_mf);
+    static uint16_t fa_twice[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fa_twice);
+
+    if (RasterBackend_MFGPU_TestDupSkipped() != 0) {
+        printf("  FAIL dup-draw  translucent repeat was elided (%u) - it composites, so it counts\n",
+               RasterBackend_MFGPU_TestDupSkipped());
+        return 0;
+    }
+    if (memcmp(fa_once, fa_twice, sizeof fa_once) == 0) {
+        printf("  FAIL dup-draw  translucent double-draw looks identical to a single one; "
+               "this case cannot tell elision from correctness\n");
+        return 0;
+    }
+    printf("  OK   dup-draw  opaque repeat elided (pixels identical), translucent repeat kept\n");
+    return 1;
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -1413,5 +1490,7 @@ int main(void){
     else printf("raster_backend mfgpu-inflight-drop-limit OK\n");
     if (!case_opaque_alpha_to_copy()) { printf("FAIL mfgpu-opaque-alpha-copy\n"); ok = 0; }
     else printf("raster_backend mfgpu-opaque-alpha-copy OK\n");
+    if (!case_dup_draw_elision()) { printf("FAIL mfgpu-dup-draw\n"); ok = 0; }
+    else printf("raster_backend mfgpu-dup-draw OK\n");
     return ok ? 0 : 1;
 }

@@ -139,6 +139,49 @@ static uint32_t g_drop_count       = 0;      // frames dropped since reinit (tes
 static int      g_test_fabric_busy = -1;     // host tests force the predicate (-1 = ask for real)
 static uint32_t g_drop_run         = 0;      // consecutive drops (bounded by MF_DROP_LIMIT)
 static int      g_last_trilist_blend = -1;   // blend mode of the last TRILIST emitted (test hook)
+
+// [duplicate-draw elimination] The measured device frame graph emits the app-surface
+// composite TWICE per frame, byte-identical: same target, same source texture, same
+// full-screen rect, same blend (see the frame-graph capture in the ledger). Each of those
+// passes is 2 triangles that each walk the FULL-SCREEN bounding box, and a harness A/B
+// prices the pair at ~16ms of a frame -- so the redundant one is ~8ms, about a quarter of
+// the whole frame.
+//
+// Dropping it needs no visual judgement, because a repeat is provably a no-op when the
+// blend is idempotent. An opaque draw goes out as BLT_BLEND_COPY (or BLT_BLEND_COLORKEY
+// when the region is keyed); COPY writes src over dst and COLORKEY writes src where it is
+// not the key, so running either a second time over its own output lands on exactly the
+// same pixels. A translucent draw does NOT qualify -- CONST_ALPHA composites, so a repeat
+// darkens -- and is deliberately left alone.
+//
+// Self-verifying: if the two draws are ever not truly identical (different UVs, a moved
+// vertex), the comparison simply fails and both are emitted, costing one memcmp.
+enum { MF_DUP_MAX_TRIS = 16 };   // covers full-screen quads; keeps the compare trivial
+static struct {
+    bool     valid;
+    uint32_t fbo, tex_key;
+    int      bl;
+    float    ar;
+    int      triCount;
+    BVtx     v[MF_DUP_MAX_TRIS * 3];
+} g_last_draw;
+static uint32_t g_dup_skipped = 0;   // draws elided this run (test hook + device log)
+
+// Would this draw go out with an idempotent blend? Mirrors mf_emit_group's decision:
+// fully opaque => COPY or COLORKEY (both idempotent), anything else => CONST_ALPHA.
+//
+// NOTE `ar` is alphaRef -- the ALPHA-TEST THRESHOLD (gm_AlphaRefValue), not an opacity
+// multiplier, and blitter.cpp:599 passes a constant 0.0f. An earlier version of this
+// function required ar >= 0.999 as if it were opacity, which made the elision dead on
+// arrival: it could never fire on a real draw. The threshold is irrelevant to idempotency
+// anyway -- alpha test discards the same pixels every time -- and the signature comparison
+// at the call site still requires the two draws to share the same ar, so a differing
+// threshold blocks elision there.
+static bool mf_draw_is_idempotent(const BVtx *v, int nverts, RBlend bl) {
+    if (bl != RB_NONE && bl != RB_ALPHA) return false;   // ADD/MULTIPLY accumulate
+    for (int i = 0; i < nverts; i++) if (v[i].a < 0.999f) return false;   // per-vertex opacity
+    return true;
+}
 // Default ~1s at 60Hz: long enough that a short stall is covered by dropping rather than
 // stomping, short enough that a fabric which never acks costs a second of black instead of a
 // permanent freeze. Overridable with GMLOADER_MFGPU_DROP_LIMIT because the right value is an
@@ -476,6 +519,7 @@ static void mf_init_once(void) {
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
     g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
+    g_last_draw.valid = false; g_dup_skipped = 0;
     g_inited = true;
 }
 
@@ -528,6 +572,7 @@ static void mf_frame_begin(void) {
     }
     g_drop_run = 0;
     g_frame_dropped = false;
+    g_last_draw.valid = false;   // [duplicate-draw elimination] never span frames
     // Snapshot the pin floor for this frame: any g_texcache entry touched
     // (hit or staged) from here through mf_frame_end gets .lru > this value
     // and is thus protected from eviction until the NEXT frame begins (see
@@ -566,6 +611,7 @@ static void mf_select_target(uint32_t fbo) {
 static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     mf_ensure_frame();
     if (g_frame_dropped) return;   // [in-flight-batch guard] emit nothing this frame
+    g_last_draw.valid = false;     // [duplicate-draw elimination] a clear breaks the run
     mf_select_target(d->fbo);
     (void)a;   // fabric FILL writes opaque RGB565; no alpha channel on the wire
     int w = d->w < BLT_FB_WIDTH  ? d->w : BLT_FB_WIDTH;
@@ -974,6 +1020,29 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         return;
     }
 
+    // [duplicate-draw elimination] Identical to the draw immediately before it, with an
+    // idempotent blend => re-running it cannot change a pixel. Skip the whole thing:
+    // no staging, no vertex push, no command.
+    if (triCount > 0 && triCount <= MF_DUP_MAX_TRIS &&
+        mf_draw_is_idempotent(v, triCount * 3, bl)) {
+        if (g_last_draw.valid && g_last_draw.fbo == d->fbo && g_last_draw.tex_key == tex_key &&
+            g_last_draw.bl == (int)bl && g_last_draw.ar == ar &&
+            g_last_draw.triCount == triCount &&
+            memcmp(g_last_draw.v, v, sizeof(BVtx) * (size_t)triCount * 3) == 0) {
+            g_dup_skipped++;
+            return;
+        }
+        g_last_draw.valid    = true;
+        g_last_draw.fbo      = d->fbo;
+        g_last_draw.tex_key  = tex_key;
+        g_last_draw.bl       = (int)bl;
+        g_last_draw.ar       = ar;
+        g_last_draw.triCount = triCount;
+        memcpy(g_last_draw.v, v, sizeof(BVtx) * (size_t)triCount * 3);
+    } else {
+        g_last_draw.valid = false;   // anything non-qualifying breaks the run
+    }
+
     // Any OTHER (non-default, non-appsurf) render-to-texture target: the
     // fabric has one scanout FB plus the one app-surface BRAM, so effect
     // surfaces beyond the application surface stay on the SW rasterizer
@@ -1209,6 +1278,18 @@ static void mf_frame_end(void) {
     // g_lru_frame_floor (set in mf_frame_begin) still delimits exactly this
     // frame's pinned working set at this point.
     mf_heaplog_frame_set(g_e.overflow ? "frame-end(OVERFLOWED)" : "frame-end(ok)", /*verbose=*/1);
+    // [duplicate-draw elimination] report periodically so a device run shows whether the
+    // repeat the frame graph captured is actually being elided, and how often.
+#ifdef MISTER_NATIVE_VIDEO
+    if (mf_stat_on()) {
+        static uint32_t nf = 0, last = 0;
+        if (++nf % 300 == 0) {
+            fprintf(stderr, "MFDUP frames=%u dup_draws_elided=%u (+%u since last)\n",
+                    nf, g_dup_skipped, g_dup_skipped - last);
+            last = g_dup_skipped;
+        }
+    }
+#endif
     blt_end_frame(&g_e);
 #ifdef MISTER_NATIVE_VIDEO
     // Device: the ring + heap are already resident in the mmap'd DDR (the emitter
@@ -1290,6 +1371,8 @@ extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void) { return g_drop_coun
 // Blend mode the last TRILIST went out with, so a test can pin the opaque-ALPHA -> COPY
 // promotion (and, just as importantly, that a NON-opaque draw is left alone).
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void) { return g_last_trilist_blend; }
+// [duplicate-draw elimination] draws elided because they repeated the previous one verbatim.
+extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void) { return g_dup_skipped; }
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_inited = false; g_frame_active = false;
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap
