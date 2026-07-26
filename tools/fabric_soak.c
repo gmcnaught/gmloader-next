@@ -29,6 +29,12 @@
  * blitter parked in S_SNAP_DRAIN freezes both, while a blitter that is merely slow does
  * not. It also reports the fabric's own per-frame cycle counters and wd_fire_count.
  *
+ * Those cycle counters are NOT stall evidence, and the summary labels them as such.
+ * They are written only on frame COMPLETION, so a stalled fabric leaves whatever the
+ * last completed frame put in DDR — a "normal" reading during a stall is expected
+ * either way. See the note at the printf. Stall reasoning rests on scan_frozen and the
+ * measured doorbell -> C_DONE latency, both sampled live.
+ *
  * The workload knobs exist so one variable can be moved at a time. The stall is
  * suspected to live in DDR arbitration between the blitter, comp_fb_dma and the scanout
  * reader, so the interesting sweeps are --stage (DDR3->SDRAM copy traffic) and
@@ -439,8 +445,21 @@ int main(int argc, char **argv) {
     printf("\nfabric_soak: %.1fs, %u frames acked (%.1f/s), %u stalls >=%.0fms, %u giveups\n",
            elapsed, frames, elapsed > 0 ? frames / elapsed : 0.0, stalls, c.stall_ms, giveups);
     printf("  latency ms: mean=%.1f p50=%.1f p99=%.1f max=%.1f\n", mean, p50, p99, maxl);
-    printf("  fabric self-report (last frame): frame=%.2fms tri=%.2fms texwait=%.2fms  "
-           "wd_fires=%u\n", frame_ms, tri_ms, texw_ms, wd_fires);
+    /* [stale-counter warning] These three words are written ONLY on frame COMPLETION
+     * (perf_frame_cyc at blitter_top.sv:1514, inside S_WR_DONE; the other two in the
+     * same S_WR_* writeback chain). A stalled fabric is by definition not completing
+     * frames, so during a stall they hold whatever the last COMPLETED frame left in
+     * DDR. A "normal" reading here is therefore expected whether or not the fabric is
+     * wedged, and says nothing about where a stall's dwell is.
+     *
+     * That inference is exactly what made wedge probe v3 (maldita.castilla-mister
+     * 698dc8a) conclude "perf_frame_cyc stays normal during an 18s stall, therefore
+     * the dwell is outside S_CHK_NEW -> C_DONE" and wrongly eliminate S_TRI_PIX. Do
+     * not repeat it: stall reasoning belongs to scan_frozen and the measured
+     * doorbell -> C_DONE latency, which are sampled live. */
+    printf("  fabric self-report (LAST COMPLETED frame - NOT stall evidence): "
+           "frame=%.2fms tri=%.2fms texwait=%.2fms  wd_fires=%u\n",
+           frame_ms, tri_ms, texw_ms, wd_fires);
     printf("  scanout publishes during soak: %u\n", scan_last - scan_first);
     if (stalls)
         printf("  worst stall %.0fms: scanout published %u frames during it -> %s\n",
