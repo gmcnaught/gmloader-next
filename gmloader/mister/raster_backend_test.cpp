@@ -1320,6 +1320,69 @@ static int case_inflight_drop_limit(void) {
     return 1;
 }
 
+// [restage-after-drop] blt_stage is emitted once per resident page, inside a frame
+// that can be discarded (overflow / device-unmapped / drop-limit ring reclaim).
+// The DDR heap copy survives, but the SDRAM copy may never have been made; the
+// cache then serves "resident" hits the fabric samples as unwritten SDRAM — the
+// post-stall persistent-garbage mechanism. A ring discard must trigger exactly one
+// re-STAGE per cached entry on its next hit (and zero re-uploads).
+static int case_restage_after_reclaim(void) {
+    static const uint8_t px[4] = { 10, 200, 30, 255 };
+    RTexture t = { px, 1, 1, 1, 1, 0, 1 };
+    BVtx v[3] = { {1,1,0,0,1,1,1,1}, {60,1,1,0,1,1,1,1}, {1,60,0,1,1,1,1,1} };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+    uint32_t key = next_key();
+
+    // frame A (miss: upload+stage) then frame B (hit: no new stage)
+    backend_mfgpu.clear(&s, 0,0,0,255);
+    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, key);
+    backend_mfgpu.present(&s);
+    backend_mfgpu.clear(&s, 0,0,0,255);
+    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, key);
+    backend_mfgpu.present(&s);
+    const uint32_t up0 = RasterBackend_MFGPU_TestUploadCount();
+    const uint32_t st0 = RasterBackend_MFGPU_TestStageCount();
+    if (up0 != 1 || st0 != 1) {
+        printf("  FAIL restage-precondition up=%u st=%u (want 1/1: one miss, one hit)\n", up0, st0);
+        return 0;
+    }
+
+    // Hold "fabric busy" past MF_DROP_LIMIT: frames drop whole, then the guard
+    // reclaims the ring — the abandoned batch's STAGEs may never have executed.
+    RasterBackend_MFGPU_TestSetFabricBusy(1);
+    const uint32_t dr0 = RasterBackend_MFGPU_TestDropCount();
+    for (int i = 0; i <= 60 /* MF_DROP_LIMIT_DEFAULT */; i++) {
+        backend_mfgpu.clear(&s, 0,0,0,255);
+        backend_mfgpu.present(&s);
+    }
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+    if (RasterBackend_MFGPU_TestDropCount() == dr0) {
+        printf("  FAIL restage-setup: guard never engaged (no drops)\n");
+        return 0;
+    }
+
+    // Next hit on the same texture must RE-EMIT the stage — no re-upload.
+    backend_mfgpu.clear(&s, 0,0,0,255);
+    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, key);
+    backend_mfgpu.present(&s);
+    if (RasterBackend_MFGPU_TestUploadCount() != up0) {
+        printf("  FAIL restage  hit became a re-upload (up %u->%u)\n",
+               up0, RasterBackend_MFGPU_TestUploadCount());
+        return 0;
+    }
+    if (RasterBackend_MFGPU_TestStageCount() != st0 + 1) {
+        printf("  FAIL restage  stage_count=%u want=%u (discarded STAGE never re-emitted)\n",
+               RasterBackend_MFGPU_TestStageCount(), st0 + 1);
+        return 0;
+    }
+    printf("  OK   restage-after-reclaim  1 re-STAGE, 0 re-uploads\n");
+    return 1;
+}
+
 // [opaque-ALPHA -> COPY] A fully-opaque ALPHA draw over a source with no per-texel alpha is
 // a copy, but BLT_BLEND_CONST_ALPHA makes the RTL read the destination for every pixel
 // (tri_need_dst -> B_DSTW/B_DSTC, 8 states per pixel instead of 6). The measured device frame
@@ -1652,6 +1715,8 @@ int main(void){
     else printf("raster_backend mfgpu-inflight-drop OK\n");
     if (!case_inflight_drop_limit()) { printf("FAIL mfgpu-inflight-drop-limit\n"); ok = 0; }
     else printf("raster_backend mfgpu-inflight-drop-limit OK\n");
+    if (!case_restage_after_reclaim()) { printf("FAIL mfgpu-restage-after-reclaim\n"); ok = 0; }
+    else printf("raster_backend mfgpu-restage-after-reclaim OK\n");
     if (!case_opaque_alpha_to_copy()) { printf("FAIL mfgpu-opaque-alpha-copy\n"); ok = 0; }
     else printf("raster_backend mfgpu-opaque-alpha-copy OK\n");
     if (!case_dup_draw_elision()) { printf("FAIL mfgpu-dup-draw\n"); ok = 0; }
