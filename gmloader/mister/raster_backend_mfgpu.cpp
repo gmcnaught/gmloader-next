@@ -127,11 +127,14 @@ static int           g_frame_no = 0;
 // sub-rects get distinct entries; invalidate frees every entry with a matching
 // key regardless of rect.
 struct MfTexEntry { uint32_t key; bool used; bool has_key; bool mask_only; blt_surface_ref_t ref; uint64_t lru;
-                    uint16_t rx, ry, rw, rh; };
+                    uint16_t rx, ry, rw, rh;
+                    uint32_t stage_gen;   // [restage-after-drop] generation the last OP_STAGE survived to submit in
+                  };
 static MfTexEntry g_texcache[MF_TEX_CACHE_N];
 static uint64_t   g_lru_clock   = 0;
 static uint32_t   g_upload_count = 0;   // real blt_upload calls since reinit (test hook)
 static uint32_t   g_stage_count  = 0;   // BLT_OP_STAGE emits since reinit (FO Task 3 test hook)
+static uint32_t   g_stage_gen    = 0;   // [restage-after-drop] bumped whenever emitted STAGEs may have been discarded
 static bool     g_fabric_pending   = false;  // a submitted batch has not been acked yet
 static uint32_t g_pending_seq      = 0;      // the submit_seq we are waiting on
 static bool     g_frame_dropped    = false;  // this frame is being dropped (emit nothing)
@@ -546,7 +549,7 @@ static void mf_init_once(void) {
     blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_REGION);     // per-frame vertex buffer
 #endif
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
-    g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
+    g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_stage_gen = 0; g_lru_frame_floor = 0;
     g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
     g_last_draw.valid = false; g_dup_skipped = 0;
     g_appsurf_presented = false; g_crt_stripped = 0;
@@ -595,9 +598,11 @@ static void mf_frame_begin(void) {
         // That is strictly worse than the corruption the guard exists to prevent. After
         // MF_DROP_LIMIT consecutive drops, reclaim the ring and rebuild: one deliberate
         // stomp as a last resort, instead of one per frame.
-        if (g_drop_run >= mf_drop_limit())
+        if (g_drop_run >= mf_drop_limit()) {
             fprintf(stderr, "backend_mfgpu: fabric never acked seq=%u after %u frames - "
                     "reclaiming the ring\n", g_pending_seq, mf_drop_limit());
+            g_stage_gen++;   // [restage-after-drop] ring discarded; emitted STAGEs may never execute
+        }
         g_fabric_pending = false;     // acked (or reclaimed): the ring is ours again
     }
     g_drop_run = 0;
@@ -823,7 +828,8 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
     if (g_texcache[slot].used)
         blt_emitter_free(&g_e, g_texcache[slot].ref.off, g_texcache[slot].ref.size);
     g_texcache[slot] = MfTexEntry{ key, true, has_key, mask_only, ref, ++g_lru_clock,
-                                   (uint16_t)rx, (uint16_t)ry, (uint16_t)w, (uint16_t)h };
+                                   (uint16_t)rx, (uint16_t)ry, (uint16_t)w, (uint16_t)h,
+                                   g_stage_gen };
     return ref;
 }
 
@@ -853,6 +859,17 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
             g_texcache[i].rx == 0 && g_texcache[i].ry == 0 &&
             g_texcache[i].rw == tw && g_texcache[i].rh == th) {
             g_texcache[i].lru = ++g_lru_clock;
+            // [restage-after-drop] a discarded ring (overflow / no device / drop-limit
+            // reclaim) may have thrown away this entry's OP_STAGE before the fabric
+            // copied it to SDRAM; the cache would then believe the page resident
+            // forever while the fabric samples unwritten SDRAM. The DDR heap copy is
+            // intact, so one idempotent re-STAGE per generation restores the invariant.
+            if (g_texcache[i].stage_gen != g_stage_gen) {
+                if (blt_stage(&g_e, g_texcache[i].ref.off,
+                              (uint32_t)g_texcache[i].ref.stride * g_texcache[i].ref.h) == 0)
+                    g_stage_count++;
+                g_texcache[i].stage_gen = g_stage_gen;
+            }
             *out_has_key = g_texcache[i].has_key;
             return g_texcache[i].ref;
         }
@@ -916,6 +933,17 @@ static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
             g_texcache[i].rx == rx && g_texcache[i].ry == ry &&
             g_texcache[i].rw == rw && g_texcache[i].rh == rh) {
             g_texcache[i].lru = ++g_lru_clock;
+            // [restage-after-drop] a discarded ring (overflow / no device / drop-limit
+            // reclaim) may have thrown away this entry's OP_STAGE before the fabric
+            // copied it to SDRAM; the cache would then believe the page resident
+            // forever while the fabric samples unwritten SDRAM. The DDR heap copy is
+            // intact, so one idempotent re-STAGE per generation restores the invariant.
+            if (g_texcache[i].stage_gen != g_stage_gen) {
+                if (blt_stage(&g_e, g_texcache[i].ref.off,
+                              (uint32_t)g_texcache[i].ref.stride * g_texcache[i].ref.h) == 0)
+                    g_stage_count++;
+                g_texcache[i].stage_gen = g_stage_gen;
+            }
             *out_has_key = g_texcache[i].has_key;
             if (out_mask_only) *out_mask_only = g_texcache[i].mask_only;
             return g_texcache[i].ref;
@@ -1425,15 +1453,20 @@ static void mf_frame_end(void) {
     // itself out. No blt_execute, no g_fb565 on the hot path.
     if (g_e.overflow) {
         fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped\n");
+        g_stage_gen++;   // [restage-after-drop] ring discarded; emitted STAGEs may never execute
         return;
     }
     if (g_dev_ok) mf_device_submit();
-    else          fprintf(stderr, "backend_mfgpu: device DDR unmapped - frame dropped\n");
+    else {
+        fprintf(stderr, "backend_mfgpu: device DDR unmapped - frame dropped\n");
+        g_stage_gen++;   // [restage-after-drop] ring discarded; emitted STAGEs may never execute
+    }
 #else
     // Host oracle: software-execute the ring into g_fb565 (parity tests read it back).
     memset(g_fb565, 0, sizeof g_fb565);
     if (g_e.overflow) {
         fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped\n");
+        g_stage_gen++;   // [restage-after-drop] ring discarded; emitted STAGEs may never execute
         return;   // nothing safe to execute this frame
     }
     int n = g_e.cmd_count;
