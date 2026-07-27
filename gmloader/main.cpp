@@ -31,6 +31,7 @@
 #include "mister/draw_trace.h"
 #include "mister/blitter.h"
 #include "mister/raster_backend.h"
+#include "mister/mister_native_audio.h"
 // Global handle to bundled libGLES_sw.so — also used by egl.cpp and gles2.cpp via extern
 void* g_gles_handle = nullptr;
 
@@ -502,11 +503,25 @@ int main(int argc, char *argv[])
     warning("DBG: SDL_VIDEODRIVER=dummy for MISTER_NATIVE_VIDEO\n");
 #endif
 
+#ifdef MISTER_NATIVE_VIDEO
+    // The FPGA owns the audio path; MiSTer's Linux has no sound card. Pin SDL
+    // to the dummy driver so SDL_Init can neither fail for want of a device
+    // nor grab one, then bring the DDR ring up.
+    setenv("SDL_AUDIODRIVER", "dummy", 1);
+#endif
+
     // Initialize SDL with video, audio, joystick, and controller support
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC) != 0) {
         fatal_error("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
         return -1;
     }
+
+#ifdef MISTER_NATIVE_VIDEO
+    fprintf(stderr, "SDL audio driver: %s\n",
+            SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "(none)");
+    if (!MisterAudio_Init())
+        warning("MisterAudio: /dev/mem unavailable, using SDL fallback\n");
+#endif
 
     // Load an SDL controller-mapping DB so pads not in SDL's built-in list are
     // recognized as GameControllers (update_inputs only handles the GameController
@@ -844,6 +859,9 @@ int main(int argc, char *argv[])
     SDL_GL_DeleteContext(sdl_ctx);
 #endif
     SDL_DestroyWindow(sdl_win);
+#ifdef MISTER_NATIVE_VIDEO
+    MisterAudio_Shutdown();
+#endif
     SDL_Quit();
 
     // Check for relaunch
