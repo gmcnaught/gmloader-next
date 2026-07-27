@@ -137,6 +137,60 @@ int main(void) {
     // 8820 / 4 = 2205 per refusal. The exact check discriminates the two.
     CHECK(t44_dropped_delta == (uint64_t)t44_refusals * 4410u);
 
+    // --- Pump ------------------------------------------------------------
+    // Start clean: drop the flood staged above and drain what the ring holds.
+    MisterAudio_Clear(t);
+    MisterAudio_Clear(t44);
+    drain_ring();
+
+    // With every track paused the pump still feeds the ring, so the DAC sees
+    // real silence rather than a held DC level.
+    CHECK(MisterAudio_PumpOnce() > 0);
+    CHECK(NativeAudioWriter_FreeFrames() < NativeAudioWriter_CapacityFrames());
+
+    // Reaching TARGET_FILL (4800) takes more than one pass because each is
+    // capped at MAX_FRAMES (4096). Pump until topped up, then a further pass
+    // must be a no-op.
+    for (int i = 0; i < 8 && MisterAudio_PumpOnce() > 0; ++i) {}
+    CHECK(MisterAudio_PumpOnce() == 0);
+
+    // Unpause and stage a known full-scale ramp; the pump must consume it.
+    drain_ring();
+    MisterAudio_Pause(t, 0);
+    static int16_t tone[2400 * 2];
+    for (int i = 0; i < 2400 * 2; ++i) tone[i] = 1000;
+    CHECK(MisterAudio_Queue(t, tone, sizeof(tone)) == 0);
+    CHECK(MisterAudio_QueuedBytes(t) == sizeof(tone));
+    CHECK(MisterAudio_PumpOnce() > 0);
+    CHECK(MisterAudio_QueuedBytes(t) == 0);       // staging drained into ring
+
+    // Two unpaused tracks sum. Feed both the same constant and check the ring
+    // holds the doubled value, saturating rather than wrapping.
+    drain_ring();
+    MisterAudio_Pause(t44, 0);
+    SDL_AudioSpec want2;
+    SDL_zero(want2);
+    want2.freq = 48000; want2.format = AUDIO_S16SYS; want2.channels = 2;
+    want2.samples = 1024;
+    MisterAudioTrack tb = MisterAudio_Open(&want2, NULL);
+    CHECK(tb != 0);
+    MisterAudio_Pause(tb, 0);
+    static int16_t loud[480 * 2];
+    for (int i = 0; i < 480 * 2; ++i) loud[i] = 20000;
+    CHECK(MisterAudio_Queue(t, loud, sizeof(loud)) == 0);
+    CHECK(MisterAudio_Queue(tb, loud, sizeof(loud)) == 0);
+    const uint32_t wr_before =
+        *(volatile uint32_t *)(g_map + 0x30u) & 0xFFFFu;
+    CHECK(MisterAudio_PumpOnce() > 0);
+    // 20000 + 20000 saturates to 32767, never wraps to a negative sample.
+    const int16_t *ring =
+        (const int16_t *)(const void *)(g_map + 0x000D0000u + wr_before);
+    CHECK(ring[0] == 32767);
+    CHECK(ring[1] == 32767);
+    MisterAudio_Close(tb);
+    MisterAudio_Pause(t44, 1);
+    MisterAudio_Pause(t, 1);
+
     // Closing frees the slot so a later open succeeds.
     MisterAudio_Close(t);
     MisterAudio_Close(t44);

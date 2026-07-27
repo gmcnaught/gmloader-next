@@ -20,6 +20,24 @@ namespace {
 const uint32_t kStagingCapBytes =
     (uint32_t)NA_SAMPLE_RATE * NA_BYTES_PER_FRAME * MISTER_AUDIO_STAGING_CAP_MS / 1000u;
 
+// Solarus's constants (mister_native_audio.cpp:56-57,105): keep ~100 ms of
+// audio queued in the ring, and never render more than 16 KiB in one pass.
+const size_t kTargetFillFrames = 4800;
+const size_t kMaxFramesPerPass = 4096;
+
+int16_t g_mixbuf[kMaxFramesPerPass * NA_CHANNELS];
+int16_t g_tmpbuf[kMaxFramesPerPass * NA_CHANNELS];
+// Scratch for pull tracks, in the TRACK's format. Sized for the worst case
+// this shim accepts: 4 bytes/frame at the highest rate any caller asks for.
+uint8_t g_pullbuf[kMaxFramesPerPass * 8];
+
+int16_t sat_add_s16(int16_t a, int16_t b) {
+    int32_t s = (int32_t)a + (int32_t)b;
+    if (s >  32767) return  32767;
+    if (s < -32768) return -32768;
+    return (int16_t)s;
+}
+
 struct Track {
     bool             open;
     bool             paused;
@@ -40,6 +58,28 @@ Track *track_of(MisterAudioTrack t) {
     if (t <= 0 || t > MISTER_AUDIO_MAX_TRACKS) return nullptr;
     Track *tr = &g_tracks[t - 1];
     return tr->open ? tr : nullptr;
+}
+
+// Ask a pull track's callback for enough source bytes to cover `want_bytes`
+// of sink output, and push the result through its converter.
+void fill_pull_track(Track *tr, int want_bytes) {
+    const int src_frame_bytes = SDL_AUDIO_BITSIZE(tr->spec.format) / 8 *
+                                tr->spec.channels;
+    if (src_frame_bytes <= 0) return;
+
+    // Sink frames -> source frames, rounded up.
+    const int want_frames = want_bytes / NA_BYTES_PER_FRAME;
+    long src_frames = ((long)want_frames * tr->spec.freq + NA_SAMPLE_RATE - 1) /
+                      NA_SAMPLE_RATE;
+    long src_bytes = src_frames * src_frame_bytes;
+    if (src_bytes > (long)sizeof(g_pullbuf)) src_bytes = sizeof(g_pullbuf);
+    if (src_bytes <= 0) return;
+
+    // Callbacks expect a fully-initialised buffer; SDL guarantees silence.
+    SDL_memset(g_pullbuf, SDL_AUDIO_ISSIGNED(tr->spec.format) ? 0 : 0x80,
+               (size_t)src_bytes);
+    tr->spec.callback(tr->spec.userdata, g_pullbuf, (int)src_bytes);
+    SDL_AudioStreamPut(tr->conv, g_pullbuf, (int)src_bytes);
 }
 
 }  // namespace
@@ -165,3 +205,59 @@ void MisterAudio_Pause(MisterAudioTrack t, int pause_on) {
 }
 
 uint64_t MisterAudio_DroppedFrames(void) { return g_dropped; }
+
+size_t MisterAudio_PumpOnce(void) {
+    if (!g_active) return 0;
+
+    const size_t cap  = NativeAudioWriter_CapacityFrames();
+    const size_t freeF = NativeAudioWriter_FreeFrames();
+    const size_t used = cap - freeF;
+    if (used >= kTargetFillFrames) return 0;
+
+    size_t want = kTargetFillFrames - used;
+    if (want > kMaxFramesPerPass) want = kMaxFramesPerPass;
+    if (want > freeF) want = freeF;
+    if (want == 0) return 0;
+
+    const int want_bytes = (int)(want * NA_BYTES_PER_FRAME);
+
+    pthread_mutex_lock(&g_lock);
+
+    // Silence is the floor, not the absence of a submit: the FPGA FIFO holds
+    // its last sample when starved, so a dry ring parks the DAC at a DC level.
+    memset(g_mixbuf, 0, (size_t)want_bytes);
+
+    int mixed = 0;
+    for (int i = 0; i < MISTER_AUDIO_MAX_TRACKS; ++i) {
+        Track *tr = &g_tracks[i];
+        if (!tr->open || tr->paused || !tr->conv) continue;
+
+        if (tr->pull && SDL_AudioStreamAvailable(tr->conv) < want_bytes)
+            fill_pull_track(tr, want_bytes);
+
+        int got = SDL_AudioStreamGet(tr->conv,
+                                     mixed == 0 ? g_mixbuf : g_tmpbuf,
+                                     want_bytes);
+        if (got <= 0) {
+            // A track with nothing available contributes silence, exactly as
+            // an underrunning SDL device would. g_mixbuf was zeroed at the top
+            // of the pass, so there is nothing to do here.
+            continue;
+        }
+        if (mixed == 0) {
+            // First contributor wrote straight into the mix buffer; zero any
+            // shortfall so the tail is silence rather than stale samples.
+            if (got < want_bytes)
+                memset((uint8_t *)g_mixbuf + got, 0, (size_t)(want_bytes - got));
+        } else {
+            const int n = got / 2;   // samples, not frames
+            for (int s = 0; s < n; ++s)
+                g_mixbuf[s] = sat_add_s16(g_mixbuf[s], g_tmpbuf[s]);
+        }
+        ++mixed;
+    }
+
+    pthread_mutex_unlock(&g_lock);
+
+    return NativeAudioWriter_Submit(g_mixbuf, want);
+}

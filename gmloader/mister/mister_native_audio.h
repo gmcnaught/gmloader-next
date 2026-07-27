@@ -60,6 +60,13 @@ uint32_t MisterAudio_QueuedBytes(MisterAudioTrack t);
 void MisterAudio_Clear(MisterAudioTrack t);
 void MisterAudio_Pause(MisterAudioTrack t, int pause_on);
 
+/// Run one pump pass: top the ring back up to TARGET_FILL by mixing every
+/// active, unpaused track. Returns the frames submitted. Submits silence when
+/// nothing is playing -- the FPGA FIFO holds its last sample when starved, so
+/// an empty ring would park the DAC at a DC offset.
+/// The pump thread calls this in a loop; tests call it directly.
+size_t MisterAudio_PumpOnce(void);
+
 /// Frames refused by the staging cap since Init. Non-zero on device is a bug
 /// signal, not normal operation.
 uint64_t MisterAudio_DroppedFrames(void);
