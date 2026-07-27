@@ -1,3 +1,4 @@
+#define _GNU_SOURCE 1
 //
 //  MiSTer native audio shim -- gmloader
 //
@@ -13,6 +14,12 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+
+#include <atomic>
+#include <sched.h>      /* cpu_set_t / CPU_SET, under _GNU_SOURCE */
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 
 namespace {
 
@@ -82,6 +89,51 @@ void fill_pull_track(Track *tr, int want_bytes) {
     SDL_AudioStreamPut(tr->conv, g_pullbuf, (int)src_bytes);
 }
 
+pthread_t g_pump_tid;
+// ATOMIC, not a plain bool: this is the pump loop's exit condition. A plain
+// non-atomic flag read in a spin loop may legally be hoisted out of the loop by
+// the compiler, so the pump could never observe Shutdown()'s store and would
+// hang the join forever.
+std::atomic<bool> g_pump_running{false};
+
+// Pin a thread to one core. Linux-only; a no-op elsewhere (host tests).
+void pin_to_core(pthread_t th, int cpu) {
+#ifdef __linux__
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    if (pthread_setaffinity_np(th, sizeof(set), &set) != 0)
+        fprintf(stderr, "MisterAudio: pin to core %d failed\n", cpu);
+#else
+    (void)th; (void)cpu;
+#endif
+}
+
+bool pinning_enabled(void) {
+    const char *v = getenv("GMLOADER_AUDIO_PIN");
+    if (v && v[0] == '0') return false;
+    return sysconf(_SC_NPROCESSORS_ONLN) >= 2;
+}
+
+// GMLOADER_AUDIO_PUMP_THREAD=0 keeps the pump off the clock so a caller (the
+// host test) can drive MisterAudio_PumpOnce() deterministically.
+bool pump_thread_enabled(void) {
+    const char *v = getenv("GMLOADER_AUDIO_PUMP_THREAD");
+    return !(v && v[0] == '0');
+}
+
+void *pump_main(void *) {
+    // Ring-driven: the FPGA drain is the clock. PumpOnce refills TO a fixed
+    // level, so the long-run submit rate equals the 48 kHz drain rate and the
+    // pitch is exact. Sleep only when there is nothing to do.
+    const struct timespec idle = { 0, 1000 * 1000 };   // 1 ms
+    while (g_pump_running.load(std::memory_order_acquire)) {
+        if (MisterAudio_PumpOnce() == 0)
+            nanosleep(&idle, nullptr);
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 bool MisterAudio_Init(void) {
@@ -94,11 +146,35 @@ bool MisterAudio_Init(void) {
         return false;
     }
     g_active = true;
+
+    if (!pump_thread_enabled()) {
+        fprintf(stderr, "MisterAudio: pump thread disabled by env\n");
+    } else {
+        g_pump_running = true;
+        if (pthread_create(&g_pump_tid, nullptr, pump_main, nullptr) != 0) {
+            g_pump_running = false;
+            fprintf(stderr, "MisterAudio: pump thread failed to start\n");
+        } else if (pinning_enabled()) {
+            // The fabric backend pure-spins on C_DONE by default and pegs the
+            // thread it runs on, so keep the pump off that core entirely.
+            pin_to_core(g_pump_tid, 1);
+            pin_to_core(pthread_self(), 0);
+            fprintf(stderr,
+                    "MisterAudio: pump pinned to core 1, main to core 0\n");
+        }
+    }
+
     fprintf(stderr, "MisterAudio: native audio active (48000 Hz stereo S16)\n");
     return true;
 }
 
 void MisterAudio_Shutdown(void) {
+    // Join before anything is torn down: no mix may be in flight over a dead
+    // mapping. Mirrors Solarus stopping the thread at the top of Sound::quit().
+    if (g_pump_running.exchange(false, std::memory_order_release)) {
+        pthread_join(g_pump_tid, nullptr);
+    }
+
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < MISTER_AUDIO_MAX_TRACKS; ++i) {
         if (g_tracks[i].conv) SDL_FreeAudioStream(g_tracks[i].conv);
@@ -260,4 +336,8 @@ size_t MisterAudio_PumpOnce(void) {
     pthread_mutex_unlock(&g_lock);
 
     return NativeAudioWriter_Submit(g_mixbuf, want);
+}
+
+bool MisterAudio_ThreadActive(void) {
+    return g_pump_running.load(std::memory_order_acquire);
 }

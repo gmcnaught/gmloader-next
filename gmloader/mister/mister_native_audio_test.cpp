@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "mister_native_audio.h"
@@ -45,6 +46,8 @@ int main(void) {
     make_region();
     CHECK(MisterAudio_Init());
     CHECK(MisterAudio_IsActive());
+    // Deterministic sections run with the pump thread disabled.
+    CHECK(!MisterAudio_ThreadActive());
 
     // A push track at the sink's own format opens and echoes its spec back.
     SDL_AudioSpec want, got;
@@ -202,6 +205,20 @@ int main(void) {
     drain_ring();
     MisterAudio_Shutdown();
     CHECK(!MisterAudio_IsActive());
+    CHECK(!MisterAudio_ThreadActive());
+
+    // --- Thread ----------------------------------------------------------
+    // A second cycle with the pump thread enabled: it must keep the ring fed
+    // with nobody calling PumpOnce, and must join cleanly on shutdown.
+    setenv("GMLOADER_AUDIO_PUMP_THREAD", "1", 1);
+    CHECK(MisterAudio_Init());
+    CHECK(MisterAudio_ThreadActive());
+    drain_ring();
+    struct timespec nap = { 0, 50 * 1000 * 1000 };   // 50 ms
+    nanosleep(&nap, NULL);
+    CHECK(NativeAudioWriter_FreeFrames() < NativeAudioWriter_CapacityFrames());
+    MisterAudio_Shutdown();
+    CHECK(!MisterAudio_ThreadActive());
 
     munmap((void *)g_map, REGION_SIZE);
     unlink(PATH);
