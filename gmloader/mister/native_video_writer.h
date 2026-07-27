@@ -38,13 +38,14 @@ bool NativeVideoWriter_Init(void);
 void NativeVideoWriter_Shutdown(void);
 
 /// Write one pre-converted RGB565 frame to the active DDR3 double-buffer.
-/// Silently ignored if width != 320, height != 240, or writer is not active.
+/// Silently ignored unless width/height match NV_FRAME_WIDTH/NV_FRAME_HEIGHT
+/// (= MISTER_WIDTH/MISTER_HEIGHT, currently 288x216), or writer is not active.
 /// Uses single memcpy when pitch == width*2, else copies row-by-row.
 /// Increments frame_counter (starts at 1, never 0) and writes control word
 /// AFTER pixel data, then toggles active_buf.
 /// @param pixels_rgb565  Source pixel data, already in RGB565 format
-/// @param width          Frame width (must be 320)
-/// @param height         Frame height (must be 240)
+/// @param width          Frame width (must equal NV_FRAME_WIDTH, currently 288)
+/// @param height         Frame height (must equal NV_FRAME_HEIGHT, currently 216)
 /// @param pitch          Source row stride in bytes
 void NativeVideoWriter_WriteFrame(const void* pixels_rgb565, int width,
                                   int height, int pitch);

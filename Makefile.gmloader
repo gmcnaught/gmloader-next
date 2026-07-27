@@ -173,11 +173,20 @@ clean:
 build/${ARCH}/gmloader/gmloadernext.${DEVICE_ARCH}: ${LIBC_TABS} $(BSD_OBJ) $(LUA_OBJ) $(ZIP_OBJ) $(FMODSDL_OBJ) $(KIT_OBJ) $(OBJ)
 	$(CXX) $(LDFLAGS) -o $@ $(OBJ) $(LUA_OBJ) $(ZIP_OBJ) $(FMODSDL_OBJ) $(KIT_OBJ) $(BSD_OBJ) $(LIBS)
 
-build/${ARCH}/%.cpp.o: %.cpp
+# Every object depends on THIS makefile. Geometry (MISTER_WIDTH/HEIGHT) and the other
+# feature switches arrive as -D flags, not as anything -MMD can see, so without this
+# prerequisite a flag-only change leaves every existing .o looking current: make rebuilds
+# nothing and you link a binary whose translation units disagree about the geometry. That
+# actually shipped once (2026-07-27) — a day-old main.cpp.o logged `pbuffer 320x240` beside
+# freshly-built 288x216 objects, and md5 verification could not see it because md5 proves
+# transport, not build coherence. It also silently defeats the
+# static_assert(MISTER_WIDTH == BLT_FB_WIDTH) in raster_backend_mfgpu.cpp, which can only
+# fire if its object is actually recompiled.
+build/${ARCH}/%.cpp.o: %.cpp Makefile.gmloader
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(BSD_FLAGS) $(MD_FLAGS) -c $< -o $@
 
-build/${ARCH}/%.c.o: %.c
+build/${ARCH}/%.c.o: %.c Makefile.gmloader
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(MD_FLAGS) -c $< -o $@
 
