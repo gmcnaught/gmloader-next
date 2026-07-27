@@ -96,16 +96,21 @@ pthread_t g_pump_tid;
 // hang the join forever.
 std::atomic<bool> g_pump_running{false};
 
-// Pin a thread to one core. Linux-only; a no-op elsewhere (host tests).
-void pin_to_core(pthread_t th, int cpu) {
+// Pin a thread to one core. Linux-only; returns false elsewhere (host tests).
+// Returns true if pinning succeeded, false if it failed or is unavailable.
+bool pin_to_core(pthread_t th, int cpu) {
 #ifdef __linux__
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
-    if (pthread_setaffinity_np(th, sizeof(set), &set) != 0)
+    if (pthread_setaffinity_np(th, sizeof(set), &set) != 0) {
         fprintf(stderr, "MisterAudio: pin to core %d failed\n", cpu);
+        return false;
+    }
+    return true;
 #else
     (void)th; (void)cpu;
+    return false;
 #endif
 }
 
@@ -157,10 +162,14 @@ bool MisterAudio_Init(void) {
         } else if (pinning_enabled()) {
             // The fabric backend pure-spins on C_DONE by default and pegs the
             // thread it runs on, so keep the pump off that core entirely.
-            pin_to_core(g_pump_tid, 1);
-            pin_to_core(pthread_self(), 0);
-            fprintf(stderr,
-                    "MisterAudio: pump pinned to core 1, main to core 0\n");
+            bool pump_pinned = pin_to_core(g_pump_tid, 1);
+            bool main_pinned = pin_to_core(pthread_self(), 0);
+            if (pump_pinned && main_pinned) {
+                fprintf(stderr,
+                        "MisterAudio: pump pinned to core 1, main to core 0\n");
+            } else {
+                fprintf(stderr, "MisterAudio: pump thread running unpinned\n");
+            }
         }
     }
 

@@ -68,8 +68,8 @@ void MisterAudio_Pause(MisterAudioTrack t, int pause_on);
 size_t MisterAudio_PumpOnce(void);
 
 /// True when the pump thread is running. False when Init() failed, when
-/// GMLOADER_AUDIO_PUMP_THREAD=0, or when the platform reports fewer than 2
-/// cores -- in the last case the caller must drive MisterAudio_PumpOnce().
+/// GMLOADER_AUDIO_PUMP_THREAD=0, or when pthread_create failed. A low core
+/// count affects pinning only, not whether the thread runs.
 bool MisterAudio_ThreadActive(void);
 
 /// Frames refused by the staging cap since Init. Non-zero on device is a bug
