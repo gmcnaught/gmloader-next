@@ -130,13 +130,12 @@ int main(void) {
     uint64_t t44_dropped_after = MisterAudio_DroppedFrames();
     uint64_t t44_dropped_delta = t44_dropped_after - t44_dropped_before;
     CHECK(t44_refusals > 0);
-    CHECK(t44_dropped_delta > 0);
-    // Each refused queue of 4410 frames (8820 bytes at 2 bytes/frame) should
-    // increment dropped by 4410. With the bug, it would be 2205 per refusal.
-    // Check that dropped is closer to the correct value: > t44_refusals * 3000
-    // ensures it's above the buggy value (t44_refusals * 2205) but below the
-    // correct value (t44_refusals * 4410), ruling out the buggy calculation.
-    CHECK(t44_dropped_delta > (uint64_t)t44_refusals * 3000u);
+    // Each refused queue of 4410 frames (8820 bytes at 2 bytes/frame) is
+    // counted in the track's own format. With the fix, dropped frames counts
+    // len / track->bytes_per_frame = 8820 / 2 = 4410 frames per refusal.
+    // With the bug (using sink's 4 bytes/frame instead), it would count
+    // 8820 / 4 = 2205 per refusal. The exact check discriminates the two.
+    CHECK(t44_dropped_delta == (uint64_t)t44_refusals * 4410u);
 
     // Closing frees the slot so a later open succeeds.
     MisterAudio_Close(t);
