@@ -4,6 +4,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+const char *JoyShm_ResolvePath(void);
 bool     JoyShm_Init(void);
 bool     JoyShm_IsActive(void);
 uint32_t JoyShm_ReadMask(int player);

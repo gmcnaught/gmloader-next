@@ -25,9 +25,16 @@ void JoyShm_MaskToButtons(uint32_t mask, unsigned char raw16[16]) {
     raw16[9]  = (mask >> 8) & 1u;  /* Pause  -> Start      */
 }
 
-bool JoyShm_Init(void) {
+/* GMLOADER_JOY_SHM overrides; otherwise the contract's canonical path, so the
+ * bridge works regardless of which parent spawned the engine (the main=
+ * wrapper exports the env, the Master_Daemon handler path may not). */
+const char *JoyShm_ResolvePath(void) {
     const char *path = getenv("GMLOADER_JOY_SHM");
-    if (!path || !*path) return false;
+    return (path && *path) ? path : MALDITA_JOY_SHM_PATH;
+}
+
+bool JoyShm_Init(void) {
+    const char *path = JoyShm_ResolvePath();
     int fd = open(path, O_RDONLY);
     if (fd < 0) return false;
     const MalditaJoyShm *p = (const MalditaJoyShm*)mmap(0, sizeof(MalditaJoyShm),

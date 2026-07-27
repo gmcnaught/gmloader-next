@@ -10,6 +10,7 @@
 
 #ifdef MISTER_NATIVE_VIDEO
 #include "mister/joy_shm_reader.h"
+#include "mister/joy_ddr_reader.h"
 #include "mister/mister_joy_shm.h"
 #endif
 
@@ -18,6 +19,7 @@ int mouse_has_warped = 0;
 
 #ifdef MISTER_NATIVE_VIDEO
 static int g_joyshm_ready = -1;   // -1 = untried, 0 = inactive, 1 = active
+static int g_joyddr_ready = -1;   // -1 = untried, 0 = inactive, 1 = active
 #endif
 
 typedef struct controller_t {
@@ -303,11 +305,18 @@ int update_inputs(SDL_Window *win)
 
 #ifdef MISTER_NATIVE_VIDEO
     if (g_joyshm_ready == -1) g_joyshm_ready = JoyShm_Init() ? 1 : 0;
-    if (g_joyshm_ready == 1) {
-        // MiSTer OSD is the authoritative input source: drive yoyo_gamepads[]
-        // straight from the /dev/shm mask instead of polling SDL controllers.
+    if (g_joyddr_ready == -1) g_joyddr_ready = JoyDdr_Init() ? 1 : 0;
+    if (g_joyshm_ready == 1 || g_joyddr_ready == 1) {
+        // MiSTer is the authoritative input source (it holds the exclusive
+        // evdev grab): drive yoyo_gamepads[] from its normalized mask instead
+        // of polling SDL controllers. Two transports, same bit layout:
+        //   - joy-shm: /dev/shm mask published by a Main_MiSTer-side producer
+        //     (explicit opt-in; wins when a producer is running)
+        //   - joy-ddr: the OpenBOR-contract words the FPGA core writes into
+        //     the native-video DDR region each frame (the default path)
         for (int p = 0; p < MALDITA_JOY_MAX_PLAYERS; p++) {
-            uint32_t mask = JoyShm_ReadMask(p);
+            uint32_t mask = (g_joyshm_ready == 1) ? JoyShm_ReadMask(p)
+                                                  : JoyDdr_ReadMask(p);
             unsigned char raw[16];
             JoyShm_MaskToButtons(mask, raw);
 
