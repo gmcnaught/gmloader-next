@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "joy_shm_reader.h"
+#include "joy_ddr_reader.h"
 #include "mister_joy_shm.h"
 
 static int fails = 0;
@@ -72,6 +73,31 @@ int main(void) {
     JoyShm_Shutdown();
     CHECK(JoyShm_IsActive() == false);
     unlink(path);
+
+    // --- DDR joy reader (OpenBOR contract): P1 mask at region byte 0x008,
+    // P2 at 0x018 — the low 32 bits of the qwords openbor_video_reader writes.
+    // Host test maps a regular file standing in for the /dev/mem region.
+    {
+        const char *dpath = "/tmp/joyddr-reader-test";
+        unsigned char region[0x40];
+        memset(region, 0, sizeof(region));
+        region[0x08] = 0x13; region[0x09] = 0x01;   /* P1 = 0x0113 LE */
+        region[0x18] = 0x25;                        /* P2 = 0x0025 LE */
+        int fd = open(dpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        (void)!write(fd, region, sizeof(region));
+        close(fd);
+
+        setenv("GMLOADER_JOY_DDR", dpath, 1);
+        CHECK(JoyDdr_Init() == true);
+        CHECK(JoyDdr_IsActive() == true);
+        CHECK(JoyDdr_ReadMask(0) == 0x113u);
+        CHECK(JoyDdr_ReadMask(1) == 0x25u);
+        CHECK(JoyDdr_ReadMask(-1) == 0u && JoyDdr_ReadMask(2) == 0u);
+        JoyDdr_Shutdown();
+        CHECK(JoyDdr_IsActive() == false);
+        unlink(dpath);
+        unsetenv("GMLOADER_JOY_DDR");
+    }
 
     if (fails) { printf("%d checks FAILED\n", fails); return 1; }
     printf("joy_shm_reader mapping OK\n");
