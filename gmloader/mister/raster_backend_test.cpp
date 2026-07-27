@@ -1192,6 +1192,66 @@ static int case_atlas_subregion_tile(void) {
     return 1;
 }
 
+// ── glyph 1:1 texel phase: fabric sampling must match the SW oracle ──────────
+// Device-visible bug (title/intro text mangled, 2026-07-26): the TRILIST
+// sampler picks nearest with a +half-texel ROUND — tu=(u+HALF)>>4 in
+// refmodel/blt_tri.c, itu=(rnd_u+8)>>>4 in the RTL — while the SW rasterizer
+// (and GL) FLOOR the interpolated texel coordinate. For a glyph drawn 1:1 with
+// corner UVs the interpolant at each pixel centre sits exactly on texel+0.5,
+// so the round lands one texel down-right of the floor: the glyph's white face
+// samples its own drop-shadow texel and 1px-stroke text turns to hash. Big art
+// hides a ±1-texel shift; this case makes it unmissable with an 8x8
+// white/blue checkerboard drawn 1:1 from an atlas interior (sub-region staging
+// path, 1-texel crop margin — the exact path GM font glyphs take), compared
+// against the SW oracle over the full target.
+static int case_glyph_1to1_texel_phase(void) {
+    enum { TW = 64, TH = 64, GX = 16, GY = 16, GW = 8, GH = 8 };
+    static uint8_t tex[TW*TH*4];
+    for (int y = 0; y < TH; y++)
+        for (int x = 0; x < TW; x++) {
+            uint8_t *p = tex + ((size_t)y*TW + x)*4;
+            p[0] = 120; p[1] = 120; p[2] = 120; p[3] = 255;   // neutral atlas fill
+        }
+    // white face / blue shadow checkerboard — Δ far beyond ±1 LSB 565
+    for (int y = 0; y < GH; y++)
+        for (int x = 0; x < GW; x++) {
+            uint8_t *p = tex + ((size_t)(GY+y)*TW + (GX+x))*4;
+            if (((x + y) & 1) == 0) { p[0]=255; p[1]=255; p[2]=255; }
+            else                    { p[0]=0;   p[1]=120; p[2]=190; }
+        }
+    RTexture t = { tex, TW, TH, 1, 1, /*RTEX_RGBA8888*/0, 1 };
+
+    // 1:1 quad, integer dst, corner UVs — a GM font glyph draw in miniature.
+    const float X0 = 50.f, Y0 = 60.f, X1 = X0 + GW, Y1 = Y0 + GH;
+    const float u0 = (float)GX/TW, u1 = (float)(GX+GW)/TW;
+    const float v0 = (float)GY/TH, v1 = (float)(GY+GH)/TH;
+    BVtx q[6] = {
+        { X0,Y0, u0,v0, 1,1,1,1 }, { X1,Y0, u1,v0, 1,1,1,1 }, { X1,Y1, u1,v1, 1,1,1,1 },
+        { X0,Y0, u0,v0, 1,1,1,1 }, { X1,Y1, u1,v1, 1,1,1,1 }, { X0,Y1, u0,v1, 1,1,1,1 },
+    };
+
+    static uint8_t  rgba_sw[BW*BH*4];
+    static uint8_t  rgba_mf[BW*BH*4];
+    static uint16_t mf565[BW*BH];
+    RSurface s_sw = { rgba_sw, BW, BH };
+    RSurface s_mf = { rgba_mf, BW, BH };
+    uint32_t key = next_key();
+
+    backend_sw.clear(&s_sw, 10, 10, 10, 255);
+    backend_sw.draw(&s_sw, q, 2, &t, RB_NONE, 0.f, key);
+
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    RasterBackend_MFGPU_SetAppSurface(0, 0);
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.clear(&s_mf, 10, 10, 10, 255);
+    backend_mfgpu.draw(&s_mf, q, 2, &t, RB_NONE, 0.f, key);
+    backend_mfgpu.frame_end();
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, mf565);
+
+    return compare565("glyph-1to1-phase", &s_sw, mf565);
+}
+
 // [in-flight-batch guard] The emitter builds the command ring, the vertex buffer and the
 // texture heap IN PLACE in the memory the fabric reads. On device the ONLY thing stopping the
 // host from overwriting a batch the fabric is still executing is the blocking C_DONE poll --
@@ -1648,6 +1708,8 @@ int main(void){
     else printf("raster_backend mfgpu-composite-vflip OK\n");
     if (!case_atlas_subregion_tile()) { printf("FAIL mfgpu-atlas-subregion\n"); ok = 0; }
     else printf("raster_backend mfgpu-atlas-subregion OK\n");
+    if (!case_glyph_1to1_texel_phase()) { printf("FAIL mfgpu-glyph-1to1-phase\n"); ok = 0; }
+    else printf("raster_backend mfgpu-glyph-1to1-phase OK\n");
     if (!case_inflight_drop()) { printf("FAIL mfgpu-inflight-drop\n"); ok = 0; }
     else printf("raster_backend mfgpu-inflight-drop OK\n");
     if (!case_inflight_drop_limit()) { printf("FAIL mfgpu-inflight-drop-limit\n"); ok = 0; }
