@@ -132,7 +132,8 @@ int MisterAudio_Queue(MisterAudioTrack t, const void *data, uint32_t len) {
     if (!tr || tr->pull) { pthread_mutex_unlock(&g_lock); return -1; }
 
     if ((uint32_t)SDL_AudioStreamAvailable(tr->conv) >= kStagingCapBytes) {
-        g_dropped += len / NA_BYTES_PER_FRAME;
+        const int src_frame_bytes = SDL_AUDIO_BITSIZE(tr->spec.format) / 8 * tr->spec.channels;
+        g_dropped += (src_frame_bytes > 0) ? (len / (uint32_t)src_frame_bytes) : 0u;
         pthread_mutex_unlock(&g_lock);
         return -1;
     }

@@ -112,6 +112,32 @@ int main(void) {
     // batch beyond it -- bounded, which is the point, rather than unbounded.
     CHECK(MisterAudio_QueuedBytes(t) <= 256000u);
 
+    // Staging cap flood for t44 (44.1 kHz mono): verify dropped frames are
+    // counted in the track's own format, not the sink's. t44 has 2 bytes per
+    // frame (44.1 kHz mono S16), so each 8820-byte buffer is 4410 frames.
+    // With the fix, dropped frames should count 4410 per refused queue.
+    // With the bug (dividing by sink's 4 bytes instead of track's 2),
+    // it would count 2205 per refused queue -- off by a factor of 2.
+    uint64_t t44_dropped_before = MisterAudio_DroppedFrames();
+    static int16_t flood44[4410];  // 100 ms of 44.1 kHz mono
+    memset(flood44, 0, sizeof(flood44));
+    int t44_refusals = 0;
+    for (int i = 0; i < 15; ++i) {
+        if (MisterAudio_Queue(t44, flood44, sizeof(flood44)) != 0) {
+            t44_refusals++;
+        }
+    }
+    uint64_t t44_dropped_after = MisterAudio_DroppedFrames();
+    uint64_t t44_dropped_delta = t44_dropped_after - t44_dropped_before;
+    CHECK(t44_refusals > 0);
+    CHECK(t44_dropped_delta > 0);
+    // Each refused queue of 4410 frames (8820 bytes at 2 bytes/frame) should
+    // increment dropped by 4410. With the bug, it would be 2205 per refusal.
+    // Check that dropped is closer to the correct value: > t44_refusals * 3000
+    // ensures it's above the buggy value (t44_refusals * 2205) but below the
+    // correct value (t44_refusals * 4410), ruling out the buggy calculation.
+    CHECK(t44_dropped_delta > (uint64_t)t44_refusals * 3000u);
+
     // Closing frees the slot so a later open succeeds.
     MisterAudio_Close(t);
     MisterAudio_Close(t44);
