@@ -996,7 +996,7 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         // per-texel alpha channel at all (see the note at the top of this file). So an
         // opaque, un-keyed ALPHA draw has nothing to blend against.
         //
-        // Worth real time here: the measured frame graph is THREE full-screen 320x240 ALPHA
+        // Worth real time here: the measured frame graph is THREE full-screen 288x216 ALPHA
         // draws every frame (two app-surface composites plus the border) = 230400 pixels,
         // each of which was paying for a destination read it could not use.
         if (blend_mode == BLT_BLEND_CONST_ALPHA && min_vtx_a * 255.0f >= 254.0f)
@@ -1025,7 +1025,7 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
 //   v at min-y (screen TOP) == 0  -> composite is already top-origin; the
 //                                    inversion is NOT here (look at the RTL
 //                                    scanout or the scene's own y).
-// Also dumps page dims vs the 320x240 used region: if th > 240 the page is
+// Also dumps page dims vs the 288x216 used region: if th > BLT_FB_HEIGHT the page is
 // padded, and a normalized 1-v would be wrong even on the composite -- the
 // flip has to be taken in ABSOLUTE PIXELS about the used height.
 //
@@ -1182,7 +1182,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         // UV scale: t->w/t->h are the ORIGINAL GL texture's real dimensions
         // (get_rtexture() in blitter.cpp), which may be a padded page (e.g.
         // a 2048x2048 POT atlas -- Task 1's boot trace) larger than the
-        // <=320x240 used region. bvtx_to_blt(v, tw, th) = clamp(uv,0,1)*tw*16
+        // <=288x216 used region. bvtx_to_blt(v, tw, th) = clamp(uv,0,1)*tw*16
         // is an ABSOLUTE PIXEL coordinate within that tw x th space; by the
         // (assumed) top-left-aligned used-region convention, that absolute
         // pixel coordinate is identical to the app-surface's own absolute
@@ -1458,7 +1458,7 @@ static void mf_frame_end(void) {
 // Task 7 device wiring: the fabric framebuffer, for main.cpp to hand straight
 // to NativeVideoWriter_WriteFrame after present() (g_fb565 is already RGB565 —
 // no Blitter_ToRGB565 conversion needed). w/h are BLT_FB_WIDTH x BLT_FB_HEIGHT
-// (320x240, refmodel/blitter_ref.h), the fixed fabric scanout geometry — same
+// (288x216, refmodel/blitter_ref.h), the fixed fabric scanout geometry — same
 // as MISTER_WIDTH/MISTER_HEIGHT today, so callers can use either pair, but the
 // row stride must always be computed from *this* w (BLT_FB_WIDTH), not assumed.
 extern "C" const uint16_t *RasterBackend_MFGPU_GetFB565(int *w, int *h) {

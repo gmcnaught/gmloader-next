@@ -95,7 +95,7 @@ void NativeVideoWriter_Shutdown(void)
 void NativeVideoWriter_WriteFrame(const void *pixels_rgb565, int width,
                                   int height, int pitch)
 {
-    /* Reject anything that isn't exactly 320×240 or if not initialised */
+    /* Reject anything that isn't exactly NV_FRAME_WIDTH x NV_FRAME_HEIGHT (288×216) or if not initialised */
     if (!ddr_base || !pixels_rgb565) return;
     if (width != NV_FRAME_WIDTH || height != NV_FRAME_HEIGHT) return;
 

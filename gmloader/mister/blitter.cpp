@@ -74,7 +74,7 @@ static uint32_t g_pf_draws = 0, g_pf_tris = 0, g_pf_frame = 0, g_pf_culled = 0;
 static int      g_level   = 0;
 static int      g_own     = 0;   // level >= 2
 static int      g_enabled = 0;   // level >= 1
-static int      g_rw = MISTER_WIDTH, g_rh = MISTER_HEIGHT;  // render size (<= DDR 320x240)
+static int      g_rw = MISTER_WIDTH, g_rh = MISTER_HEIGHT;  // render size (<= DDR 288x216)
 static uint8_t *g_defSurf = nullptr;   // default framebuffer, RGBA8888, GL bottom-up
 
 void Blitter_Init(void) {

@@ -14,7 +14,7 @@
 #define MISTER_HEIGHT 216
 #endif
 
-// Static output buffer — 320x240 RGBA8888, no heap allocation
+// Static output buffer — MISTER_WIDTH x MISTER_HEIGHT (288x216) RGBA8888, no heap allocation
 static uint8_t  s_frame_rgba[MISTER_WIDTH * MISTER_HEIGHT * 4];
 
 // Worst-case source readback buffer: 1280x720 RGBA8888 (~3.5 MiB BSS, fine on
