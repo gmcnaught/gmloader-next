@@ -61,10 +61,10 @@ static uint64_t g_pf_raster = 0, g_pf_clear = 0, g_pf_tex = 0, g_pf_present = 0;
 static uint32_t g_pf_draws = 0, g_pf_tris = 0, g_pf_frame = 0, g_pf_culled = 0;
 
 #ifndef MISTER_WIDTH
-#define MISTER_WIDTH  320
+#define MISTER_WIDTH  288
 #endif
 #ifndef MISTER_HEIGHT
-#define MISTER_HEIGHT 240
+#define MISTER_HEIGHT 216
 #endif
 
 // ---- master gate ------------------------------------------------------------
@@ -167,7 +167,7 @@ GLuint  g_appSurfFbo   = 0, g_appSurfTex = 0;
 int     g_blendEnabled = 0;
 GLenum  g_blendSrc = GL_ONE, g_blendDst = GL_ZERO;
 
-int     g_vpX = 0, g_vpY = 0, g_vpW = 320, g_vpH = 240;
+int     g_vpX = 0, g_vpY = 0, g_vpW = MISTER_WIDTH, g_vpH = MISTER_HEIGHT;
 
 // Uniform matrices tracked by GL location; the WVP is gm_Matrices[4]. We learn
 // gm_Matrices' base location from glGetUniformLocation (array elements have

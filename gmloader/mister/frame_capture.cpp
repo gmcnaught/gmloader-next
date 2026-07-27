@@ -8,10 +8,10 @@
 #include "thunks/khronos/glad.h"
 
 #ifndef MISTER_WIDTH
-#define MISTER_WIDTH  320
+#define MISTER_WIDTH  288
 #endif
 #ifndef MISTER_HEIGHT
-#define MISTER_HEIGHT 240
+#define MISTER_HEIGHT 216
 #endif
 
 // Static output buffer — 320x240 RGBA8888, no heap allocation

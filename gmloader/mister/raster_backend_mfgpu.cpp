@@ -15,7 +15,7 @@
 //             the frame; main.cpp then scans g_fb565 out via NativeVideoWriter (Task 7).
 //
 // The fabric framebuffer geometry is FIXED at BLT_FB_WIDTH x BLT_FB_HEIGHT
-// (320x240, refmodel/blitter_ref.h) — that is the wire contract, not a
+// (288x216, refmodel/blitter_ref.h) — that is the wire contract, not a
 // per-draw parameter. clear() targets are clamped to that size; the engine's
 // render surface is comfortably inside it.
 //
@@ -72,6 +72,13 @@ extern "C" {
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   // getenv (GMLOADER_MFGPU_HEAPLOG diagnostic, Task 9 bring-up)
+
+// The mfgpu backend scans the fabric FB out as the display verbatim — the two
+// geometry roots must be identical (native-288x216 single-source rule).
+#ifdef MISTER_WIDTH
+static_assert(MISTER_WIDTH == BLT_FB_WIDTH && MISTER_HEIGHT == BLT_FB_HEIGHT,
+              "MISTER_WIDTH/HEIGHT must equal BLT_FB_WIDTH/HEIGHT");
+#endif
 
 extern "C" const RasterBackend backend_sw;   /* FBO / RB_PREMULT fallback */
 

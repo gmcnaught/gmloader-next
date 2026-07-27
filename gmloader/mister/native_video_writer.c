@@ -1,13 +1,14 @@
 //
 //  Native Video DDR3 Writer — gmloader MiSTer
 //
-//  Writes 320x240 RGB565 frames to DDR3 at 0x3A000000 for FPGA native
+//  Writes 288x216 RGB565 frames to DDR3 at 0x3A000000 for FPGA native
 //  video output. Double-buffered with control word handshake.
 //
-//  DDR layout matches OpenBOR_7533 exactly (openbor_video_reader.sv):
+//  DDR layout matches OpenBOR_7533 exactly (openbor_video_reader.sv), except
+//  the frame is 288x216 native (Maldita); diverges from OpenBOR_7533's 320x240:
 //    0x3A000000 + 0x000     : Control word (frame_counter[31:2] | active_buf[1:0])
-//    0x3A000000 + 0x000040  : Video buffer 0 (320×240 RGB565, 153,600 bytes)
-//    0x3A000000 + 0x040040  : Video buffer 1 (320×240 RGB565, 153,600 bytes)
+//    0x3A000000 + 0x000040  : Video buffer 0 (288×216 RGB565, 124,416 bytes)
+//    0x3A000000 + 0x040040  : Video buffer 1 (288×216 RGB565, 124,416 bytes)
 //
 //  Reserved offsets 0x008–0x038 are NEVER written by this module.
 //
@@ -23,6 +24,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifndef MISTER_WIDTH
+#define MISTER_WIDTH  288
+#endif
+#ifndef MISTER_HEIGHT
+#define MISTER_HEIGHT 216
+#endif
+
 /* DDR layout constants — must match OpenBOR_7533 */
 #define NV_DDR_PHYS_BASE    0x3A000000u
 #define NV_DDR_REGION_SIZE  0x00100000u   /* 1 MiB */
@@ -30,9 +38,9 @@
 /* 0x008–0x038: reserved (joysticks, cart ctrl, audio ptrs) — never written */
 #define NV_BUF0_OFFSET      0x00000040u
 #define NV_BUF1_OFFSET      0x00040040u
-#define NV_FRAME_WIDTH      320
-#define NV_FRAME_HEIGHT     240
-#define NV_FRAME_BYTES      (NV_FRAME_WIDTH * NV_FRAME_HEIGHT * 2)  /* 153,600 */
+#define NV_FRAME_WIDTH      MISTER_WIDTH
+#define NV_FRAME_HEIGHT     MISTER_HEIGHT
+#define NV_FRAME_BYTES      (NV_FRAME_WIDTH * NV_FRAME_HEIGHT * 2)  /* 124,416 */
 
 static int              mem_fd      = -1;
 static volatile uint8_t *ddr_base  = NULL;
