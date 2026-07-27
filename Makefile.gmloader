@@ -254,3 +254,11 @@ native-audio-writer-test:
 	  gmloader/mister/native_audio_writer_test.c \
 	  gmloader/mister/native_audio_writer.c \
 	  -o /tmp/nawt && /tmp/nawt
+
+.PHONY: native-audio-shim-test
+native-audio-shim-test:
+	c++ -std=c++17 -O0 -g -Igmloader/mister $(shell pkg-config sdl2 --cflags) \
+	  gmloader/mister/mister_native_audio_test.cpp \
+	  gmloader/mister/mister_native_audio.cpp \
+	  gmloader/mister/native_audio_writer.c \
+	  $(shell pkg-config sdl2 --libs) -o /tmp/mnat && /tmp/mnat
