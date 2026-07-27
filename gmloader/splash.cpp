@@ -10,6 +10,13 @@
 #include "configuration.h"
 #include "splash.h"
 
+#ifndef MISTER_WIDTH
+#define MISTER_WIDTH  288
+#endif
+#ifndef MISTER_HEIGHT
+#define MISTER_HEIGHT 216
+#endif
+
 #define STB_ONLY_PNG
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_STDIO
@@ -63,13 +70,13 @@ static GLuint create_splash_texture(zip_t *apk, int *img_w, int *img_h, int *tex
 
     if (!load_splash_png(apk, &pixels, img_w, img_h)) {
         warning("Warning, no splash image available, creating xor pattern...\n");
-        *img_w = 320;
-        *img_h = 240;
-        pixels = (uint8_t *)malloc(320 * 240 * 4);
+        *img_w = MISTER_WIDTH;
+        *img_h = MISTER_HEIGHT;
+        pixels = (uint8_t *)malloc(MISTER_WIDTH * MISTER_HEIGHT * 4);
         uint32_t *p = (uint32_t *)pixels;
-        for (int i = 0; i < 240; i++) {
-            for (int j = 0; j < 320; j++) {
-                p[i * 320 + j] = ((~i ^ j) << 16) | ((i ^ ~j) << 8) | (i ^ j);
+        for (int i = 0; i < MISTER_HEIGHT; i++) {
+            for (int j = 0; j < MISTER_WIDTH; j++) {
+                p[i * MISTER_WIDTH + j] = ((~i ^ j) << 16) | ((i ^ ~j) << 8) | (i ^ j);
             }
         }
     }

@@ -1252,6 +1252,91 @@ static int case_glyph_1to1_texel_phase(void) {
     return compare565("glyph-1to1-phase", &s_sw, mf565);
 }
 
+// ── app-surface composite 1:1 (native 288x216) ──────────────────────────────
+// With the FB contract at the game's real 288x216, GM's composite quad is a
+// straight 1:1 blit: screen=[0,0..288,216], UVs over the used region of the
+// padded 512x256 GL page. This case locks that end state: content drawn INTO
+// the app surface and then composited to WORK must land pixel-identical to the
+// same content drawn directly to WORK. Any residual scale, half-texel phase,
+// or dropped/duplicated row/column breaks the quadrant borders.
+//
+// appsurf-binding boilerplate copied from case_appsurf_composite_vflip (the
+// working example of "draw to appsurf, composite via BLT_F_SRC_SURFACE"): the
+// app-surface source is bound by tex_key (draw()'s last argument), NOT by a
+// field on RTexture -- RTexture has no GL-name member.
+static int case_appsurf_composite_1to1(void) {
+    enum { PAGE_W = 512, PAGE_H = 256 };
+    const float UMAX = (float)BW / PAGE_W;        // 288/512
+    const float VMAX = (float)BH / PAGE_H;        // 216/256
+    const uint32_t APPSURF_FBO = 70, APPSURF_TEX = 71;
+
+    static const uint8_t whitepx[4] = { 255,255,255,255 };
+    RTexture white = { whitepx, 1, 1, 1, 1, 0, 1 };
+
+    // Position-keyed content: four solid quadrants with strong distinct colors.
+    // Drawn identically into (a) the app surface then composited, (b) WORK direct.
+    auto colorquad = [&](float x0,float y0,float x1,float y1,float r,float g,float b, BVtx *q){
+        BVtx a[6] = { {x0,y0,0,0,r,g,b,1},{x1,y0,0,0,r,g,b,1},{x1,y1,0,0,r,g,b,1},
+                      {x0,y0,0,0,r,g,b,1},{x1,y1,0,0,r,g,b,1},{x0,y1,0,0,r,g,b,1} };
+        for (int i=0;i<6;i++) q[i]=a[i];
+    };
+    const float HX = BW/2.0f, HY = BH/2.0f;
+    BVtx q_tl[6], q_tr[6], q_bl[6], q_br[6];
+    colorquad(0,0,  HX,HY,  1,0,0, q_tl);   // red
+    colorquad(HX,0, BW,HY,  0,1,0, q_tr);   // green
+    colorquad(0,HY, HX,BH,  0,0,1, q_bl);   // blue
+    colorquad(HX,HY,BW,BH,  1,1,0, q_br);   // yellow
+
+    // (a) draw into the app surface, then composite with the device-geometry quad.
+    // GL FBO convention: v is bottom-origin over the padded page (v@top = VMAX).
+    static uint8_t  rgba_a[BW*BH*4];
+    static uint16_t fb_a[BW*BH];
+    RSurface s_appsurf = { nullptr, BW, BH, APPSURF_FBO };
+    RSurface s_work_a  = { rgba_a, BW, BH, 0 };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_a);
+    RasterBackend_MFGPU_SetAppSurface(APPSURF_FBO, APPSURF_TEX);
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.clear(&s_appsurf, 0, 0, 0, 255);
+    backend_mfgpu.draw(&s_appsurf, q_tl, 2, &white, RB_NONE, 0.f, next_key());
+    backend_mfgpu.draw(&s_appsurf, q_tr, 2, &white, RB_NONE, 0.f, next_key());
+    backend_mfgpu.draw(&s_appsurf, q_bl, 2, &white, RB_NONE, 0.f, next_key());
+    backend_mfgpu.draw(&s_appsurf, q_br, 2, &white, RB_NONE, 0.f, next_key());
+    RTexture surfSrc = { nullptr, PAGE_W, PAGE_H, 1, 0, 0, 0 };   // padded page dims
+    BVtx comp[6] = {
+        { 0,      0,      0.f,  VMAX, 1,1,1,1 }, { (float)BW, 0,      UMAX, VMAX, 1,1,1,1 },
+        { (float)BW, (float)BH, UMAX, 0.f, 1,1,1,1 },
+        { 0,      0,      0.f,  VMAX, 1,1,1,1 }, { (float)BW, (float)BH, UMAX, 0.f, 1,1,1,1 },
+        { 0,      (float)BH, 0.f,  0.f, 1,1,1,1 },
+    };
+    backend_mfgpu.draw(&s_work_a, comp, 2, &surfSrc, RB_NONE, 0.f, APPSURF_TEX);
+    backend_mfgpu.frame_end();
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb_a);
+    RasterBackend_MFGPU_SetAppSurface(0, 0);   // don't leak state into later cases
+
+    // (b) same quadrants drawn straight to WORK — the oracle.
+    static uint8_t  rgba_b[BW*BH*4];
+    static uint16_t fb_b[BW*BH];
+    RSurface s_work_b = { rgba_b, BW, BH, 0 };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_b);
+    RasterBackend_MFGPU_SetAppSurface(0, 0);
+    RasterBackend_MFGPU_TestReinit(0);
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.clear(&s_work_b, 0, 0, 0, 255);
+    backend_mfgpu.draw(&s_work_b, q_tl, 2, &white, RB_NONE, 0.f, next_key());
+    backend_mfgpu.draw(&s_work_b, q_tr, 2, &white, RB_NONE, 0.f, next_key());
+    backend_mfgpu.draw(&s_work_b, q_bl, 2, &white, RB_NONE, 0.f, next_key());
+    backend_mfgpu.draw(&s_work_b, q_br, 2, &white, RB_NONE, 0.f, next_key());
+    backend_mfgpu.frame_end();
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb_b);
+
+    int bad = 0;
+    for (int i = 0; i < BW*BH; i++) if (fb_a[i] != fb_b[i]) bad++;
+    if (bad) printf("  FAIL appsurf-1to1: %d/%d pixels differ (composite is not 1:1)\n", bad, BW*BH);
+    else printf("  OK   appsurf-1to1  full-frame composite is a bit-exact 1:1 copy\n");
+    return bad == 0;
+}
+
 // [in-flight-batch guard] The emitter builds the command ring, the vertex buffer and the
 // texture heap IN PLACE in the memory the fabric reads. On device the ONLY thing stopping the
 // host from overwriting a batch the fabric is still executing is the blocking C_DONE poll --
@@ -1710,6 +1795,8 @@ int main(void){
     else printf("raster_backend mfgpu-atlas-subregion OK\n");
     if (!case_glyph_1to1_texel_phase()) { printf("FAIL mfgpu-glyph-1to1-phase\n"); ok = 0; }
     else printf("raster_backend mfgpu-glyph-1to1-phase OK\n");
+    if (!case_appsurf_composite_1to1()) { printf("FAIL mfgpu-appsurf-1to1\n"); ok = 0; }
+    else printf("raster_backend mfgpu-appsurf-1to1 OK\n");
     if (!case_inflight_drop()) { printf("FAIL mfgpu-inflight-drop\n"); ok = 0; }
     else printf("raster_backend mfgpu-inflight-drop OK\n");
     if (!case_inflight_drop_limit()) { printf("FAIL mfgpu-inflight-drop-limit\n"); ok = 0; }
