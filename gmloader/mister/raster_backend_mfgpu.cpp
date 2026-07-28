@@ -653,6 +653,24 @@ static uint32_t g_await_count   = 0;
 // full doorbell->C_DONE interval even when the await happens a frame later.
 static struct timespec g_publish_t0;
 
+// [Phase 1 B2] ORDERING WITNESS. Counting publishes and awaits pins how many times and on
+// which frames the seam runs, but NOT the order: on the host oracle both halves are
+// near-no-ops (the MMIO and the poll compile out), so inverting them is behaviourally
+// invisible there and every counter still lands on its expected value. Measured: with
+// mf_device_submit's two calls swapped, all 69 host cases passed. This flag makes the
+// ordering itself observable, which is the only way to catch it without hardware.
+//
+// On device the inversion is not cosmetic: await would poll C_DONE for a sequence that was
+// never submitted, and mf_submit_stat would measure from a stale g_publish_t0.
+//
+// Lifetime: publish SETS it; a successful ack CLEARS it; a timeout deliberately does NOT.
+// A timed-out batch is still live (that is the whole premise of the in-flight guard at
+// :707), so when Task 4 re-awaits it from the next mf_frame_begin that await is properly
+// paired. Clearing on timeout would make the invariant fire on the device's most common
+// failure path and invite someone to weaken it.
+static bool     g_publish_outstanding = false;
+static uint32_t g_unpaired_awaits     = 0;   // awaits with no batch outstanding: must stay 0
+
 // [Phase 1 B2] Publish the emitter's control-block mirror and ring the doorbell.
 // Does NOT poll. Split out of the old mf_device_submit so the caller can run
 // Process() for the next frame between the doorbell and the wait.
@@ -667,6 +685,7 @@ static void mf_device_publish(void) {
 #endif
     clock_gettime(CLOCK_MONOTONIC, &g_publish_t0);
     g_publish_count++;
+    g_publish_outstanding = true;   // a batch is now in flight; the next await is paired
 }
 
 // [Phase 1 B2] Block until the fabric acks the published sequence. This is the old
@@ -675,13 +694,17 @@ static void mf_device_publish(void) {
 // guard reads are all unchanged.
 static void mf_device_await(void) {
     g_await_count++;
+    // [Phase 1 B2] Ordering witness: awaiting with nothing in flight means publish and
+    // await ran out of order, or a publish was lost. See g_publish_outstanding.
+    if (!g_publish_outstanding) g_unpaired_awaits++;
 #ifdef MISTER_NATIVE_VIDEO
     struct timespec t0 = g_publish_t0;
-    if (mf_nowait_on()) { mf_submit_stat(&t0, 0, /*timeout=*/0); return; }  // probe: no poll
+    if (mf_nowait_on()) { g_publish_outstanding = false; mf_submit_stat(&t0, 0, /*timeout=*/0); return; }  // probe: no poll
     long iters = 0;
     const long poll_us = mf_poll_us();
     for (;;) {
         if (mf_ctrl_rd(MF_C_DONE) == g_e.submit_seq) {   // fabric consumed it
+            g_publish_outstanding = false;   // acked: nothing in flight any more
             mf_submit_stat(&t0, iters, /*timeout=*/0);
             return;
         }
@@ -708,10 +731,15 @@ static void mf_device_await(void) {
             // whole rather than rebuilding the ring underneath it.
             g_fabric_pending = true;
             g_pending_seq    = g_e.submit_seq;
+            // g_publish_outstanding stays SET on purpose: the batch is still in flight, so
+            // a later re-await of it (Task 4 awaits from mf_frame_begin) is properly paired.
             return;
         }
     }
 #endif // MISTER_NATIVE_VIDEO
+    // Host oracle: blt_execute is synchronous, so the batch is always acked by the time
+    // the caller gets here. (Unreachable on device — every branch above returns.)
+    g_publish_outstanding = false;
 }
 
 // [Phase 1 B2] Unchanged behaviour for callers that still want the blocking form.
@@ -745,6 +773,7 @@ static void mf_init_once(void) {
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
     g_publish_count = 0; g_await_count = 0;   // [Phase 1 B2] submit-seam counters
+    g_publish_outstanding = false; g_unpaired_awaits = 0;   // [Phase 1 B2] ordering witness
     g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
     g_last_draw.valid = false; g_dup_skipped = 0;
     g_appsurf_presented = false; g_crt_stripped = 0;
@@ -1726,6 +1755,9 @@ extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void) { return g_drop_coun
 // [Phase 1 B2] host-test hooks: prove publish and await are separable and each ran once.
 extern "C" uint32_t RasterBackend_MFGPU_TestPublishCount(void) { return g_publish_count; }
 extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void)   { return g_await_count; }
+// [Phase 1 B2] Ordering witness: awaits that ran with no batch in flight. Must always be 0
+// — counters alone cannot see publish/await order on the oracle (see g_publish_outstanding).
+extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void) { return g_unpaired_awaits; }
 // Blend mode the last TRILIST went out with, so a test can pin the opaque-ALPHA -> COPY
 // promotion (and, just as importantly, that a NON-opaque draw is left alone).
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void) { return g_last_trilist_blend; }

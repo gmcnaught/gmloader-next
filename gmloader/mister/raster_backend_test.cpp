@@ -58,6 +58,9 @@ extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void);
 // (publish) and how many times it waited for the ack (await), since reinit.
 extern "C" uint32_t RasterBackend_MFGPU_TestPublishCount(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void);
+// awaits that ran with no batch in flight — the only way to observe publish/await ORDER on
+// a host build, where both halves are near-no-ops and counters look identical either way.
+extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void);
 // blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void);
@@ -1446,6 +1449,12 @@ static int case_inflight_drop_limit(void) {
 
     // the fabric never acks -- hold "busy" for far longer than the limit
     RasterBackend_MFGPU_TestSetFabricBusy(1);
+    // [Phase 1 B2] Seam baseline before the drop RUN. case_submit_publish_await_split
+    // drives exactly one dropped frame, so a publish conditioned on drop-run length slips
+    // past it; this walk covers frames 2..N and the reclaim boundary, where the path really
+    // is run-length-dependent (g_drop_run >= mf_drop_limit() stops dropping and rebuilds).
+    const uint32_t pub_pre = RasterBackend_MFGPU_TestPublishCount();
+    const uint32_t awa_pre = RasterBackend_MFGPU_TestAwaitCount();
     int executed_at = -1;
     static uint16_t fbN[BW*BH];
     for (int f = 0; f < 200; f++) {
@@ -1465,7 +1474,26 @@ static int case_inflight_drop_limit(void) {
                executed_at);
         return 0;
     }
-    printf("  OK   inflight-drop-limit  reclaimed the ring at frame %d (no deadlock)\n", executed_at);
+    // [Phase 1 B2] Across the whole run, exactly ONE frame drove the seam: the frame that
+    // reclaimed the ring and rebuilt. Every dropped frame before it must have rung no
+    // doorbell — a publish over a ring the fabric is still reading is the :707 cascade.
+    // Asserting the delta (not just "no publish") also pins that the reclaiming frame DID
+    // submit, so a guard that silently stopped submitting would not read as success.
+    const uint32_t pub_d = RasterBackend_MFGPU_TestPublishCount() - pub_pre;
+    const uint32_t awa_d = RasterBackend_MFGPU_TestAwaitCount()   - awa_pre;
+    if (pub_d != 1 || awa_d != 1) {
+        printf("  FAIL inflight-drop-limit  seam ran %u publish / %u await across a %d-frame "
+               "drop run; expected exactly 1 each (only the reclaiming frame)\n",
+               pub_d, awa_d, executed_at + 1);
+        return 0;
+    }
+    if (RasterBackend_MFGPU_TestUnpairedAwaits() != 0) {
+        printf("  FAIL inflight-drop-limit  %u await(s) ran with no batch in flight\n",
+               RasterBackend_MFGPU_TestUnpairedAwaits());
+        return 0;
+    }
+    printf("  OK   inflight-drop-limit  reclaimed the ring at frame %d (no deadlock); "
+           "seam ran once across the run\n", executed_at);
     return 1;
 }
 
@@ -1541,8 +1569,20 @@ static int case_submit_publish_await_split(void) {
         return 0;
     }
 
-    printf("  OK   submit-split  publish=%u await=%u; dropped frame drove neither\n",
-           pub1, awa1);
+    // ORDER, which the counters above cannot see. On a host build both halves of the seam
+    // are near-no-ops (the MMIO and the poll compile out), so swapping them leaves every
+    // count identical and every case green — measured: with mf_device_submit's two calls
+    // inverted, all 69 cases passed. An await with no batch in flight is the observable
+    // that does distinguish them. On device the inversion polls C_DONE for a sequence that
+    // was never submitted, and times mf_submit_stat from a stale publish timestamp.
+    if (RasterBackend_MFGPU_TestUnpairedAwaits() != 0) {
+        printf("  FAIL submit-split: %u await(s) ran with no batch in flight — publish and "
+               "await are out of order\n", RasterBackend_MFGPU_TestUnpairedAwaits());
+        return 0;
+    }
+
+    printf("  OK   submit-split  publish=%u await=%u; dropped frame drove neither; "
+           "0 unpaired awaits\n", pub1, awa1);
     return 1;
 }
 
