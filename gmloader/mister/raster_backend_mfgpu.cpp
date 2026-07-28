@@ -703,26 +703,45 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     double frame_ms = (double)mf_ctrl_rd_hi(MF_C_DONE)   / (MF_CLK_SYS_MHZ * 1000.0);
     double texw_ms  = (double)mf_ctrl_rd_hi(MF_C_STATUS) / (MF_CLK_SYS_MHZ * 1000.0);
     double tri_ms   = (double)mf_ctrl_rd_hi(MF_C_SRCSEL) / (MF_CLK_SYS_MHZ * 1000.0);
+    // [Phase 1 A4] EXACT covered-pixel count from the fabric, replacing cov_px_est as the
+    // cyc/px denominator. cov_px_est is a Sutherland-Hodgman clip estimate and is blind to
+    // per-pixel depth and blend rejection, so it over-counts whatever the fabric discards.
+    // Keep reporting the estimate alongside for one bring-up period: the two disagreeing is
+    // the ANSWER to Phase 0's open question #1 (measured ~8.0 vs sim ~6-7 cyc/px), not a
+    // discrepancy to suppress.
+    double cov_exact = (double)mf_ctrl_rd_hi(MF_C_FLAGS);
     static unsigned n = 0, to = 0; static double sum = 0; static long it_sum = 0;
-    static double fsum = 0, tsum = 0, xsum = 0, csum = 0;
+    static double fsum = 0, tsum = 0, xsum = 0, csum = 0, esum = 0;
     n++; to += timeout ? 1u : 0u; sum += us; it_sum += iters; fsum += frame_ms; tsum += tri_ms; xsum += texw_ms;
+    esum += cov_exact;
+    // [Phase 1 B2] Still correctly paired with the batch being measured after the deferral.
+    // mf_device_await -- and therefore this function -- now runs at the TOP of the next
+    // mf_frame_begin, but strictly before blt_begin_frame and before any draw of that frame
+    // calls mf_cov_add_triangle. So the accumulator still holds the estimate for the batch
+    // whose counters were just read. Moving the await below blt_begin_frame would silently
+    // fold the wrong frame's estimate in.
     csum += g_cov_px_accum; g_cov_px_accum = 0.0;   // per-frame: reset after folding in
     if (n % 30 == 0) {
-        double f=fsum/30.0, t=tsum/30.0, x=xsum/30.0, c=csum/30.0;
-        // cyc_px uses the fabric clock: dpath_ms * clk_MHz * 1000 / covered_px.
+        double f=fsum/30.0, t=tsum/30.0, x=xsum/30.0, c=csum/30.0, e=esum/30.0;
+        // cyc_px uses the fabric clock: dpath_ms * clk_MHz * 1000 / covered_px. The
+        // denominator is now the fabric's EXACT count; if the fabric reports nothing (an
+        // older bitstream, where C_FLAGS.hi reads 0) fall back to the estimate rather than
+        // printing a divide-by-zero 0.0 that would read as "free pixels".
         double dpath_ms = t - x;
-        double cyc_px = (c > 1.0) ? (dpath_ms * MF_CLK_SYS_MHZ * 1000.0) / c : 0.0;
+        double cov_den = (e > 1.0) ? e : c;
+        double cyc_px = (cov_den > 1.0) ? (dpath_ms * MF_CLK_SYS_MHZ * 1000.0) / cov_den : 0.0;
         // Screen area comes from the fabric geometry macros, never a literal:
         // MISTER_WIDTH/HEIGHT arrive as -D flags, so a hardcoded 288x216 here
         // would silently survive a geometry change and report a wrong overdraw.
         const double screen_px = (double)BLT_FB_WIDTH * (double)BLT_FB_HEIGHT;
         fprintf(stderr, "MFSUBMIT n=%u wait_ms[avg=%.2f] fabric_ms[frame=%.2f tri=%.2f "
-                "texwait=%.2f dpath=%.2f ovhd=%.2f] cov_px_est=%.0f overdraw=%.2f "
-                "cyc_px=%.1f spin_avg=%ld to=%u\n",
+                "texwait=%.2f dpath=%.2f ovhd=%.2f] cov_px=%.0f cov_px_est=%.0f "
+                "est_ratio=%.2f overdraw=%.2f cyc_px=%.1f%s spin_avg=%ld to=%u\n",
                 n, (sum/30.0)/1e3, f, t, x, dpath_ms, f-t,
-                c, c / screen_px, cyc_px, it_sum/30, to);
+                e, c, (e > 1.0) ? c / e : 0.0, cov_den / screen_px, cyc_px,
+                (e > 1.0) ? "" : "(est)", it_sum/30, to);
         sum = 0; it_sum = 0; to = 0;
-        fsum = 0; tsum = 0; xsum = 0; csum = 0;
+        fsum = 0; tsum = 0; xsum = 0; csum = 0; esum = 0;
     }
 }
 #endif // MISTER_NATIVE_VIDEO — device transport internals end here
@@ -1997,7 +2016,12 @@ extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy) {
     // busy>0 simulates the whole device condition, not just the predicate: a submit that
     // timed out and left a batch unacked. busy==0 deliberately LEAVES g_fabric_pending set,
     // so the next frame exercises the "acked -> clear the flag and resume" branch.
-    if (busy > 0) { g_fabric_pending = true; g_pending_seq = g_e.submit_seq; }
+    // [Phase 1 B2] Also model the PUBLISH the simulated in-flight batch implies. Setting
+    // g_fabric_pending alone would leave the pairing depth at 0, so the deferred await in
+    // the next mf_frame_begin would count an unpaired await -- a false positive created by
+    // the hook, not by the code. Assignment rather than increment: exactly one batch is ever
+    // outstanding, so this is idempotent whether or not a real publish already happened.
+    if (busy > 0) { g_fabric_pending = true; g_pending_seq = g_e.submit_seq; g_publish_depth = 1; }
 }
 extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void) { return g_drop_count; }
 // [Phase 1 B2] host-test hooks: prove publish and await are separable and each ran once.

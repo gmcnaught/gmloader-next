@@ -1618,7 +1618,7 @@ static int case_submit_publish_await_split(void) {
                "(publish %u->%u) over a ring the fabric is still reading\n", pub1, pub2);
         return 0;
     }
-    if (awa2 > awa1 + 1) {
+    if (awa2 != awa1 + 1) {   // exactly one: '>' would also accept an await that never ran
         printf("  FAIL submit-split: dropped frame drove %u awaits, expected at most 1 "
                "(the previous batch's); a drop run must not re-enter the blocking poll\n",
                awa2 - awa1);
