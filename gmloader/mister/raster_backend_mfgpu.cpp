@@ -498,17 +498,43 @@ enum {
 //
 // So mf_ctrl_wr records every write to a trace buffer in both builds and stores only on
 // device — the same lift that made the seam itself testable, applied one level down.
+//
+// The trace is HOST-ONLY. Nothing on device ever reads it, and compiling it in would perturb
+// the exact path the shim exists to protect — so on a device build mf_ctrl_wr below is
+// byte-for-byte the volatile store it always was. Nothing is lost: the write ORDER lives in
+// publish's source, which is identical in both builds, so checking it on the oracle checks
+// the order the device executes.
 enum { MF_TRACE_MAX = 32, MF_TRACE_BARRIER = -1 };   // -1 is not a valid qword index
 struct MfCtrlTraceEnt { int reg; uint32_t val; };
 static MfCtrlTraceEnt g_ctrl_trace[MF_TRACE_MAX];
-static uint32_t       g_ctrl_trace_n = 0;
+static uint32_t       g_ctrl_trace_n        = 0;
+static uint32_t       g_ctrl_trace_overflow = 0;   // sticky; asserted 0 by the host test
 
 static inline void mf_trace_add(int reg, uint32_t v) {
-    if (g_ctrl_trace_n < MF_TRACE_MAX) {
-        g_ctrl_trace[g_ctrl_trace_n].reg = reg;
-        g_ctrl_trace[g_ctrl_trace_n].val = v;
-        g_ctrl_trace_n++;
+#ifndef MISTER_NATIVE_VIDEO
+    if (g_ctrl_trace_n >= MF_TRACE_MAX) {
+        // FAIL LOUDLY. A trace that silently truncates makes the ordering assertion vacuous:
+        // "the doorbell is last" would pass because the later writes were dropped, not
+        // because they never happened. Sticky, so it cannot be missed by a later reset.
+        if (!g_ctrl_trace_overflow)
+            fprintf(stderr, "backend_mfgpu: FATAL control-write trace overflow (>%d entries "
+                            "in one publish) — ordering assertions are no longer valid\n",
+                    MF_TRACE_MAX);
+        g_ctrl_trace_overflow++;
+        return;
     }
+    g_ctrl_trace[g_ctrl_trace_n].reg = reg;
+    g_ctrl_trace[g_ctrl_trace_n].val = v;
+    g_ctrl_trace_n++;
+#else
+    (void)reg; (void)v;   // device: no trace at all (see above)
+#endif
+}
+
+static inline void mf_trace_reset(void) {
+#ifndef MISTER_NATIVE_VIDEO
+    g_ctrl_trace_n = 0;   // overflow is deliberately NOT cleared: it is sticky
+#endif
 }
 
 #ifdef MISTER_NATIVE_VIDEO
@@ -661,9 +687,10 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
 // behaviour is unchanged — same store, same order; the trace is a few array writes per
 // frame alongside five uncached MMIO round trips.
 static inline void mf_ctrl_wr(int qw, uint32_t v) {
-    mf_trace_add(qw, v);
 #ifdef MISTER_NATIVE_VIDEO
     *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u) = v;   // low u32 of each 8B qword
+#else
+    mf_trace_add(qw, v);   // oracle: record instead of store, so publish's order is checkable
 #endif
 }
 
@@ -672,7 +699,7 @@ static inline void mf_ctrl_wr(int qw, uint32_t v) {
 // behind, and the trace would still claim a barrier that is no longer there. Moving this
 // moves both, so the test sees the real ordering.
 static inline void mf_ctrl_barrier(void) {
-    mf_trace_add(MF_TRACE_BARRIER, 0);
+    mf_trace_add(MF_TRACE_BARRIER, 0);   // no-op on device; one call, so it cannot drift
     __sync_synchronize();
 }
 
@@ -732,7 +759,7 @@ static uint32_t g_seam_depth_violations = 0;  // publish while one was already i
 static void mf_device_publish(void) {
     // Body is NOT #ifdef'd: mf_ctrl_wr traces in both builds and stores only on device, so
     // the write order below is checkable on the host oracle. See the trace shim above.
-    g_ctrl_trace_n = 0;                         // each publish's trace stands alone
+    mf_trace_reset();                           // each publish's trace stands alone
     mf_ctrl_wr(MF_C_CMDCOUNT, (uint32_t)g_e.cmd_count);
     mf_ctrl_wr(MF_C_TARGET,   (uint32_t)g_e.target_buf);
     mf_ctrl_wr(MF_C_CLEAR,    (uint32_t)g_e.clear_color);
@@ -833,7 +860,7 @@ static void mf_init_once(void) {
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
     g_publish_count = 0; g_await_count = 0;   // [Phase 1 B2] submit-seam counters
     g_publish_depth = 0; g_unpaired_awaits = 0; g_seam_depth_violations = 0;  // [Phase 1 B2] ordering witness
-    g_ctrl_trace_n = 0;                                                       // [Phase 1 B2] control-write trace
+    g_ctrl_trace_n = 0; g_ctrl_trace_overflow = 0;                             // [Phase 1 B2] control-write trace
     g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
     g_last_draw.valid = false; g_dup_skipped = 0;
     g_appsurf_presented = false; g_crt_stripped = 0;
@@ -1825,6 +1852,8 @@ extern "C" uint32_t RasterBackend_MFGPU_TestSeamDepthViolations(void) { return g
 // written last and the barrier precedes it. Invisible to counters -- mf_ctrl_wr's store
 // compiles out on the oracle, so publish's body was otherwise untestable off-device.
 extern "C" uint32_t RasterBackend_MFGPU_TestTraceLen(void) { return g_ctrl_trace_n; }
+// Nonzero => the trace truncated, so every ordering assertion over it is vacuous. Asserted 0.
+extern "C" uint32_t RasterBackend_MFGPU_TestTraceOverflow(void) { return g_ctrl_trace_overflow; }
 extern "C" int RasterBackend_MFGPU_TestTraceReg(uint32_t i) {
     return (i < g_ctrl_trace_n) ? g_ctrl_trace[i].reg : -99;
 }

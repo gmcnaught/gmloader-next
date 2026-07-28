@@ -65,6 +65,7 @@ extern "C" uint32_t RasterBackend_MFGPU_TestSeamDepthViolations(void);
 // Control-word write trace for the last publish (see raster_backend_mfgpu.cpp's trace shim).
 extern "C" uint32_t RasterBackend_MFGPU_TestTraceLen(void);
 extern "C" int      RasterBackend_MFGPU_TestTraceReg(uint32_t i);
+extern "C" uint32_t RasterBackend_MFGPU_TestTraceOverflow(void);
 
 // BLTCTRL qword indices, mirroring the MF_C_* enum in raster_backend_mfgpu.cpp. These are
 // the wire contract (3rdparty/mfgpu/docs/blitter-protocol.md §2), not build-dependent
@@ -1610,6 +1611,15 @@ static int case_submit_publish_await_split(void) {
     // had not finished writing. Asserted as the contract rather than as a literal sequence,
     // so Task 2's C_SRCSEL write (specified before the barrier) does not have to fight it.
     {
+        // Checked FIRST: if the trace truncated, every ordering claim below is vacuous —
+        // "the doorbell is last" would pass because later entries were dropped, not because
+        // they never happened.
+        if (RasterBackend_MFGPU_TestTraceOverflow() != 0) {
+            printf("  FAIL submit-split: control-write trace overflowed (%u dropped); the "
+                   "ordering assertions below cannot be trusted\n",
+                   RasterBackend_MFGPU_TestTraceOverflow());
+            return 0;
+        }
         const uint32_t n = RasterBackend_MFGPU_TestTraceLen();
         if (n < 6) {
             printf("  FAIL submit-split: publish traced %u control writes, expected >= 6 "
