@@ -283,8 +283,24 @@ static uint32_t   g_cachefull_drops = 0;
 //   UNKNOWN    - neither refusal was recorded, so ring/vertex capacity is what remains.
 //                Phrased as what is left rather than asserted, because nothing observed it.
 //
-// FIRST cause wins: the refusal that started the frame's trouble is the informative one, and
-// a later different failure is usually its consequence.
+// FIRST cause wins, and that is a CORRECTNESS MECHANISM rather than a tie-break preference --
+// do not "simplify" it to last-wins.
+//
+// mf_draw's four staging-failure sites CANNOT distinguish the two causes: stage_texture
+// returns an invalid ref for a heap-byte exhaustion and for a pin-aware table refusal alike
+// (the cache-full guard returns `bad.valid = 0`, exactly as the !ref.valid path does). So all
+// four blanket-assert MF_OVF_HEAP_FULL on any staging failure. That is correct ONLY because
+// the cache-full path already called mf_note_ovf_cause(MF_OVF_CACHE_FULL) deeper in the
+// stack, inside mf_upload_and_cache, before returning -- and first-wins then discards the
+// outer, coarser claim.
+//
+// Flip this to last-wins and EVERY cache-full frame reports as heap-full: the precise defect
+// this enum exists to fix, restored, and pointing readers at the wrong lever again. The
+// outer sites depend on the inner note having landed first.
+//
+// (Secondary, and the reason first-wins is also the right reading: the refusal that started
+// the frame's trouble is the informative one; a later different failure is usually its
+// consequence.)
 enum MfOvfCause { MF_OVF_UNKNOWN = 0, MF_OVF_CACHE_FULL = 1, MF_OVF_HEAP_FULL = 2 };
 static MfOvfCause g_frame_ovf_cause = MF_OVF_UNKNOWN;
 static inline void mf_note_ovf_cause(MfOvfCause c) {
@@ -1877,7 +1893,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
             blt_surface_ref_t tex = stage_texture(tex_key, t, &has_key);
             if (!tex.valid) {
                 mf_note_ovf_cause(MF_OVF_HEAP_FULL);
-            fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
+                fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
                 return;
             }
             mf_emit_group(tex, tex.w, tex.h, gv, 2, bl, has_key, /*extra_flags=*/0);
@@ -2122,6 +2138,11 @@ extern "C" uint32_t  RasterBackend_MFGPU_TestCacheFullDrops(void) { return g_cac
 // SELECTS the overflow message is itself asserted -- a cause that is never recorded would
 // silently restore the ambiguity it exists to remove, and nothing would fail.
 extern "C" int       RasterBackend_MFGPU_TestFrameOvfCause(void) { return (int)g_frame_ovf_cause; }
+// Exposed so the test does not hand-mirror MfOvfCause's values. Same reasoning as
+// TestTexCacheSlots: a mirrored constant is a second source of truth that drifts silently.
+extern "C" int       RasterBackend_MFGPU_OvfCauseUnknown(void)   { return (int)MF_OVF_UNKNOWN; }
+extern "C" int       RasterBackend_MFGPU_OvfCauseCacheFull(void) { return (int)MF_OVF_CACHE_FULL; }
+extern "C" int       RasterBackend_MFGPU_OvfCauseHeapFull(void)  { return (int)MF_OVF_HEAP_FULL; }
 // [Phase 1 A4] The covered-pixel derivation, exposed for host testing. Reading C_FLAGS.hi
 // needs a fabric; the arithmetic over it does not, and is where the provenance bug lived.
 extern "C" void RasterBackend_MFGPU_TestDeriveCov(double dpath_ms, double cov_exact,

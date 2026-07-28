@@ -87,8 +87,13 @@ extern "C" uint32_t RasterBackend_MFGPU_TestEvictAttempts(void);
 // read from the backend rather than mirrored here, so the fill loop cannot drift from it.
 extern "C" uint32_t RasterBackend_MFGPU_TestCacheFullDrops(void);
 extern "C" int      RasterBackend_MFGPU_TestFrameOvfCause(void);
-// Mirrors MfOvfCause in raster_backend_mfgpu.cpp. Three overflow paths, three remedies.
-enum { OVF_UNKNOWN = 0, OVF_CACHE_FULL = 1, OVF_HEAP_FULL = 2 };
+// Read from the backend rather than mirrored: a hand-copied enum is a second source of truth
+// that drifts silently, the same reason MF_TEX_CACHE_N is exposed via a hook.
+extern "C" int RasterBackend_MFGPU_OvfCauseUnknown(void);
+extern "C" int RasterBackend_MFGPU_OvfCauseCacheFull(void);
+extern "C" int RasterBackend_MFGPU_OvfCauseHeapFull(void);
+#define OVF_CACHE_FULL (RasterBackend_MFGPU_OvfCauseCacheFull())
+#define OVF_HEAP_FULL  (RasterBackend_MFGPU_OvfCauseHeapFull())
 // [Phase 1 A4] The covered-pixel derivation: pure arithmetic over values that come from the
 // fabric. Reading C_FLAGS.hi needs hardware; this does not, and is testable anywhere.
 extern "C" void RasterBackend_MFGPU_TestDeriveCov(double dpath_ms, double cov_exact,
