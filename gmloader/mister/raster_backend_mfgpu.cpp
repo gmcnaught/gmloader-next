@@ -87,8 +87,15 @@ extern "C" const RasterBackend backend_sw;   /* FBO / RB_PREMULT fallback */
 // One frame's worth of host-side emitter buffers. Static/file-scope is fine for
 // this single-threaded backend; Task 6 points these at the real DDR ring/heap.
 enum {
-    MF_RING_CAP    = 64 * 1024,
-    MF_VTX_REGION  = 128 * 1024,                 // per-frame TRILIST vertex buffer
+    MF_RING_CAP    = 64 * 1024,                  // capacity of ONE host-oracle ring arena
+    // [Phase 1 B1] DOUBLE-BUFFERED vertex region: two 128 KiB halves, alternated per
+    // frame, so the host can build frame N+1's vertices while the fabric reads N's.
+    // Grown rather than split because 128 KiB is ~2730 triangles of headroom and halving
+    // it is a real ceiling; the cost is 128 KiB out of a ~14.4 MiB texture heap.
+    // Needs NO RTL change: TRILIST commands carry the vertex offset, so the fabric
+    // follows wherever blt_vtx_buf_init points.
+    MF_VTX_HALF    = 128 * 1024,                 // one frame's TRILIST vertex buffer
+    MF_VTX_REGION  = 2 * MF_VTX_HALF,            // both halves; heap starts above this
     MF_TEX_HEAP    = 32u * 1024 * 1024,          // persistent texture pages (32MB)
     MF_SRCDRAM_CAP = MF_VTX_REGION + MF_TEX_HEAP,
     MF_MAX_CMDS    = MF_RING_CAP / BLT_CMD_BYTES,
@@ -101,7 +108,10 @@ enum {
     // default). Every entry is a real heap page, but each sub-rect is a few KB.
     MF_TEX_CACHE_N = 256,                         // resident-page table size
 };
-static uint8_t       g_ring[MF_RING_CAP];
+// [Phase 1 B1] TWO host-oracle ring arenas. The device has ring A/ring B at fixed DDR
+// offsets; the oracle needs the same disjointness or the alternation is untestable and
+// case_arena_alternates would be asserting against one buffer relabelled.
+static uint8_t       g_ring[2][MF_RING_CAP];
 // Deliberate ~40MB static footprint (32MB texture heap here + 8MB conversion
 // scratch below): safe and unremarkable on the MiSTer ARM's DDR3, not a
 // mistake to "optimize away".
@@ -141,6 +151,7 @@ static MfTexEntry g_texcache[MF_TEX_CACHE_N];
 static uint64_t   g_lru_clock   = 0;
 static uint32_t   g_upload_count = 0;   // real blt_upload calls since reinit (test hook)
 static uint32_t   g_stage_count  = 0;   // BLT_OP_STAGE emits since reinit (FO Task 3 test hook)
+static uint32_t g_arena            = 0;      // [Phase 1 B1] which arena this frame owns (0/1)
 static bool     g_fabric_pending   = false;  // a submitted batch has not been acked yet
 static uint32_t g_pending_seq      = 0;      // the submit_seq we are waiting on
 static bool     g_frame_dropped    = false;  // this frame is being dropped (emit nothing)
@@ -555,10 +566,19 @@ static inline void mf_trace_reset(void) {
 enum {
     MF_DEV_PHYS_BASE = 0x3B000000u,
     MF_DEV_MAP_SIZE  = 0x01000000u,   // 16 MiB dedicated blitter region
-    MF_DEV_RING_OFF  = 0x00000040u,   // BLTCTRL (8 qwords) precedes the ring
-    MF_DEV_SRC_OFF   = 0x00080000u,   // SRC_QW = 0x3B080000 (DDR3 source heap)
+    // [Phase 1 B1] DOUBLE-BUFFERED command ring. Must match the RTL exactly:
+    // blitter_defs.vh RING_QW = 0x3B000040 (ring A), RING_B_QW = 0x3B040000 (ring B),
+    // selected by C_SRCSEL bit 2 (C_RINGSEL_BIT). The 512 KiB region is SPLIT rather
+    // than grown so SRC_QW / OFF_HEAP stays put -- blitter_defs.vh flags that constant
+    // as a must-match-across-repos hazard.
+    // Canonical source for these values is
+    // wt-maldita-60fps/fpga/rtl/blitter_defs.vh -- NOT 3rdparty/mfgpu/rtl/blitter_defs.vh,
+    // whose RING_QW/SRC_QW are small windowed sim addresses that disagree.
+    MF_DEV_RING_OFF  = 0x00000040u,   // ring A: BLTCTRL (8 qwords) precedes it
+    MF_DEV_RING_B_OFF= 0x00040000u,   // ring B
+    MF_DEV_SRC_OFF   = 0x00080000u,   // SRC_QW = 0x3B080000 (DDR3 source heap) -- UNCHANGED
     MF_DEV_TLBUF_OFF = 0x00F40000u,   // bounds the usable SRC heap (~14.8 MiB)
-    MF_DEV_RING_CAP  = MF_DEV_SRC_OFF   - MF_DEV_RING_OFF,
+    MF_DEV_RING_CAP  = MF_DEV_RING_B_OFF - MF_DEV_RING_OFF,   // 256 KiB, ~8190 commands
     MF_DEV_SRC_CAP   = MF_DEV_TLBUF_OFF - MF_DEV_SRC_OFF,
     MF_DEV_DONE_TIMEOUT_MS = 200,
     // MF_C_* register indices moved above the guard: publish's body compiles in both builds.
@@ -566,6 +586,7 @@ enum {
 static volatile uint8_t *g_dev_base = nullptr;   // mmap of 0x3B000000
 static volatile uint8_t *g_dev_ctrl = nullptr;   // = base (control block)
 static uint8_t          *g_dev_ring = nullptr;   // = base + RING_OFF
+static uint8_t          *g_dev_ring_b = nullptr; // [Phase 1 B1] = base + RING_B_OFF
 static uint8_t          *g_dev_src  = nullptr;   // = base + SRC_OFF
 static bool              g_dev_ok   = false;     // mmap ok -> submits reach the fabric
 
@@ -587,6 +608,7 @@ static bool mf_ddr_map(void) {
     g_dev_base = (volatile uint8_t *)m;
     g_dev_ctrl = g_dev_base;
     g_dev_ring = (uint8_t *)(g_dev_base + MF_DEV_RING_OFF);
+    g_dev_ring_b = (uint8_t *)(g_dev_base + MF_DEV_RING_B_OFF);   // [Phase 1 B1]
     g_dev_src  = (uint8_t *)(g_dev_base + MF_DEV_SRC_OFF);
     memset((void *)g_dev_ctrl, 0, MF_DEV_RING_OFF);   // zero the control block
     g_dev_ok = true;
@@ -683,6 +705,15 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
 }
 #endif // MISTER_NATIVE_VIDEO — device transport internals end here
 
+#ifndef MISTER_NATIVE_VIDEO
+// [Phase 1 B1] Host-oracle shadow of the control block. mf_ctrl_rd is device-only, so
+// without this the read-modify-write C_SRCSEL needs (preserve bits 15:8, change bit 2)
+// could not run off-device at all -- and the throttle-preservation property would be
+// untestable. Writes land here instead of in MMIO; reads come back from it.
+static uint32_t g_ctrl_shadow[8] = {0};
+static inline uint32_t mf_ctrl_rd(int qw) { return g_ctrl_shadow[qw & 7]; }
+#endif
+
 // [Phase 1 B2] Control-word write: traced in BOTH builds, stored only on device. Device
 // behaviour is unchanged — same store, same order; the trace is a few array writes per
 // frame alongside five uncached MMIO round trips.
@@ -691,6 +722,7 @@ static inline void mf_ctrl_wr(int qw, uint32_t v) {
     *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u) = v;   // low u32 of each 8B qword
 #else
     mf_trace_add(qw, v);   // oracle: record instead of store, so publish's order is checkable
+    g_ctrl_shadow[qw & 7] = v;   // ...and remain readable, for read-modify-write registers
 #endif
 }
 
@@ -764,6 +796,15 @@ static void mf_device_publish(void) {
     mf_ctrl_wr(MF_C_TARGET,   (uint32_t)g_e.target_buf);
     mf_ctrl_wr(MF_C_CLEAR,    (uint32_t)g_e.clear_color);
     mf_ctrl_wr(MF_C_FLAGS,    (uint32_t)g_e.flags);
+    // [Phase 1 B1] Tell the fabric which ring this frame is in. C_SRCSEL bit 2
+    // (C_RINGSEL_BIT); bits 0 and 1 are dead (source is hardwired to SDRAM,
+    // comp_pipeline is the sole renderer) and bits 15:8 are the f2h write throttle,
+    // which must be preserved -- hence read-modify-write rather than a plain store.
+    {
+        uint32_t srcsel = mf_ctrl_rd(MF_C_SRCSEL);
+        srcsel = (srcsel & ~(1u << 2)) | ((g_arena & 1u) << 2);
+        mf_ctrl_wr(MF_C_SRCSEL, srcsel);
+    }
     mf_ctrl_barrier();                          // data before doorbell (traced)
     mf_ctrl_wr(MF_C_SUBMIT, g_e.submit_seq);    // doorbell LAST
     clock_gettime(CLOCK_MONOTONIC, &g_publish_t0);
@@ -842,23 +883,24 @@ static void mf_init_once(void) {
         // In-place: the emitter builds ring + heap directly in the mmap'd DDR.
         blt_emitter_init(&g_e, g_dev_ring, MF_DEV_RING_CAP, g_dev_src, MF_DEV_SRC_CAP);
         blt_alloc_init(&g_e.alloc, MF_VTX_REGION, MF_DEV_SRC_CAP - MF_VTX_REGION);
-        blt_vtx_buf_init(&g_e, g_dev_src, MF_VTX_REGION);
+        blt_vtx_buf_init(&g_e, g_dev_src, MF_VTX_HALF);
     } else {
         // No /dev/mem: bind host RAM so the emitter never faults; g_dev_ok is false
         // so mf_frame_end drops (never submits to a null map).
-        blt_emitter_init(&g_e, g_ring, sizeof g_ring, g_srcdram, sizeof g_srcdram);
+        blt_emitter_init(&g_e, g_ring[0], MF_RING_CAP, g_srcdram, sizeof g_srcdram);
         blt_alloc_init(&g_e.alloc, MF_VTX_REGION, MF_TEX_HEAP);
-        blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_REGION);
+        blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_HALF);
     }
 #else
-    blt_emitter_init(&g_e, g_ring, sizeof g_ring, g_srcdram, sizeof g_srcdram);
+    blt_emitter_init(&g_e, g_ring[0], MF_RING_CAP, g_srcdram, sizeof g_srcdram);
     uint32_t cap = g_tex_heap_cap ? g_tex_heap_cap : MF_TEX_HEAP;
     blt_alloc_init(&g_e.alloc, MF_VTX_REGION, cap);       // texture allocator (persistent)
-    blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_REGION);     // per-frame vertex buffer
+    blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_HALF);       // per-frame vertex buffer
 #endif
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
     g_publish_count = 0; g_await_count = 0;   // [Phase 1 B2] submit-seam counters
+    g_arena = 0;                                                              // [Phase 1 B1] arena parity
     g_publish_depth = 0; g_unpaired_awaits = 0; g_seam_depth_violations = 0;  // [Phase 1 B2] ordering witness
     g_ctrl_trace_n = 0; g_ctrl_trace_overflow = 0;                             // [Phase 1 B2] control-write trace
     g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
@@ -923,6 +965,32 @@ static void mf_frame_begin(void) {
     // and is thus protected from eviction until the NEXT frame begins (see
     // g_lru_frame_floor and evict_one_lru).
     g_lru_frame_floor = g_lru_clock;
+    // [Phase 1 B1] Flip to the other arena before rebuilding. The fabric is (or will
+    // shortly be) reading the previous frame's arena, so this frame must not touch it.
+    // Rebinding here — not at init — is what makes the alternation take effect, since
+    // blt_begin_frame rewinds cursors into whatever buffers the emitter currently holds.
+    //
+    // The ring pointer is rebound DIRECTLY rather than via blt_emitter_init, which the plan
+    // text suggested. blt_emitter_init memsets the whole emitter and re-runs
+    // blt_alloc_init(&e->alloc, 0, heap_cap). Per frame that would zero submit_seq (so the
+    // doorbell never advances — a permanent device wedge), wipe sdram_alloc / sdram_perm /
+    // sdram_src (the resident atlas), and reset the texture allocator to base 0, overlapping
+    // the vertex region, while g_texcache still believes those pages are live — handing out
+    // heap the cache thinks it owns. That is the same silent aliasing this plan exists to
+    // prevent. Only ring / ring_cap / the vertex window may move per frame.
+    g_arena ^= 1u;
+#ifdef MISTER_NATIVE_VIDEO
+    if (g_dev_ok) {
+        g_e.ring     = g_arena ? g_dev_ring_b : g_dev_ring;
+        g_e.ring_cap = MF_DEV_RING_CAP;
+        blt_vtx_buf_init(&g_e, g_dev_src + (g_arena ? MF_VTX_HALF : 0), MF_VTX_HALF);
+    } else
+#endif
+    {
+        g_e.ring     = g_ring[g_arena & 1u];
+        g_e.ring_cap = MF_RING_CAP;
+        blt_vtx_buf_init(&g_e, g_srcdram + (g_arena ? MF_VTX_HALF : 0), MF_VTX_HALF);
+    }
     // Textures persist across frames now (cache in g_texcache). Only the vtx
     // cursor + command list reset here (blt_begin_frame). No blt_heap_reset.
     blt_begin_frame(&g_e, /*target_buf=*/0, /*clear=*/0, /*clear_color=*/0);
@@ -1283,6 +1351,13 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         fprintf(stderr, "backend_mfgpu: vertex push overflow (%d tris) - draw dropped\n", nt);
         return;
     }
+    // [Phase 1 B1] blt_push_tris returns an offset relative to vtx_buf, but the consumer —
+    // blt_execute and the fabric alike — resolves it as heap_base + entry_off (see
+    // blt_vtx_buf_init's comment in 3rdparty/mfgpu). Those coincided only while vtx_buf WAS
+    // the heap base. Arena 1's vertex window starts MF_VTX_HALF up, so the offset must be
+    // rebased or every TRILIST reads its vertices from the wrong address — garbage geometry
+    // with no error, on device and in the oracle alike.
+    eoff += g_arena ? (uint32_t)MF_VTX_HALF : 0u;
     uint8_t blend_mode;
     uint16_t colorkey;
     if (has_key && min_vtx_a * 255.0f >= 254.0f) {
@@ -1747,6 +1822,17 @@ static void mf_frame_end(void) {
         }
     }
 #endif
+    // [Phase 1 B1] Ring capacity halved to ~8190 commands when the ring was
+    // double-buffered. Log a new high-water mark so approaching the cap is visible
+    // instead of surfacing as an overflow-driven black frame.
+    {
+        static uint32_t hw = 0;
+        if ((uint32_t)g_e.cmd_count > hw) {
+            hw = (uint32_t)g_e.cmd_count;
+            if (hw > 4096u)
+                fprintf(stderr, "backend_mfgpu: cmd_count high-water %u (ring cap ~8190)\n", hw);
+        }
+    }
     blt_end_frame(&g_e);
 #ifdef MISTER_NATIVE_VIDEO
     // Device: the ring + heap are already resident in the mmap'd DDR (the emitter
@@ -1773,7 +1859,7 @@ static void mf_frame_end(void) {
     int n = g_e.cmd_count;
     if (n > MF_MAX_CMDS) n = MF_MAX_CMDS;
     for (int i = 0; i < n; i++)
-        blt_unpack_cmd(g_ring + (size_t)i * BLT_CMD_BYTES, &g_cmds[i]);
+        blt_unpack_cmd(g_e.ring + (size_t)i * BLT_CMD_BYTES, &g_cmds[i]);
     // The whole g_srcdram is the source region: vertices at low offsets, texture
     // pages above MF_VTX_REGION. blt_execute only reads (and clamps OOB), so
     // passing the full size keeps both offset ranges in-bounds.
@@ -1856,6 +1942,27 @@ extern "C" uint32_t RasterBackend_MFGPU_TestTraceLen(void) { return g_ctrl_trace
 extern "C" uint32_t RasterBackend_MFGPU_TestTraceOverflow(void) { return g_ctrl_trace_overflow; }
 extern "C" int RasterBackend_MFGPU_TestTraceReg(uint32_t i) {
     return (i < g_ctrl_trace_n) ? g_ctrl_trace[i].reg : -99;
+}
+// [Phase 1 B1] The VALUE written, not just which register. Task 1's trace proved where a
+// write happened; Task 2's contract (C_SRCSEL bit 2 == g_arena) is a value property, and a
+// select bit stuck at 0 passes every ordering assertion while the fabric reads ring A
+// forever. Position alone cannot see it.
+extern "C" uint32_t RasterBackend_MFGPU_TestTraceVal(uint32_t i) {
+    return (i < g_ctrl_trace_n) ? g_ctrl_trace[i].val : 0u;
+}
+// [Phase 1 B1] host-test hooks: prove the arenas alternate and are disjoint. Field names
+// are the emitter's real ones (blt_emitter_t: `ring`, `vtx_buf`), not assumed.
+extern "C" uint32_t  RasterBackend_MFGPU_TestArena(void)    { return g_arena; }
+extern "C" uintptr_t RasterBackend_MFGPU_TestRingBase(void) { return (uintptr_t)g_e.ring; }
+extern "C" uintptr_t RasterBackend_MFGPU_TestVtxBase(void)  { return (uintptr_t)g_e.vtx_buf; }
+// [Phase 1 B1] Seed C_SRCSEL's shadow so the read-modify-write has a non-zero throttle
+// field (bits 15:8) to preserve — otherwise "the throttle survives" is a vacuous 0 == 0.
+extern "C" void RasterBackend_MFGPU_TestSetCtrlSrcsel(uint32_t v) {
+#ifndef MISTER_NATIVE_VIDEO
+    g_ctrl_shadow[MF_C_SRCSEL] = v;
+#else
+    (void)v;
+#endif
 }
 // Blend mode the last TRILIST went out with, so a test can pin the opaque-ALPHA -> COPY
 // promotion (and, just as importantly, that a NON-opaque draw is left alone).

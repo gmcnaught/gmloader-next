@@ -71,7 +71,15 @@ extern "C" uint32_t RasterBackend_MFGPU_TestTraceOverflow(void);
 // the wire contract (3rdparty/mfgpu/docs/blitter-protocol.md §2), not build-dependent
 // addresses. MF_TRACE_BARRIER is the sentinel the shim records where the memory barrier sits.
 enum { TC_SUBMIT = 0, TC_CMDCOUNT = 1, TC_TARGET = 2, TC_CLEAR = 3, TC_FLAGS = 4,
-       TC_BARRIER = -1 };
+       TC_SRCSEL = 7, TC_BARRIER = -1 };
+// [Phase 1 B1] value recorded alongside the register, and a seed for C_SRCSEL's
+// read-modify-write so "the throttle field survives" is a real claim, not 0 == 0.
+extern "C" uint32_t RasterBackend_MFGPU_TestTraceVal(uint32_t i);
+extern "C" void     RasterBackend_MFGPU_TestSetCtrlSrcsel(uint32_t v);
+// [Phase 1 B1] arena alternation + the emitter's current bases.
+extern "C" uint32_t  RasterBackend_MFGPU_TestArena(void);
+extern "C" uintptr_t RasterBackend_MFGPU_TestRingBase(void);
+extern "C" uintptr_t RasterBackend_MFGPU_TestVtxBase(void);
 // blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void);
@@ -1665,6 +1673,105 @@ static int case_submit_publish_await_split(void) {
     return 1;
 }
 
+// [Phase 1 B1] The ring and vertex buffer must alternate between two arenas so the host
+// can build frame N+1 in one while the fabric reads N from the other. Without this, the
+// deferred poll in Task 4 reproduces the documented corruption cascade
+// (raster_backend_mfgpu.cpp:707): re-staging straight over a batch the fabric is
+// mid-way through reading.
+static int case_arena_alternates(void) {
+    RasterBackend_MFGPU_TestReinit(0);
+
+    uint32_t seen[4];
+    uintptr_t ring[4], vtx[4];
+    for (int i = 0; i < 4; i++) {
+        mf_test_drive_one_frame();
+        seen[i] = RasterBackend_MFGPU_TestArena();
+        ring[i] = RasterBackend_MFGPU_TestRingBase();
+        vtx[i]  = RasterBackend_MFGPU_TestVtxBase();
+    }
+
+    // Alternating, not stuck and not free-running.
+    if (!(seen[0] != seen[1] && seen[1] != seen[2] && seen[2] != seen[3])) {
+        printf("  FAIL arena-alt: not alternating (%u %u %u %u)\n",
+               seen[0], seen[1], seen[2], seen[3]);
+        return 0;
+    }
+    if (seen[0] != seen[2] || seen[1] != seen[3]) {
+        printf("  FAIL arena-alt: period is not 2 (%u %u %u %u)\n",
+               seen[0], seen[1], seen[2], seen[3]);
+        return 0;
+    }
+    // The two arenas must be genuinely disjoint memory, not the same base relabelled.
+    if (ring[0] == ring[1] || vtx[0] == vtx[1]) {
+        printf("  FAIL arena-alt: arenas share memory (ring %p/%p vtx %p/%p)\n",
+               (void*)ring[0], (void*)ring[1], (void*)vtx[0], (void*)vtx[1]);
+        return 0;
+    }
+    if (ring[0] != ring[2] || vtx[0] != vtx[2]) {
+        printf("  FAIL arena-alt: arena 0 base moved between frames\n");
+        return 0;
+    }
+    printf("  OK   arena-alt  ring %p/%p vtx %p/%p\n",
+           (void*)ring[0], (void*)ring[1], (void*)vtx[0], (void*)vtx[1]);
+    return 1;
+}
+
+// [Phase 1 B1, Step 6b] The ring-select BIT must track g_arena. Position alone is not
+// enough: Task 1's trace proves WHERE a control write happened, not WHAT was written, and
+// a bit stuck at 0 selects ring A every frame, passes every ordering assertion already in
+// place, and surfaces only as the fabric reading a ring the host never wrote — no build
+// error, no test failure, garbage geometry on device.
+//   frame N   : arena a  -> C_SRCSEL bit 2 == a
+//   frame N+1 : arena !a -> C_SRCSEL bit 2 == !a
+// Both are asserted, because a stuck bit passes on whichever frame happens to match.
+static int case_ringsel_value_tracks_arena(void) {
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+
+    // Seed the f2h write-throttle field (bits 15:8) so "preserved" is a real claim and not
+    // a vacuous 0 == 0. Clobbering it is a silent performance regression, not a failure.
+    const uint32_t THROTTLE = 0x3700u;          // bits 15:8 = 0x37
+    RasterBackend_MFGPU_TestSetCtrlSrcsel(THROTTLE);
+
+    uint32_t arena[2] = {0,0}, sel[2] = {0,0};
+    for (int i = 0; i < 2; i++) {
+        mf_test_drive_one_frame();
+        arena[i] = RasterBackend_MFGPU_TestArena();
+        int at = -1;
+        for (uint32_t k = 0; k < RasterBackend_MFGPU_TestTraceLen(); k++)
+            if (RasterBackend_MFGPU_TestTraceReg(k) == TC_SRCSEL) at = (int)k;
+        if (at < 0) {
+            printf("  FAIL ringsel: frame %d's publish wrote no C_SRCSEL at all\n", i);
+            return 0;
+        }
+        sel[i] = RasterBackend_MFGPU_TestTraceVal((uint32_t)at);
+    }
+
+    // The two frames must genuinely differ, or a stuck bit is indistinguishable.
+    if (arena[0] == arena[1]) {
+        printf("  FAIL ringsel: arena did not alternate across the two frames (%u, %u); "
+               "a stuck select bit would be undetectable\n", arena[0], arena[1]);
+        return 0;
+    }
+    for (int i = 0; i < 2; i++) {
+        const uint32_t bit = (sel[i] >> 2) & 1u;
+        if (bit != arena[i]) {
+            printf("  FAIL ringsel: frame %d wrote C_SRCSEL=0x%08X -> bit2=%u, arena=%u "
+                   "(fabric would read the wrong ring)\n", i, sel[i], bit, arena[i]);
+            return 0;
+        }
+        if ((sel[i] & 0xFF00u) != THROTTLE) {
+            printf("  FAIL ringsel: frame %d clobbered the f2h throttle field: "
+                   "wrote 0x%08X, bits15:8=0x%02X want 0x37\n",
+                   i, sel[i], (sel[i] >> 8) & 0xFFu);
+            return 0;
+        }
+    }
+    printf("  OK   ringsel  bit2 tracked arena across both frames (0x%08X / 0x%08X), "
+           "throttle preserved\n", sel[0], sel[1]);
+    return 1;
+}
+
 // [opaque-ALPHA -> COPY] A fully-opaque ALPHA draw over a source with no per-texel alpha is
 // a copy, but BLT_BLEND_CONST_ALPHA makes the RTL read the destination for every pixel
 // (tri_need_dst -> B_DSTW/B_DSTC, 8 states per pixel instead of 6). The measured device frame
@@ -2003,6 +2110,10 @@ int main(void){
     else printf("raster_backend mfgpu-inflight-drop-limit OK\n");
     if (!case_submit_publish_await_split()) { printf("FAIL mfgpu-submit-split\n"); ok = 0; }
     else printf("raster_backend mfgpu-submit-split OK\n");
+    if (!case_arena_alternates()) { printf("FAIL mfgpu-arena-alt\n"); ok = 0; }
+    else printf("raster_backend mfgpu-arena-alt OK\n");
+    if (!case_ringsel_value_tracks_arena()) { printf("FAIL mfgpu-ringsel\n"); ok = 0; }
+    else printf("raster_backend mfgpu-ringsel OK\n");
     if (!case_opaque_alpha_to_copy()) { printf("FAIL mfgpu-opaque-alpha-copy\n"); ok = 0; }
     else printf("raster_backend mfgpu-opaque-alpha-copy OK\n");
     if (!case_dup_draw_elision()) { printf("FAIL mfgpu-dup-draw\n"); ok = 0; }
