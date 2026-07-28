@@ -126,7 +126,7 @@ ifeq ($(MISTER_BUILD),1)
 CFLAGS   += -DMISTER_NATIVE_VIDEO=1 -DMISTER_WIDTH=288 -DMISTER_HEIGHT=216
 CXXFLAGS += -DMISTER_NATIVE_VIDEO=1 -DMISTER_WIDTH=288 -DMISTER_HEIGHT=216
 LDFLAGS  += -L$(CURDIR)/3rdparty/gles2-sw -lGLES_sw -Wl,-rpath,'$$ORIGIN'
-MISTER_SRCS = gmloader/mister/native_video_writer.c gmloader/mister/frame_capture.cpp gmloader/mister/draw_trace.cpp gmloader/mister/blitter.cpp gmloader/mister/blitter_raster.cpp gmloader/mister/raster_backend_sw.cpp gmloader/mister/raster_backend_mfgpu.cpp gmloader/mister/joy_shm_reader.cpp gmloader/mister/joy_ddr_reader.cpp
+MISTER_SRCS = gmloader/mister/native_video_writer.c gmloader/mister/native_audio_writer.c gmloader/mister/mister_native_audio.cpp gmloader/mister/frame_capture.cpp gmloader/mister/draw_trace.cpp gmloader/mister/blitter.cpp gmloader/mister/blitter_raster.cpp gmloader/mister/raster_backend_sw.cpp gmloader/mister/raster_backend_mfgpu.cpp gmloader/mister/joy_shm_reader.cpp gmloader/mister/joy_ddr_reader.cpp
 endif
 
 # Used by generate_libc.py to generate the function tables that are exported to the
@@ -247,3 +247,18 @@ joy-shm-test:
 	  gmloader/mister/joy_shm_reader.cpp \
 	  gmloader/mister/joy_ddr_reader.cpp \
 	  -lm -o /tmp/jst && /tmp/jst
+
+.PHONY: native-audio-writer-test
+native-audio-writer-test:
+	cc -std=c11 -O0 -g -Igmloader/mister \
+	  gmloader/mister/native_audio_writer_test.c \
+	  gmloader/mister/native_audio_writer.c \
+	  -o /tmp/nawt && /tmp/nawt
+
+.PHONY: native-audio-shim-test
+native-audio-shim-test:
+	c++ -std=c++17 -O0 -g -Igmloader/mister $(shell pkg-config sdl2 --cflags) \
+	  gmloader/mister/mister_native_audio_test.cpp \
+	  gmloader/mister/mister_native_audio.cpp \
+	  gmloader/mister/native_audio_writer.c \
+	  $(shell pkg-config sdl2 --libs) -o /tmp/mnat && /tmp/mnat

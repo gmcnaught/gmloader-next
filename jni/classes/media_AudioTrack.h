@@ -2,6 +2,9 @@
 #include <SDL2/SDL.h>
 #include "jni.h"
 #include "jni_internals.h"
+#ifdef MISTER_NATIVE_VIDEO
+#include "mister/mister_native_audio.h"
+#endif
 
 #define ENCODING_PCM_16BIT  2
 #define ENCODING_PCM_8BIT   3
@@ -26,6 +29,9 @@ public:
     unsigned int needed_bytes;
     SDL_AudioSpec desired, obtained;
     SDL_AudioDeviceID deviceId;
+#ifdef MISTER_NATIVE_VIDEO
+    MisterAudioTrack nativeTrack;
+#endif
     int playing;
     int mode;
 };

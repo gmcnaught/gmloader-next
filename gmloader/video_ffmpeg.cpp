@@ -17,11 +17,17 @@ extern "C" {
 #include <kitchensink/kitchensink.h>
 #include <kitchensink/kiterror.h>
 #include <string.h>
+#ifdef MISTER_NATIVE_VIDEO
+#include "mister/mister_native_audio.h"
+#endif
 
 #define AUDIOBUFFER_SIZE (1024 * 64)
 
 static SDL_Window* sdl_win = NULL;
 static SDL_AudioDeviceID video_audiodev = NULL;
+#ifdef MISTER_NATIVE_VIDEO
+static MisterAudioTrack video_audiotrack = 0;
+#endif
 static Kit_Source* video_src = NULL;
 static Kit_Player* video_player = NULL;
 static char video_audiobuf[AUDIOBUFFER_SIZE];
@@ -149,8 +155,17 @@ void video_open_internal(const char* path)
     wanted_spec.format = pinfo.audio.output.format;
     wanted_spec.channels = pinfo.audio.output.channels;
     wanted_spec.size = 32768;
+#ifdef MISTER_NATIVE_VIDEO
+    video_audiotrack = MisterAudio_IsActive()
+        ? MisterAudio_Open(&wanted_spec, &audio_spec) : 0;
+    video_audiodev = video_audiotrack
+        ? 0 : SDL_OpenAudioDevice(NULL, 0, &wanted_spec, &audio_spec, 0);
+    if (video_audiotrack) MisterAudio_Pause(video_audiotrack, 0);
+    else SDL_PauseAudioDevice(video_audiodev, 0);
+#else
     video_audiodev = SDL_OpenAudioDevice(NULL, 0, &wanted_spec, &audio_spec, 0);
     SDL_PauseAudioDevice(video_audiodev, 0);
+#endif
 
     // Start player, set start variables
     Kit_PlayerPlay(video_player);
@@ -170,12 +185,20 @@ void video_close_internal()
     video_loaded = false;
     Kit_ClosePlayer(video_player);
     Kit_CloseSource(video_src);
+#ifdef MISTER_NATIVE_VIDEO
+    if (video_audiotrack) MisterAudio_Close(video_audiotrack);
+    else SDL_CloseAudioDevice(video_audiodev);
+#else
     SDL_CloseAudioDevice(video_audiodev);
+#endif
     free(video_buffer);
     video_buffer = NULL;
     video_player = NULL;
     video_src = NULL;
     video_audiodev = NULL;
+#ifdef MISTER_NATIVE_VIDEO
+    video_audiotrack = 0;
+#endif
     video_status = -2;
     video_playback_status = 0;
 }
@@ -186,7 +209,12 @@ void video_pause_internal()
         return;
 
     video_playback_status = 3;
+#ifdef MISTER_NATIVE_VIDEO
+    if (video_audiotrack) MisterAudio_Pause(video_audiotrack, 1);
+    else SDL_PauseAudioDevice(video_audiodev, 1);
+#else
     SDL_PauseAudioDevice(video_audiodev, 1);
+#endif
     Kit_PlayerPause(video_player);
 }
 
@@ -196,7 +224,12 @@ void video_resume_internal()
         return;
 
     video_playback_status = 2;
+#ifdef MISTER_NATIVE_VIDEO
+    if (video_audiotrack) MisterAudio_Pause(video_audiotrack, 0);
+    else SDL_PauseAudioDevice(video_audiodev, 0);
+#else
     SDL_PauseAudioDevice(video_audiodev, 0);
+#endif
     Kit_PlayerPlay(video_player);
 }
 
@@ -302,11 +335,24 @@ void video_process()
     } else {
         video_decode();
 
+#ifdef MISTER_NATIVE_VIDEO
+        int queued = video_audiotrack
+            ? (int)MisterAudio_QueuedBytes(video_audiotrack)
+            : SDL_GetQueuedAudioSize(video_audiodev);
+#else
         int queued = SDL_GetQueuedAudioSize(video_audiodev);
+#endif
         if (queued < AUDIOBUFFER_SIZE) {
             int ret;
             while ((ret = Kit_GetPlayerAudioData(video_player, (unsigned char*)video_audiobuf, AUDIOBUFFER_SIZE)) > 0) {
+#ifdef MISTER_NATIVE_VIDEO
+                if (video_audiotrack)
+                    MisterAudio_Queue(video_audiotrack, video_audiobuf, ret);
+                else
+                    SDL_QueueAudio(video_audiodev, video_audiobuf, ret);
+#else
                 SDL_QueueAudio(video_audiodev, video_audiobuf, ret);
+#endif
             }
         }
     }
