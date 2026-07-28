@@ -80,6 +80,9 @@ extern "C" void     RasterBackend_MFGPU_TestSetCtrlSrcsel(uint32_t v);
 extern "C" uint32_t  RasterBackend_MFGPU_TestArena(void);
 extern "C" uintptr_t RasterBackend_MFGPU_TestRingBase(void);
 extern "C" uintptr_t RasterBackend_MFGPU_TestVtxBase(void);
+// [Phase 1 B3] times evict_one_lru was CALLED (not times it succeeded). Proves the heap was
+// genuinely under pressure, so a retention assertion cannot pass by never being tested.
+extern "C" uint32_t RasterBackend_MFGPU_TestEvictAttempts(void);
 // blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void);
@@ -1772,6 +1775,122 @@ static int case_ringsel_value_tracks_arena(void) {
     return 1;
 }
 
+// [Phase 1 B3] Texture heap capped to hold exactly ONE 512x512 page (512 KiB) plus slack,
+// so a second texture cannot be admitted without evicting the first. Sizing convention
+// follows case_eviction (1.25 MB for two such pages); this is the one-page equivalent.
+//
+// Deliberately NOT the "two textures fit, a third evicts" sizing the plan suggested: with
+// two pages resident nothing is ever under pressure in a three-frame test, evict_one_lru is
+// never called, and the case passes IDENTICALLY with and without the two-frame floor. That
+// is the vacuity this task was hardened against, reachable straight from the plan's text.
+enum { MF_TEST_TINY_HEAP = 768u * 1024u };
+
+// Drive one frame that uses exactly one keyed texture.
+// Deliberately not routed through draw_tagged/battery_case_key: under the CORRECT two-frame
+// floor the second texture's upload is refused (its only eviction candidate is pinned) and
+// the draw is dropped — the designed safe behaviour, documented at case_intra_frame_no_alias
+// — but the SW oracle still draws it, so a parity comparison would report that as a failure.
+static void mf_test_drive_frame_with_texture(uint32_t key, uint8_t tag) {
+    enum { TW = 512, TH = 512 };
+    static uint8_t buf[TW*TH*4];
+    for (int i = 0; i < TW*TH; i++) { buf[i*4]=tag; buf[i*4+1]=tag; buf[i*4+2]=tag; buf[i*4+3]=255; }
+    RTexture t = { buf, TW, TH, 1, 1, 0, 1 };
+    BVtx v[3] = { {0,0,0,0,1,1,1,1}, {200,0,1,0,1,1,1,1}, {0,150,0,1,1,1,1,1} };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, key);
+    backend_mfgpu.frame_end();
+}
+
+// [Phase 1 B3] With two frames in flight, a texture touched in frame N is still being read
+// by the fabric while the host builds N+1. The eviction floor must therefore protect the
+// last TWO frames, not one. Re-staging over a texture the fabric is mid-read produces no
+// error at all — just garbage, the same silent class as the cascade at :707.
+//
+//   frame 1: texture A  -> uploaded, sole resident
+//   frame 2: texture B  -> heap full. A was touched LAST frame, so it is still live to the
+//                          fabric. A one-frame floor evicts it; a two-frame floor refuses,
+//                          and B's draw is dropped instead (safe, and designed).
+//   frame 3: texture A  -> must be a cache HIT. If A was evicted in frame 2 this re-uploads.
+static int case_lru_protects_two_frames(void) {
+    RasterBackend_MFGPU_TestReinit(MF_TEST_TINY_HEAP);
+
+    mf_test_drive_frame_with_texture(/*key=*/1, /*tag=*/40);
+    const uint32_t up_after_1 = RasterBackend_MFGPU_TestUploadCount();
+    const uint32_t ev_after_1 = RasterBackend_MFGPU_TestEvictAttempts();
+
+    mf_test_drive_frame_with_texture(/*key=*/2, /*tag=*/200);
+    mf_test_drive_frame_with_texture(/*key=*/1, /*tag=*/40);
+
+    const uint32_t up_after_3 = RasterBackend_MFGPU_TestUploadCount();
+    const uint32_t ev_after_3 = RasterBackend_MFGPU_TestEvictAttempts();
+
+    // VACUITY GUARD, checked BEFORE concluding anything from A's survival. If the heap never
+    // filled, A survived because nothing was ever under pressure — and "A survived" would
+    // read as success while testing nothing. A later change to the heap cap or the texture
+    // size could reintroduce that silently; this assertion is what makes it loud.
+    if (ev_after_3 == ev_after_1) {
+        printf("  FAIL lru-2frame: the heap was never under pressure (evict attempts %u -> "
+               "%u); A's survival proves nothing and this case is vacuous\n",
+               ev_after_1, ev_after_3);
+        return 0;
+    }
+    if (up_after_3 != up_after_1) {
+        printf("  FAIL lru-2frame: uploads %u -> %u; texture A was evicted while still live "
+               "to the fabric\n", up_after_1, up_after_3);
+        return 0;
+    }
+    printf("  OK   lru-2frame  A survived an intervening frame under real heap pressure "
+           "(uploads %u, evict attempts %u)\n", up_after_3, ev_after_3 - ev_after_1);
+    return 1;
+}
+
+// [Phase 1 B3] The SECOND site the lagging floor governs: the pin-aware insert guard, which
+// fires when the 256-slot cache TABLE is full (not when the heap is). It must protect the
+// previous frame's entries for the same reason eviction must -- the fabric is still reading
+// that frame's batch. Heap pressure never reaches this path, so case_lru_protects_two_frames
+// cannot cover it: reverting this one guard alone leaves the whole suite green.
+//
+//   frame 1: fill all 256 slots. Key 1 is the global LRU from here on.
+//   frame 2: a 257th key. The table is full and the LRU victim (key 1) was touched LAST
+//            frame, so it is still live. Must be refused, not overwritten.
+//   frame 3: key 1 must still be resident -- a cache hit, no re-upload.
+static int case_pin_insert_protects_two_frames(void) {
+    RasterBackend_MFGPU_TestReinit(0);
+    static const uint8_t px[4] = { 90, 90, 90, 255 };
+    RTexture t = { px, 1, 1, 1, 1, 0, 1 };
+    BVtx v[3] = { {1,1,0,0,1,1,1,1}, {30,1,1,0,1,1,1,1}, {1,30,0,1,1,1,1,1} };
+    static uint8_t rgba[BW*BH*4];
+    RSurface s = { rgba, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba);
+
+    backend_mfgpu.frame_begin();
+    for (uint32_t k = 1; k <= 256; k++)
+        backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, k);
+    backend_mfgpu.frame_end();
+
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, /*257th key=*/9999);
+    backend_mfgpu.frame_end();
+    const uint32_t up2 = RasterBackend_MFGPU_TestUploadCount();
+
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, /*the LRU victim=*/1);
+    backend_mfgpu.frame_end();
+    const uint32_t up3 = RasterBackend_MFGPU_TestUploadCount();
+
+    if (up3 != up2) {
+        printf("  FAIL pin-insert-2frame: uploads %u -> %u; the previous frame's LRU entry "
+               "was overwritten in the cache table while still live to the fabric\n", up2, up3);
+        return 0;
+    }
+    printf("  OK   pin-insert-2frame  prior-frame entry survived a full-table insert "
+           "(uploads steady at %u)\n", up3);
+    return 1;
+}
+
 // [opaque-ALPHA -> COPY] A fully-opaque ALPHA draw over a source with no per-texel alpha is
 // a copy, but BLT_BLEND_CONST_ALPHA makes the RTL read the destination for every pixel
 // (tri_need_dst -> B_DSTW/B_DSTC, 8 states per pixel instead of 6). The measured device frame
@@ -2114,6 +2233,10 @@ int main(void){
     else printf("raster_backend mfgpu-arena-alt OK\n");
     if (!case_ringsel_value_tracks_arena()) { printf("FAIL mfgpu-ringsel\n"); ok = 0; }
     else printf("raster_backend mfgpu-ringsel OK\n");
+    if (!case_lru_protects_two_frames()) { printf("FAIL mfgpu-lru-2frame\n"); ok = 0; }
+    else printf("raster_backend mfgpu-lru-2frame OK\n");
+    if (!case_pin_insert_protects_two_frames()) { printf("FAIL mfgpu-pin-insert-2frame\n"); ok = 0; }
+    else printf("raster_backend mfgpu-pin-insert-2frame OK\n");
     if (!case_opaque_alpha_to_copy()) { printf("FAIL mfgpu-opaque-alpha-copy\n"); ok = 0; }
     else printf("raster_backend mfgpu-opaque-alpha-copy OK\n");
     if (!case_dup_draw_elision()) { printf("FAIL mfgpu-dup-draw\n"); ok = 0; }

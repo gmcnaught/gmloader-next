@@ -261,6 +261,16 @@ static uint32_t   g_tex_heap_cap = 0;   // 0 => full MF_TEX_HEAP; else test over
 // draw onto different pixels. evict_one_lru() only considers entries with
 // .lru <= floor (untouched this frame) as eviction candidates.
 static uint64_t   g_lru_frame_floor = 0;
+// [Phase 1 B3] How many times eviction was ATTEMPTED (not how many succeeded). A retention
+// test that cannot show the heap was under pressure cannot distinguish "the texture was
+// protected" from "nothing was ever at risk"; this is what makes that distinction assertable.
+static uint32_t   g_evict_attempts = 0;
+// [Phase 1 B3] The floor EVICTION compares against, which lags g_lru_frame_floor by one
+// frame. With the ring double-buffered the host builds frame N+1 while the fabric is still
+// reading N, so a texture touched in N is live even though N is "over". Evicting or
+// re-staging it writes straight over memory the fabric is mid-read — the same class of
+// failure as the in-flight-batch cascade at :707, and just as silent.
+static uint64_t   g_lru_evict_floor = 0;
 
 // Free the least-recently-used cached entry that is NOT pinned by this
 // frame (see g_lru_frame_floor above). Returns false if no unpinned entry
@@ -899,6 +909,7 @@ static void mf_init_once(void) {
 #endif
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
+    g_evict_attempts = 0; g_lru_evict_floor = 0;   // [Phase 1 B3] pressure witness + lagging floor
     g_publish_count = 0; g_await_count = 0;   // [Phase 1 B2] submit-seam counters
     g_arena = 0;                                                              // [Phase 1 B1] arena parity
     g_publish_depth = 0; g_unpaired_awaits = 0; g_seam_depth_violations = 0;  // [Phase 1 B2] ordering witness
@@ -964,6 +975,9 @@ static void mf_frame_begin(void) {
     // (hit or staged) from here through mf_frame_end gets .lru > this value
     // and is thus protected from eviction until the NEXT frame begins (see
     // g_lru_frame_floor and evict_one_lru).
+    // [Phase 1 B3] Retire this frame's floor to the eviction floor BEFORE taking the new
+    // snapshot, so entries touched in the previous frame stay pinned through this one.
+    g_lru_evict_floor = g_lru_frame_floor;
     g_lru_frame_floor = g_lru_clock;
     // [Phase 1 B1] Flip to the other arena before rebuilding. The fabric is (or will
     // shortly be) reading the previous frame's arena, so this frame must not touch it.
@@ -1033,17 +1047,20 @@ static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
 }
 
 static bool evict_one_lru(void) {
-    // Pin-this-frame invariant: an entry with .lru > g_lru_frame_floor was
-    // hit or staged during the CURRENT frame, so a blt_trilist command
-    // already emitted this frame may reference its heap offset — that
-    // command isn't consumed until blt_execute runs at frame end. Freeing
-    // such an entry now would let a later stage_texture's retry reuse the
-    // same offset with different pixels, so the earlier (already-emitted)
-    // draw would sample the wrong texture when the frame finally executes.
-    // Only entries from a PRIOR frame (.lru <= floor) are eviction-eligible.
+    g_evict_attempts++;   // [Phase 1 B3] pressure witness: called, not necessarily succeeded
+    // Pin-for-TWO-frames invariant: an entry with .lru > g_lru_evict_floor was hit or
+    // staged during the current frame OR the previous one.
+    //   - current frame: a blt_trilist command already emitted this frame may reference its
+    //     heap offset, and that command isn't consumed until blt_execute runs at frame end.
+    //     Freeing it now would let a later stage_texture's retry reuse the same offset with
+    //     different pixels, so the earlier (already-emitted) draw samples the wrong texture.
+    //   - previous frame [Phase 1 B3]: with the ring double-buffered the fabric is still
+    //     reading that frame's batch while the host builds this one, so its textures are
+    //     live in hardware even though the frame is "over".
+    // Only entries older than BOTH (.lru <= g_lru_evict_floor) are eviction-eligible.
     int victim = -1; uint64_t best = ~0ull;
     for (int i = 0; i < MF_TEX_CACHE_N; i++) {
-        if (g_texcache[i].used && g_texcache[i].lru <= g_lru_frame_floor && g_texcache[i].lru < best) {
+        if (g_texcache[i].used && g_texcache[i].lru <= g_lru_evict_floor && g_texcache[i].lru < best) {
             best = g_texcache[i].lru; victim = i;
         }
     }
@@ -1194,7 +1211,7 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
     // (mirror the heap-overflow graceful path): undo this upload, set overflow, and
     // fail the stage so the caller drops the draw. A busy frame degrades to a
     // DROPPED frame, never a wrong-pixel frame.
-    if (g_texcache[slot].used && g_texcache[slot].lru > g_lru_frame_floor) {
+    if (g_texcache[slot].used && g_texcache[slot].lru > g_lru_evict_floor) {
         if (mf_heaplog_on())
             fprintf(stderr, "HEAPLOG CACHE-FULL %s key=%u: all %d slots frame-pinned "
                     "- dropping frame\n", what, key, MF_TEX_CACHE_N);
@@ -1953,6 +1970,8 @@ extern "C" uint32_t RasterBackend_MFGPU_TestTraceVal(uint32_t i) {
 // [Phase 1 B1] host-test hooks: prove the arenas alternate and are disjoint. Field names
 // are the emitter's real ones (blt_emitter_t: `ring`, `vtx_buf`), not assumed.
 extern "C" uint32_t  RasterBackend_MFGPU_TestArena(void)    { return g_arena; }
+// [Phase 1 B3] eviction ATTEMPTS since reinit — the vacuity guard for the retention case.
+extern "C" uint32_t  RasterBackend_MFGPU_TestEvictAttempts(void) { return g_evict_attempts; }
 extern "C" uintptr_t RasterBackend_MFGPU_TestRingBase(void) { return (uintptr_t)g_e.ring; }
 extern "C" uintptr_t RasterBackend_MFGPU_TestVtxBase(void)  { return (uintptr_t)g_e.vtx_buf; }
 // [Phase 1 B1] Seed C_SRCSEL's shadow so the read-modify-write has a non-zero throttle
@@ -1976,6 +1995,7 @@ extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap
     mf_init_once();                    // re-wires emitter, clears cache + counter
     g_lru_frame_floor = 0;             // start clean: nothing pinned before frame 1
+    g_lru_evict_floor = 0;             // [Phase 1 B3] ...and nothing pinned from before that
 }
 
 // Free the cached entry for GL texture `id` so the next draw re-stages it. Called
