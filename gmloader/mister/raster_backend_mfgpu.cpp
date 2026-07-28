@@ -488,8 +488,9 @@ static void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
-#include <time.h>
 #include <stdlib.h>   // getenv (GMLOADER_MFSUBMIT_STAT instrumentation)
+// <time.h> was here; hoisted to the top includes when mf_device_publish stopped being
+// device-only and needed clock_gettime in both builds.
 enum {
     MF_DEV_PHYS_BASE = 0x3B000000u,
     MF_DEV_MAP_SIZE  = 0x01000000u,   // 16 MiB dedicated blitter region
@@ -626,11 +627,17 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
 #endif // MISTER_NATIVE_VIDEO — device transport internals end here
 
 // ── SUBMIT SEAM (Phase 1 B2) ─────────────────────────────────────────────────
-// Publish the emitter's control-block mirror, ring the doorbell (submit_seq LAST,
-// after a barrier), poll C_DONE. Ring + heap are already resident in DDR (the
-// emitter was bound to g_dev_ring/g_dev_src), so there is nothing to copy. This
-// core's C_STATUS is OSD-mirror, not an error latch — completion == C_DONE match,
-// failure == timeout.
+// The frame's handoff to the fabric, in three parts: mf_device_publish (control-block
+// mirror, barrier, doorbell), mf_device_await (poll C_DONE), and mf_device_submit, which
+// is just the two in order. Split so Task 4 can run the engine's Process() for frame N+1
+// in between; see each function for its own contract.
+//
+// Common to both halves: the ring + heap are already resident in DDR (the emitter was
+// bound to g_dev_ring/g_dev_src), so there is nothing to copy. This core's C_STATUS is
+// OSD-mirror, not an error latch — completion == C_DONE match, failure == timeout.
+//
+// Both halves sit BEHIND mf_frame_end's g_frame_dropped guard: a dropped frame rebuilds
+// no ring and must ring no doorbell (pinned by case_submit_publish_await_split).
 //
 // These three deliberately sit OUTSIDE #ifdef MISTER_NATIVE_VIDEO, with only the
 // MMIO and the poll loop guarded, because the host oracle has to be able to observe

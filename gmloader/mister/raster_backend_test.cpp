@@ -1513,7 +1513,36 @@ static int case_submit_publish_await_split(void) {
         printf("  FAIL submit-split: expected 1 await, got %u\n", awa1);
         return 0;
     }
-    printf("  OK   submit-split  publish=%u await=%u\n", pub1, awa1);
+
+    // The seam must sit BEHIND the drop guard: a frame the in-flight guard drops rebuilds
+    // no ring, so it must ring no doorbell either. mf_frame_end returns on g_frame_dropped
+    // before blt_end_frame and before both submit sites; this pins that placement, which
+    // Task 4 moves publish and await straight across. A publish on a dropped frame would
+    // re-ring the doorbell with submit_seq unchanged, over a ring the fabric is still
+    // reading -- the corruption cascade documented at raster_backend_mfgpu.cpp:707.
+    RasterBackend_MFGPU_TestSetFabricBusy(1);   // fabric "still busy" -> next frame drops
+    const uint32_t drop0 = RasterBackend_MFGPU_TestDropCount();
+    mf_test_drive_one_frame();                  // must be dropped whole
+    const uint32_t pub2  = RasterBackend_MFGPU_TestPublishCount();
+    const uint32_t awa2  = RasterBackend_MFGPU_TestAwaitCount();
+    const uint32_t drop1 = RasterBackend_MFGPU_TestDropCount();
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);  // restore before any early return below
+
+    // Vacuity guard: if the frame was never actually dropped, "no publish happened" says
+    // nothing about the drop path -- the case would pass for the wrong reason.
+    if (drop1 != drop0 + 1) {
+        printf("  FAIL submit-split: frame was NOT dropped (drops %u -> %u), so the "
+               "no-seam-on-drop check below would pass vacuously\n", drop0, drop1);
+        return 0;
+    }
+    if (pub2 != pub1 || awa2 != awa1) {
+        printf("  FAIL submit-split: dropped frame still drove the seam "
+               "(publish %u->%u, await %u->%u)\n", pub1, pub2, awa1, awa2);
+        return 0;
+    }
+
+    printf("  OK   submit-split  publish=%u await=%u; dropped frame drove neither\n",
+           pub1, awa1);
     return 1;
 }
 
