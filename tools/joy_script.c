@@ -146,8 +146,26 @@ int main(int argc, char **argv) {
      * capture runs. */
     while (!g_stop) sleep(1);
 
+    /* Clear the doorbell before unmapping/removing the file: a later reader
+     * (joy_shm_reader.cpp's JoyShm_Init()) validates only magic+version, and
+     * input.cpp latches whichever transport wins ONCE and never re-checks.
+     * If this process just munmap()s and exits, the file survives on disk
+     * with magic still set and the last mask frozen in it; the next
+     * *production* launch (no joy_script running) opens that orphaned file,
+     * sees a valid magic/version, latches shm as the transport, and reads a
+     * frozen mask (usually 0x000) forever — the same failure class as the
+     * project's recorded input-death incident, but self-inflicted by a prior
+     * bench session instead of a dropped bridge leg. Clearing magic here
+     * makes a stale mapping fail JoyShm_Init()'s validation even if unlink
+     * below races with (or fails against) a reader that already has the
+     * file open; unlink then removes the path entirely so a fresh joy_script
+     * run — or JoyShm_Init()'s open() — never sees this instance's leftovers. */
+    p->magic = 0u;                 /* clear doorbell FIRST, mirrors the set-order */
+    __sync_synchronize();
+    munmap((void *)p, sizeof(MalditaJoyShm));
+    unlink(shm_path);
+
     printf("JOYSCRIPT stop\n");
     fflush(stdout);
-    munmap((void *)p, sizeof(MalditaJoyShm));
     return 0;
 }
