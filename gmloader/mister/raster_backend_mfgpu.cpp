@@ -72,6 +72,8 @@ extern "C" {
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   // getenv (GMLOADER_MFGPU_HEAPLOG diagnostic, Task 9 bring-up)
+#include <time.h>     // [Phase 1 B2] clock_gettime for the publish timestamp, which is
+                      // recorded in BOTH builds (mf_device_publish is not device-only)
 
 // The mfgpu backend scans the fabric FB out as the display verbatim — the two
 // geometry roots must be identical (native-288x216 single-source rule).
@@ -621,20 +623,53 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
         fsum = 0; tsum = 0; xsum = 0; csum = 0;
     }
 }
+#endif // MISTER_NATIVE_VIDEO — device transport internals end here
 
+// ── SUBMIT SEAM (Phase 1 B2) ─────────────────────────────────────────────────
 // Publish the emitter's control-block mirror, ring the doorbell (submit_seq LAST,
 // after a barrier), poll C_DONE. Ring + heap are already resident in DDR (the
 // emitter was bound to g_dev_ring/g_dev_src), so there is nothing to copy. This
 // core's C_STATUS is OSD-mirror, not an error latch — completion == C_DONE match,
 // failure == timeout.
-static void mf_device_submit(void) {
+//
+// These three deliberately sit OUTSIDE #ifdef MISTER_NATIVE_VIDEO, with only the
+// MMIO and the poll loop guarded, because the host oracle has to be able to observe
+// the seam: the raster-backend-test target does not define MISTER_NATIVE_VIDEO, so
+// device-only publish/await counters would be permanently zero there and the
+// pipelining this split exists to enable could not be tested without hardware.
+// On the oracle the two functions reduce to the counter bump and the timestamp.
+
+// [Phase 1 B2] Counters for the host-oracle test that publish and await are separable.
+static uint32_t g_publish_count = 0;
+static uint32_t g_await_count   = 0;
+// Timestamp of the publish we are waiting on, so mf_submit_stat still measures the
+// full doorbell->C_DONE interval even when the await happens a frame later.
+static struct timespec g_publish_t0;
+
+// [Phase 1 B2] Publish the emitter's control-block mirror and ring the doorbell.
+// Does NOT poll. Split out of the old mf_device_submit so the caller can run
+// Process() for the next frame between the doorbell and the wait.
+static void mf_device_publish(void) {
+#ifdef MISTER_NATIVE_VIDEO
     mf_ctrl_wr(MF_C_CMDCOUNT, (uint32_t)g_e.cmd_count);
     mf_ctrl_wr(MF_C_TARGET,   (uint32_t)g_e.target_buf);
     mf_ctrl_wr(MF_C_CLEAR,    (uint32_t)g_e.clear_color);
     mf_ctrl_wr(MF_C_FLAGS,    (uint32_t)g_e.flags);
     __sync_synchronize();                       // data before doorbell
     mf_ctrl_wr(MF_C_SUBMIT, g_e.submit_seq);    // doorbell LAST
-    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+#endif
+    clock_gettime(CLOCK_MONOTONIC, &g_publish_t0);
+    g_publish_count++;
+}
+
+// [Phase 1 B2] Block until the fabric acks the published sequence. This is the old
+// mf_device_submit's tail, moved verbatim: the poll loop, the backoff, the timeout
+// budget, and the g_fabric_pending / g_pending_seq bookkeeping the in-flight-batch
+// guard reads are all unchanged.
+static void mf_device_await(void) {
+    g_await_count++;
+#ifdef MISTER_NATIVE_VIDEO
+    struct timespec t0 = g_publish_t0;
     if (mf_nowait_on()) { mf_submit_stat(&t0, 0, /*timeout=*/0); return; }  // probe: no poll
     long iters = 0;
     const long poll_us = mf_poll_us();
@@ -669,8 +704,15 @@ static void mf_device_submit(void) {
             return;
         }
     }
-}
 #endif // MISTER_NATIVE_VIDEO
+}
+
+// [Phase 1 B2] Unchanged behaviour for callers that still want the blocking form.
+// Task 4 replaces the single call site with a deferred publish/await pair.
+static void mf_device_submit(void) {
+    mf_device_publish();
+    mf_device_await();
+}
 
 static void mf_init_once(void) {
     if (g_inited) return;
@@ -695,6 +737,7 @@ static void mf_init_once(void) {
 #endif
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
+    g_publish_count = 0; g_await_count = 0;   // [Phase 1 B2] submit-seam counters
     g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
     g_last_draw.valid = false; g_dup_skipped = 0;
     g_appsurf_presented = false; g_crt_stripped = 0;
@@ -1600,6 +1643,10 @@ static void mf_frame_end(void) {
         fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped\n");
         return;   // nothing safe to execute this frame
     }
+    // [Phase 1 B2] Drive the same submit seam the device path uses, so the publish/await
+    // bookkeeping is observable off-device. blt_execute below stands in for the fabric and
+    // is synchronous, so the await is trivially satisfied and costs nothing here.
+    mf_device_submit();
     int n = g_e.cmd_count;
     if (n > MF_MAX_CMDS) n = MF_MAX_CMDS;
     for (int i = 0; i < n; i++)
@@ -1669,6 +1716,9 @@ extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy) {
     if (busy > 0) { g_fabric_pending = true; g_pending_seq = g_e.submit_seq; }
 }
 extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void) { return g_drop_count; }
+// [Phase 1 B2] host-test hooks: prove publish and await are separable and each ran once.
+extern "C" uint32_t RasterBackend_MFGPU_TestPublishCount(void) { return g_publish_count; }
+extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void)   { return g_await_count; }
 // Blend mode the last TRILIST went out with, so a test can pin the opaque-ALPHA -> COPY
 // promotion (and, just as importantly, that a NON-opaque draw is left alone).
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void) { return g_last_trilist_blend; }

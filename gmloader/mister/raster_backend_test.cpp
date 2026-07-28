@@ -54,6 +54,10 @@ extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes);
 // read how many whole frames the guard has dropped since reinit.
 extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy);
 extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void);
+// [Phase 1 B2] submit-seam counters: how many times the frame loop rang the doorbell
+// (publish) and how many times it waited for the ack (await), since reinit.
+extern "C" uint32_t RasterBackend_MFGPU_TestPublishCount(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void);
 // blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void);
@@ -1465,6 +1469,54 @@ static int case_inflight_drop_limit(void) {
     return 1;
 }
 
+// [Phase 1 B2] Drive one complete frame through the real vtable and close it: clear, one
+// small textured triangle, present. Mirrors how case_inflight_drop above drives its
+// frames — the submit-seam cases care about the publish/await bookkeeping a closed frame
+// produces, not about the pixels, so the geometry is deliberately the same trivial one.
+static void mf_test_drive_one_frame(void) {
+    static const uint8_t white[4] = { 255, 255, 255, 255 };
+    RTexture t = { white, 1, 1, 1, 1, 0, 1 };
+    BVtx v[3] = { {1,1,0,0,1,1,1,1}, {60,1,1,0,1,1,1,1}, {1,60,0,1,1,1,1,1} };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    backend_mfgpu.clear(&s, 0,0,0,255);
+    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, next_key());
+    backend_mfgpu.present(&s);
+}
+
+// [Phase 1 B2] The submit path must be separable into a non-blocking publish and a
+// blocking await, so the host can run Process() for frame N+1 between them. This is
+// the seam the pipelining depends on; without it, deferring the poll means
+// restructuring the timeout and drop-frame logic at the same time.
+static int case_submit_publish_await_split(void) {
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);   // ask for the real predicate
+
+    const uint32_t pub0 = RasterBackend_MFGPU_TestPublishCount();
+    const uint32_t awa0 = RasterBackend_MFGPU_TestAwaitCount();
+    if (pub0 != 0 || awa0 != 0) {
+        printf("  FAIL submit-split: counters not zeroed by reinit (pub=%u await=%u)\n",
+               pub0, awa0);
+        return 0;
+    }
+
+    mf_test_drive_one_frame();   // emits a trivial frame and closes it
+
+    const uint32_t pub1 = RasterBackend_MFGPU_TestPublishCount();
+    const uint32_t awa1 = RasterBackend_MFGPU_TestAwaitCount();
+    if (pub1 != 1) {
+        printf("  FAIL submit-split: expected 1 publish, got %u\n", pub1);
+        return 0;
+    }
+    if (awa1 != 1) {
+        printf("  FAIL submit-split: expected 1 await, got %u\n", awa1);
+        return 0;
+    }
+    printf("  OK   submit-split  publish=%u await=%u\n", pub1, awa1);
+    return 1;
+}
+
 // [opaque-ALPHA -> COPY] A fully-opaque ALPHA draw over a source with no per-texel alpha is
 // a copy, but BLT_BLEND_CONST_ALPHA makes the RTL read the destination for every pixel
 // (tri_need_dst -> B_DSTW/B_DSTC, 8 states per pixel instead of 6). The measured device frame
@@ -1801,6 +1853,8 @@ int main(void){
     else printf("raster_backend mfgpu-inflight-drop OK\n");
     if (!case_inflight_drop_limit()) { printf("FAIL mfgpu-inflight-drop-limit\n"); ok = 0; }
     else printf("raster_backend mfgpu-inflight-drop-limit OK\n");
+    if (!case_submit_publish_await_split()) { printf("FAIL mfgpu-submit-split\n"); ok = 0; }
+    else printf("raster_backend mfgpu-submit-split OK\n");
     if (!case_opaque_alpha_to_copy()) { printf("FAIL mfgpu-opaque-alpha-copy\n"); ok = 0; }
     else printf("raster_backend mfgpu-opaque-alpha-copy OK\n");
     if (!case_dup_draw_elision()) { printf("FAIL mfgpu-dup-draw\n"); ok = 0; }
