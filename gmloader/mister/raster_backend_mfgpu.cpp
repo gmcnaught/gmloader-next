@@ -476,6 +476,41 @@ static void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2
     g_cov_px_accum += mf_clip_tri_area(x0, y0, x1, y1, x2, y2);
 }
 
+// ── CONTROL-BLOCK REGISTER INDICES + WRITE TRACE (Phase 1 B2) ────────────────
+// Hoisted out of the device block so mf_device_publish's body can compile in BOTH builds.
+// These are qword indices into BLTCTRL, the wire contract in
+// 3rdparty/mfgpu/docs/blitter-protocol.md §2 — not addresses, so they are build-independent.
+enum {
+    MF_C_SUBMIT = 0, MF_C_CMDCOUNT = 1, MF_C_TARGET = 2, MF_C_CLEAR = 3,
+    MF_C_FLAGS = 4, MF_C_DONE = 5, MF_C_STATUS = 6, MF_C_SRCSEL = 7,
+};
+
+// [Phase 1 B2] Publish writes a SINGLE shared control block and the fabric latches every
+// word of it in its prologue the moment it sees a new C_SUBMIT. So the ORDER of these
+// writes is the contract, not an implementation detail: the doorbell must be last and the
+// barrier must precede it, or the fabric latches values the host had not finished writing.
+//
+// None of that was observable on the host oracle. mf_ctrl_wr's store compiles out there, so
+// publish's entire body was invisible: counters see how many times the seam ran, the
+// pairing witness sees in what order its two halves ran, and neither reaches INSIDE publish.
+// Measured escapes before this shim, each passing all 69 cases: barrier moved after the
+// doorbell, C_SUBMIT written first, and any single control word simply deleted.
+//
+// So mf_ctrl_wr records every write to a trace buffer in both builds and stores only on
+// device — the same lift that made the seam itself testable, applied one level down.
+enum { MF_TRACE_MAX = 32, MF_TRACE_BARRIER = -1 };   // -1 is not a valid qword index
+struct MfCtrlTraceEnt { int reg; uint32_t val; };
+static MfCtrlTraceEnt g_ctrl_trace[MF_TRACE_MAX];
+static uint32_t       g_ctrl_trace_n = 0;
+
+static inline void mf_trace_add(int reg, uint32_t v) {
+    if (g_ctrl_trace_n < MF_TRACE_MAX) {
+        g_ctrl_trace[g_ctrl_trace_n].reg = reg;
+        g_ctrl_trace[g_ctrl_trace_n].val = v;
+        g_ctrl_trace_n++;
+    }
+}
+
 #ifdef MISTER_NATIVE_VIDEO
 // ── Device fabric transport (FO Task 4; in-place DDR model, mirrors fabric_probe.c)
 // On device the emitter binds DIRECTLY to the mmap'd DDR command region: blt_upload/
@@ -499,9 +534,8 @@ enum {
     MF_DEV_TLBUF_OFF = 0x00F40000u,   // bounds the usable SRC heap (~14.8 MiB)
     MF_DEV_RING_CAP  = MF_DEV_SRC_OFF   - MF_DEV_RING_OFF,
     MF_DEV_SRC_CAP   = MF_DEV_TLBUF_OFF - MF_DEV_SRC_OFF,
-    MF_C_SUBMIT = 0, MF_C_CMDCOUNT = 1, MF_C_TARGET = 2, MF_C_CLEAR = 3,
-    MF_C_FLAGS = 4, MF_C_DONE = 5, MF_C_STATUS = 6, MF_C_SRCSEL = 7,
     MF_DEV_DONE_TIMEOUT_MS = 200,
+    // MF_C_* register indices moved above the guard: publish's body compiles in both builds.
 };
 static volatile uint8_t *g_dev_base = nullptr;   // mmap of 0x3B000000
 static volatile uint8_t *g_dev_ctrl = nullptr;   // = base (control block)
@@ -509,9 +543,6 @@ static uint8_t          *g_dev_ring = nullptr;   // = base + RING_OFF
 static uint8_t          *g_dev_src  = nullptr;   // = base + SRC_OFF
 static bool              g_dev_ok   = false;     // mmap ok -> submits reach the fabric
 
-static inline void mf_ctrl_wr(int qw, uint32_t v) {
-    *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u) = v;   // low u32 of each 8B qword
-}
 static inline uint32_t mf_ctrl_rd(int qw) {
     return *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u);
 }
@@ -626,6 +657,25 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
 }
 #endif // MISTER_NATIVE_VIDEO — device transport internals end here
 
+// [Phase 1 B2] Control-word write: traced in BOTH builds, stored only on device. Device
+// behaviour is unchanged — same store, same order; the trace is a few array writes per
+// frame alongside five uncached MMIO round trips.
+static inline void mf_ctrl_wr(int qw, uint32_t v) {
+    mf_trace_add(qw, v);
+#ifdef MISTER_NATIVE_VIDEO
+    *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u) = v;   // low u32 of each 8B qword
+#endif
+}
+
+// [Phase 1 B2] The publish barrier AND its trace marker, deliberately one call. If these
+// were two statements a mutation could move __sync_synchronize() while leaving the marker
+// behind, and the trace would still claim a barrier that is no longer there. Moving this
+// moves both, so the test sees the real ordering.
+static inline void mf_ctrl_barrier(void) {
+    mf_trace_add(MF_TRACE_BARRIER, 0);
+    __sync_synchronize();
+}
+
 // ── SUBMIT SEAM (Phase 1 B2) ─────────────────────────────────────────────────
 // The frame's handoff to the fabric, in three parts: mf_device_publish (control-block
 // mirror, barrier, doorbell), mf_device_await (poll C_DONE), and mf_device_submit, which
@@ -663,29 +713,38 @@ static struct timespec g_publish_t0;
 // On device the inversion is not cosmetic: await would poll C_DONE for a sequence that was
 // never submitted, and mf_submit_stat would measure from a stale g_publish_t0.
 //
-// Lifetime: publish SETS it; a successful ack CLEARS it; a timeout deliberately does NOT.
-// A timed-out batch is still live (that is the whole premise of the in-flight guard at
-// :707), so when Task 4 re-awaits it from the next mf_frame_begin that await is properly
-// paired. Clearing on timeout would make the invariant fire on the device's most common
-// failure path and invite someone to weaken it.
-static bool     g_publish_outstanding = false;
-static uint32_t g_unpaired_awaits     = 0;   // awaits with no batch outstanding: must stay 0
+// Lifetime: publish INCREMENTS it; a successful ack DECREMENTS it; a timeout deliberately
+// does NOT. A timed-out batch is still live (that is the whole premise of the in-flight
+// guard at :707), so when Task 4 re-awaits it from the next mf_frame_begin that await is
+// properly paired. Decrementing on timeout would make the invariant fire on the device's
+// most common failure path and invite someone to weaken it.
+//
+// A DEPTH rather than a bool, because a bool is idempotent: publish(); publish(); await()
+// leaves a bool looking perfectly paired even though the doorbell was rung twice for one
+// frame. Depth must never exceed 1, and must return to 0.
+static int32_t  g_publish_depth        = 0;
+static uint32_t g_unpaired_awaits      = 0;   // awaits with nothing in flight: must stay 0
+static uint32_t g_seam_depth_violations = 0;  // publish while one was already in flight
 
 // [Phase 1 B2] Publish the emitter's control-block mirror and ring the doorbell.
 // Does NOT poll. Split out of the old mf_device_submit so the caller can run
 // Process() for the next frame between the doorbell and the wait.
 static void mf_device_publish(void) {
-#ifdef MISTER_NATIVE_VIDEO
+    // Body is NOT #ifdef'd: mf_ctrl_wr traces in both builds and stores only on device, so
+    // the write order below is checkable on the host oracle. See the trace shim above.
+    g_ctrl_trace_n = 0;                         // each publish's trace stands alone
     mf_ctrl_wr(MF_C_CMDCOUNT, (uint32_t)g_e.cmd_count);
     mf_ctrl_wr(MF_C_TARGET,   (uint32_t)g_e.target_buf);
     mf_ctrl_wr(MF_C_CLEAR,    (uint32_t)g_e.clear_color);
     mf_ctrl_wr(MF_C_FLAGS,    (uint32_t)g_e.flags);
-    __sync_synchronize();                       // data before doorbell
+    mf_ctrl_barrier();                          // data before doorbell (traced)
     mf_ctrl_wr(MF_C_SUBMIT, g_e.submit_seq);    // doorbell LAST
-#endif
     clock_gettime(CLOCK_MONOTONIC, &g_publish_t0);
     g_publish_count++;
-    g_publish_outstanding = true;   // a batch is now in flight; the next await is paired
+    // Depth, not a bool: a bool is idempotent, so publish(); publish(); await() would look
+    // perfectly paired while the doorbell had been rung twice for one frame — on device a
+    // re-submit of a sequence that is still in flight. Depth must never exceed 1.
+    if (++g_publish_depth > 1) g_seam_depth_violations++;
 }
 
 // [Phase 1 B2] Block until the fabric acks the published sequence. This is the old
@@ -695,16 +754,16 @@ static void mf_device_publish(void) {
 static void mf_device_await(void) {
     g_await_count++;
     // [Phase 1 B2] Ordering witness: awaiting with nothing in flight means publish and
-    // await ran out of order, or a publish was lost. See g_publish_outstanding.
-    if (!g_publish_outstanding) g_unpaired_awaits++;
+    // await ran out of order, or a publish was lost. See g_publish_depth.
+    if (g_publish_depth <= 0) g_unpaired_awaits++;
 #ifdef MISTER_NATIVE_VIDEO
     struct timespec t0 = g_publish_t0;
-    if (mf_nowait_on()) { g_publish_outstanding = false; mf_submit_stat(&t0, 0, /*timeout=*/0); return; }  // probe: no poll
+    if (mf_nowait_on()) { if (g_publish_depth > 0) g_publish_depth--; mf_submit_stat(&t0, 0, /*timeout=*/0); return; }  // probe: no poll
     long iters = 0;
     const long poll_us = mf_poll_us();
     for (;;) {
         if (mf_ctrl_rd(MF_C_DONE) == g_e.submit_seq) {   // fabric consumed it
-            g_publish_outstanding = false;   // acked: nothing in flight any more
+            if (g_publish_depth > 0) g_publish_depth--;   // acked: no longer in flight
             mf_submit_stat(&t0, iters, /*timeout=*/0);
             return;
         }
@@ -731,15 +790,15 @@ static void mf_device_await(void) {
             // whole rather than rebuilding the ring underneath it.
             g_fabric_pending = true;
             g_pending_seq    = g_e.submit_seq;
-            // g_publish_outstanding stays SET on purpose: the batch is still in flight, so
-            // a later re-await of it (Task 4 awaits from mf_frame_begin) is properly paired.
+            // g_publish_depth is NOT decremented on purpose: the batch is still in flight,
+            // so a later re-await of it (Task 4 awaits from mf_frame_begin) stays paired.
             return;
         }
     }
 #endif // MISTER_NATIVE_VIDEO
     // Host oracle: blt_execute is synchronous, so the batch is always acked by the time
     // the caller gets here. (Unreachable on device — every branch above returns.)
-    g_publish_outstanding = false;
+    if (g_publish_depth > 0) g_publish_depth--;
 }
 
 // [Phase 1 B2] Unchanged behaviour for callers that still want the blocking form.
@@ -773,7 +832,8 @@ static void mf_init_once(void) {
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
     g_publish_count = 0; g_await_count = 0;   // [Phase 1 B2] submit-seam counters
-    g_publish_outstanding = false; g_unpaired_awaits = 0;   // [Phase 1 B2] ordering witness
+    g_publish_depth = 0; g_unpaired_awaits = 0; g_seam_depth_violations = 0;  // [Phase 1 B2] ordering witness
+    g_ctrl_trace_n = 0;                                                       // [Phase 1 B2] control-write trace
     g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
     g_last_draw.valid = false; g_dup_skipped = 0;
     g_appsurf_presented = false; g_crt_stripped = 0;
@@ -1755,9 +1815,19 @@ extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void) { return g_drop_coun
 // [Phase 1 B2] host-test hooks: prove publish and await are separable and each ran once.
 extern "C" uint32_t RasterBackend_MFGPU_TestPublishCount(void) { return g_publish_count; }
 extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void)   { return g_await_count; }
-// [Phase 1 B2] Ordering witness: awaits that ran with no batch in flight. Must always be 0
-// — counters alone cannot see publish/await order on the oracle (see g_publish_outstanding).
+// [Phase 1 B2] Ordering witness: awaits that ran with no batch in flight, and publishes
+// issued while one was already in flight. Both must always be 0 — counters alone cannot see
+// publish/await order on the oracle (see g_publish_depth).
 extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void) { return g_unpaired_awaits; }
+extern "C" uint32_t RasterBackend_MFGPU_TestSeamDepthViolations(void) { return g_seam_depth_violations; }
+// [Phase 1 B2] Control-word write trace for the LAST publish: reg index per entry
+// (MF_TRACE_BARRIER == -1 marks the memory barrier), so a test can pin that the doorbell is
+// written last and the barrier precedes it. Invisible to counters -- mf_ctrl_wr's store
+// compiles out on the oracle, so publish's body was otherwise untestable off-device.
+extern "C" uint32_t RasterBackend_MFGPU_TestTraceLen(void) { return g_ctrl_trace_n; }
+extern "C" int RasterBackend_MFGPU_TestTraceReg(uint32_t i) {
+    return (i < g_ctrl_trace_n) ? g_ctrl_trace[i].reg : -99;
+}
 // Blend mode the last TRILIST went out with, so a test can pin the opaque-ALPHA -> COPY
 // promotion (and, just as importantly, that a NON-opaque draw is left alone).
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void) { return g_last_trilist_blend; }

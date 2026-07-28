@@ -61,6 +61,16 @@ extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void);
 // awaits that ran with no batch in flight — the only way to observe publish/await ORDER on
 // a host build, where both halves are near-no-ops and counters look identical either way.
 extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestSeamDepthViolations(void);
+// Control-word write trace for the last publish (see raster_backend_mfgpu.cpp's trace shim).
+extern "C" uint32_t RasterBackend_MFGPU_TestTraceLen(void);
+extern "C" int      RasterBackend_MFGPU_TestTraceReg(uint32_t i);
+
+// BLTCTRL qword indices, mirroring the MF_C_* enum in raster_backend_mfgpu.cpp. These are
+// the wire contract (3rdparty/mfgpu/docs/blitter-protocol.md §2), not build-dependent
+// addresses. MF_TRACE_BARRIER is the sentinel the shim records where the memory barrier sits.
+enum { TC_SUBMIT = 0, TC_CMDCOUNT = 1, TC_TARGET = 2, TC_CLEAR = 3, TC_FLAGS = 4,
+       TC_BARRIER = -1 };
 // blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void);
@@ -1531,6 +1541,17 @@ static int case_submit_publish_await_split(void) {
 
     mf_test_drive_one_frame();   // emits a trivial frame and closes it
 
+    // Checked BEFORE the raw counts: "a batch was published while another was still in
+    // flight" is a strictly more specific diagnosis than "expected 1 publish, got 2", and
+    // both fire on the same fault. Depth is what makes the pairing witness non-idempotent —
+    // a bool would read as perfectly paired through publish(); publish(); await().
+    if (RasterBackend_MFGPU_TestSeamDepthViolations() != 0) {
+        printf("  FAIL submit-split: %u publish(es) issued with a batch already in flight "
+               "(doorbell re-rung for one frame)\n",
+               RasterBackend_MFGPU_TestSeamDepthViolations());
+        return 0;
+    }
+
     const uint32_t pub1 = RasterBackend_MFGPU_TestPublishCount();
     const uint32_t awa1 = RasterBackend_MFGPU_TestAwaitCount();
     if (pub1 != 1) {
@@ -1581,8 +1602,56 @@ static int case_submit_publish_await_split(void) {
         return 0;
     }
 
+    // WRITE ORDER INSIDE publish, which neither the counters nor the pairing witness can
+    // see: mf_ctrl_wr's store compiles out on the oracle, so publish's body was invisible.
+    // The contract the fabric actually depends on is that it latches every control word in
+    // its prologue the instant it sees a new C_SUBMIT -- so the doorbell must be written
+    // LAST and the barrier must sit immediately before it, or it latches values the host
+    // had not finished writing. Asserted as the contract rather than as a literal sequence,
+    // so Task 2's C_SRCSEL write (specified before the barrier) does not have to fight it.
+    {
+        const uint32_t n = RasterBackend_MFGPU_TestTraceLen();
+        if (n < 6) {
+            printf("  FAIL submit-split: publish traced %u control writes, expected >= 6 "
+                   "(4 control words + barrier + doorbell)\n", n);
+            return 0;
+        }
+        if (RasterBackend_MFGPU_TestTraceReg(n - 1) != TC_SUBMIT) {
+            printf("  FAIL submit-split: doorbell is not the LAST control write "
+                   "(last entry is reg %d)\n", RasterBackend_MFGPU_TestTraceReg(n - 1));
+            return 0;
+        }
+        if (RasterBackend_MFGPU_TestTraceReg(n - 2) != TC_BARRIER) {
+            printf("  FAIL submit-split: no memory barrier immediately before the doorbell "
+                   "(entry before it is reg %d)\n", RasterBackend_MFGPU_TestTraceReg(n - 2));
+            return 0;
+        }
+        // Every control word present exactly once, and all of them before the barrier.
+        const int need[4] = { TC_CMDCOUNT, TC_TARGET, TC_CLEAR, TC_FLAGS };
+        static const char *nm[4] = { "C_CMDCOUNT", "C_TARGET", "C_CLEAR", "C_FLAGS" };
+        for (int k = 0; k < 4; k++) {
+            int seen = 0;
+            for (uint32_t i = 0; i + 2 < n; i++)             // [0, barrier)
+                if (RasterBackend_MFGPU_TestTraceReg(i) == need[k]) seen++;
+            if (seen != 1) {
+                printf("  FAIL submit-split: %s written %d times before the barrier, "
+                       "expected exactly 1\n", nm[k], seen);
+                return 0;
+            }
+        }
+        // ...and the doorbell exactly once overall.
+        int subs = 0;
+        for (uint32_t i = 0; i < n; i++)
+            if (RasterBackend_MFGPU_TestTraceReg(i) == TC_SUBMIT) subs++;
+        if (subs != 1) {
+            printf("  FAIL submit-split: doorbell written %d times in one publish, "
+                   "expected exactly 1\n", subs);
+            return 0;
+        }
+    }
+
     printf("  OK   submit-split  publish=%u await=%u; dropped frame drove neither; "
-           "0 unpaired awaits\n", pub1, awa1);
+           "0 unpaired awaits; doorbell last after barrier\n", pub1, awa1);
     return 1;
 }
 
