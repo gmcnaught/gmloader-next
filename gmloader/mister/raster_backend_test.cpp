@@ -89,6 +89,13 @@ extern "C" uint32_t RasterBackend_MFGPU_TestCacheFullDrops(void);
 extern "C" int      RasterBackend_MFGPU_TestFrameOvfCause(void);
 // Mirrors MfOvfCause in raster_backend_mfgpu.cpp. Three overflow paths, three remedies.
 enum { OVF_UNKNOWN = 0, OVF_CACHE_FULL = 1, OVF_HEAP_FULL = 2 };
+// [Phase 1 A4] The covered-pixel derivation: pure arithmetic over values that come from the
+// fabric. Reading C_FLAGS.hi needs hardware; this does not, and is testable anywhere.
+extern "C" void RasterBackend_MFGPU_TestDeriveCov(double dpath_ms, double cov_exact,
+                                                  double cov_est, double screen_px,
+                                                  double clk_mhz, double *cov_den,
+                                                  double *cyc_px, double *overdraw,
+                                                  double *est_ratio, int *estimated);
 extern "C" uint32_t RasterBackend_MFGPU_TestTexCacheSlots(void);
 // blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
@@ -1701,6 +1708,70 @@ static int case_submit_publish_await_split(void) {
     return 1;
 }
 
+// [Phase 1 A4] The covered-pixel derivation is pure arithmetic over fabric-sourced values.
+// Whether C_FLAGS.hi means what we think is untestable off-device -- but the arithmetic over
+// it is a total function, and fusing the two is what let a provenance bug survive into the
+// very change meant to make provenance explicit: the "estimated" marker covered cyc_px but
+// not overdraw, though BOTH derive from the same denominator.
+static int case_cov_derivation(void) {
+    const double SCREEN = 288.0 * 216.0, MHZ = 98.4375, DPATH = 10.0;
+    double den, cyc, ovd, ratio; int est;
+
+    // Exact path: the fabric reported a real count, so everything derives from it.
+    RasterBackend_MFGPU_TestDeriveCov(DPATH, /*exact=*/100000.0, /*est=*/120000.0,
+                                      SCREEN, MHZ, &den, &cyc, &ovd, &ratio, &est);
+    if (est != 0 || den != 100000.0) {
+        printf("  FAIL cov-derive: exact count ignored (estimated=%d den=%.0f)\n", est, den);
+        return 0;
+    }
+    if (ovd != den / SCREEN) {
+        printf("  FAIL cov-derive: overdraw not derived from the same denominator as cyc_px "
+               "(%.4f vs %.4f)\n", ovd, den / SCREEN);
+        return 0;
+    }
+    if (ratio < 1.19 || ratio > 1.21) {
+        printf("  FAIL cov-derive: est_ratio %.3f, expected ~1.20\n", ratio);
+        return 0;
+    }
+
+    // Fallback path: fabric reports 0 (a bitstream without A4 -- the OPERATIVE path today).
+    RasterBackend_MFGPU_TestDeriveCov(DPATH, /*exact=*/0.0, /*est=*/120000.0,
+                                      SCREEN, MHZ, &den, &cyc, &ovd, &ratio, &est);
+    if (est != 1 || den != 120000.0) {
+        printf("  FAIL cov-derive: fallback did not engage (estimated=%d den=%.0f)\n", est, den);
+        return 0;
+    }
+    // THE bug this case exists for: overdraw and cyc_px must BOTH follow the fallback, so a
+    // single provenance marker covers both. If overdraw were computed from the exact value
+    // it would silently mean something different from the label on the line.
+    if (ovd != 120000.0 / SCREEN) {
+        printf("  FAIL cov-derive: overdraw did not follow the fallback (%.4f, expected "
+               "%.4f) -- the line's provenance marker would be wrong for this field\n",
+               ovd, 120000.0 / SCREEN);
+        return 0;
+    }
+    if (cyc <= 0.0) {
+        printf("  FAIL cov-derive: fallback produced cyc_px=%.2f; a zero here reads as "
+               "'pixels are free'\n", cyc);
+        return 0;
+    }
+    if (ratio >= 0.0) {
+        printf("  FAIL cov-derive: est_ratio=%.2f on the fallback; must signal n/a rather "
+               "than put an out-of-domain value in a field whose invariant is >= 1.0\n", ratio);
+        return 0;
+    }
+
+    // Degenerate: no covered pixels at all must not divide by zero.
+    RasterBackend_MFGPU_TestDeriveCov(DPATH, 0.0, 0.0, SCREEN, MHZ, &den, &cyc, &ovd, &ratio, &est);
+    if (cyc != 0.0 || ovd != 0.0) {
+        printf("  FAIL cov-derive: empty frame produced cyc_px=%.2f overdraw=%.4f\n", cyc, ovd);
+        return 0;
+    }
+    printf("  OK   cov-derive  exact/fallback/degenerate all consistent; overdraw and cyc_px "
+           "share one provenance\n");
+    return 1;
+}
+
 // [Phase 1 B2] The await must move to the top of the NEXT frame, so Process() for
 // frame N+1 runs between the doorbell for N and the wait for N. The barrier is the
 // first control-word write of N+1, not the end of N's present(): C_CMDCOUNT/C_TARGET/
@@ -2356,6 +2427,8 @@ int main(void){
     else printf("raster_backend mfgpu-inflight-drop-limit OK\n");
     if (!case_submit_publish_await_split()) { printf("FAIL mfgpu-submit-split\n"); ok = 0; }
     else printf("raster_backend mfgpu-submit-split OK\n");
+    if (!case_cov_derivation()) { printf("FAIL mfgpu-cov-derive\n"); ok = 0; }
+    else printf("raster_backend mfgpu-cov-derive OK\n");
     if (!case_await_deferred_one_frame()) { printf("FAIL mfgpu-await-deferred\n"); ok = 0; }
     else printf("raster_backend mfgpu-await-deferred OK\n");
     if (!case_arena_alternates()) { printf("FAIL mfgpu-arena-alt\n"); ok = 0; }

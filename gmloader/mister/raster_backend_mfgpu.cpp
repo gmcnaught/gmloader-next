@@ -533,6 +533,39 @@ static int mf_stat_on(void) {
 
 static double g_cov_px_accum = 0.0;
 
+// [Phase 1 A4] The derived covered-pixel figures, as a PURE function of its inputs.
+//
+// Deliberately outside #ifdef MISTER_NATIVE_VIDEO and free of globals. Reading C_FLAGS.hi
+// needs a fabric and cannot be tested off-device -- but the arithmetic OVER that value is a
+// total function with definite correct behaviour, and is testable anywhere. Keeping the two
+// fused is what let a provenance bug (the "estimated" marker covering cyc_px but not
+// overdraw, though both derive from the same denominator) survive into a change whose entire
+// purpose was making provenance explicit.
+struct MfCovDerived {
+    double cov_den;     // the denominator actually used
+    double cyc_px;      // dpath_ms * clk_MHz * 1000 / cov_den
+    double overdraw;    // cov_den / screen_px
+    double est_ratio;   // cov_est / cov_exact; < 0 means "not computable"
+    int    estimated;   // 1 = fell back to the estimate; cov_den is NOT the fabric's count
+};
+static MfCovDerived mf_derive_cov(double dpath_ms, double cov_exact, double cov_est,
+                                  double screen_px, double clk_mhz) {
+    MfCovDerived d;
+    // Fall back when the fabric reports nothing -- an older bitstream without A4, where
+    // C_FLAGS.hi reads 0. Without this, cyc_px divides by zero and prints 0.0, which reads
+    // as "pixels are free": the most misleading possible output for a perf task.
+    d.estimated = (cov_exact > 1.0) ? 0 : 1;
+    d.cov_den   = d.estimated ? cov_est : cov_exact;
+    d.cyc_px    = (d.cov_den > 1.0) ? (dpath_ms * clk_mhz * 1000.0) / d.cov_den : 0.0;
+    d.overdraw  = (screen_px > 0.0) ? d.cov_den / screen_px : 0.0;
+    // Only meaningful against a real exact count. Reporting 0.00 would put an out-of-domain
+    // value in a field whose invariant is >= 1.0 (the estimate is blind to per-pixel
+    // rejection, so it must over-count, never under-count).
+    d.est_ratio = d.estimated ? -1.0 : cov_est / cov_exact;
+    return d;
+}
+
+
 static void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2, float y2) {
     g_cov_px_accum += mf_clip_tri_area(x0, y0, x1, y1, x2, y2);
 }
@@ -751,23 +784,25 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     csum += g_cov_px_accum; g_cov_px_accum = 0.0;   // per-frame: reset after folding in
     if (n % 30 == 0) {
         double f=fsum/30.0, t=tsum/30.0, x=xsum/30.0, c=csum/30.0, e=esum/30.0;
-        // cyc_px uses the fabric clock: dpath_ms * clk_MHz * 1000 / covered_px. The
-        // denominator is now the fabric's EXACT count; if the fabric reports nothing (an
-        // older bitstream, where C_FLAGS.hi reads 0) fall back to the estimate rather than
-        // printing a divide-by-zero 0.0 that would read as "free pixels".
         double dpath_ms = t - x;
-        double cov_den = (e > 1.0) ? e : c;
-        double cyc_px = (cov_den > 1.0) ? (dpath_ms * MF_CLK_SYS_MHZ * 1000.0) / cov_den : 0.0;
         // Screen area comes from the fabric geometry macros, never a literal:
         // MISTER_WIDTH/HEIGHT arrive as -D flags, so a hardcoded 288x216 here
         // would silently survive a geometry change and report a wrong overdraw.
         const double screen_px = (double)BLT_FB_WIDTH * (double)BLT_FB_HEIGHT;
+        MfCovDerived d = mf_derive_cov(dpath_ms, e, c, screen_px, MF_CLK_SYS_MHZ);
+        // cov_src labels the provenance of the WHOLE derived group -- overdraw and cyc_px
+        // both come from d.cov_den, so a marker attached to only one of them would leave the
+        // other silently reinterpreted. est_ratio prints n/a rather than 0.00 so the field
+        // never carries a value outside its own invariant's domain (>= 1.0).
+        char ratio_buf[16];
+        if (d.est_ratio < 0.0) snprintf(ratio_buf, sizeof ratio_buf, "n/a");
+        else                   snprintf(ratio_buf, sizeof ratio_buf, "%.2f", d.est_ratio);
         fprintf(stderr, "MFSUBMIT n=%u wait_ms[avg=%.2f] fabric_ms[frame=%.2f tri=%.2f "
                 "texwait=%.2f dpath=%.2f ovhd=%.2f] cov_px=%.0f cov_px_est=%.0f "
-                "est_ratio=%.2f overdraw=%.2f cyc_px=%.1f%s spin_avg=%ld to=%u\n",
+                "est_ratio=%s overdraw=%.2f cyc_px=%.1f cov_src=%s spin_avg=%ld to=%u\n",
                 n, (sum/30.0)/1e3, f, t, x, dpath_ms, f-t,
-                e, c, (e > 1.0) ? c / e : 0.0, cov_den / screen_px, cyc_px,
-                (e > 1.0) ? "" : "(est)", it_sum/30, to);
+                e, c, ratio_buf, d.overdraw, d.cyc_px,
+                d.estimated ? "est" : "exact", it_sum/30, to);
         sum = 0; it_sum = 0; to = 0;
         fsum = 0; tsum = 0; xsum = 0; csum = 0; esum = 0;
     }
@@ -2087,6 +2122,18 @@ extern "C" uint32_t  RasterBackend_MFGPU_TestCacheFullDrops(void) { return g_cac
 // SELECTS the overflow message is itself asserted -- a cause that is never recorded would
 // silently restore the ambiguity it exists to remove, and nothing would fail.
 extern "C" int       RasterBackend_MFGPU_TestFrameOvfCause(void) { return (int)g_frame_ovf_cause; }
+// [Phase 1 A4] The covered-pixel derivation, exposed for host testing. Reading C_FLAGS.hi
+// needs a fabric; the arithmetic over it does not, and is where the provenance bug lived.
+extern "C" void RasterBackend_MFGPU_TestDeriveCov(double dpath_ms, double cov_exact,
+                                                  double cov_est, double screen_px,
+                                                  double clk_mhz, double *cov_den,
+                                                  double *cyc_px, double *overdraw,
+                                                  double *est_ratio, int *estimated) {
+    MfCovDerived d = mf_derive_cov(dpath_ms, cov_exact, cov_est, screen_px, clk_mhz);
+    if (cov_den) *cov_den = d.cov_den;   if (cyc_px)   *cyc_px   = d.cyc_px;
+    if (overdraw) *overdraw = d.overdraw; if (est_ratio) *est_ratio = d.est_ratio;
+    if (estimated) *estimated = d.estimated;
+}
 extern "C" uint32_t  RasterBackend_MFGPU_TestTexCacheSlots(void)  { return MF_TEX_CACHE_N; }
 extern "C" uintptr_t RasterBackend_MFGPU_TestRingBase(void) { return (uintptr_t)g_e.ring; }
 extern "C" uintptr_t RasterBackend_MFGPU_TestVtxBase(void)  { return (uintptr_t)g_e.vtx_buf; }
