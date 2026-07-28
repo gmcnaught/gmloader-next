@@ -217,6 +217,20 @@ raster-backend-test:
 # so it needs blitter.cpp itself, its GL type header (glad.h -- see the
 # vendored thunks/khronos/KHR/khrplatform.h it needs), and configuration.cpp
 # (gmloader_config, extern'd by blitter.cpp).
+.PHONY: mf-cov-clip-test
+# TDD host test for the covered-pixel estimator's triangle-vs-render-target
+# clipping (mf_clip_tri_area in raster_backend_mfgpu.cpp). Same link set as
+# raster-backend-test (the function lives in that translation unit and needs
+# its full dependency chain), swapping in mf_cov_clip_test.cpp as the driver.
+mf-cov-clip-test:
+	c++ -std=c++17 -Igmloader/mister $(MFGPU_INC) \
+	  gmloader/mister/mf_cov_clip_test.cpp \
+	  gmloader/mister/raster_backend_sw.cpp \
+	  gmloader/mister/raster_backend_mfgpu.cpp \
+	  gmloader/mister/blitter_raster.cpp \
+	  $(MFGPU_SRC) \
+	  -lm -o /tmp/mcct && /tmp/mcct
+
 .PHONY: blitter-appsurf-test
 blitter-appsurf-test:
 	c++ -std=c++17 -DMISTER_NATIVE_VIDEO=1 -Igmloader/mister -Igmloader -I. \

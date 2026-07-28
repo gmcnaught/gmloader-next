@@ -334,6 +334,146 @@ static inline uint16_t mf_texel565(const RTexture *t, int x, int y, bool *out_ha
     return result;
 }
 
+// ── Coverage estimator: rect-clip a triangle, return its clipped area ───────
+// Pure function: six vertex floats in, clipped area out via Sutherland-Hodgman
+// against [0,BLT_FB_WIDTH] x [0,BLT_FB_HEIGHT] — no global/device state. Lives
+// HERE, ahead of the MISTER_NATIVE_VIDEO block below, so it compiles and links
+// in the plain host build too (raster-backend-test does not define
+// MISTER_NATIVE_VIDEO); exposed to the host unit test as
+// RasterBackend_MFGPU_TestClipTriArea() near the bottom of this file (grep
+// "Host validation only") and exercised by gmloader/mister/mf_cov_clip_test.cpp.
+//
+// A triangle clipped against a convex rectangle is a convex polygon of at most
+// 3+4=7 vertices (each of the 4 half-plane clips below can add at most one
+// vertex to the running polygon). Its area is the standard shoelace sum.
+//
+// Winding-independent: every clip test compares a single coordinate against a
+// constant plane, so a CW vs CCW input triangle still lands on the same side
+// of each plane and produces the same clipped polygon (up to point order);
+// the shoelace sum's absolute value is itself winding-independent.
+static double mf_clip_tri_area(float x0, float y0, float x1, float y1,
+                                float x2, float y2) {
+    struct Pt { double x, y; };
+    Pt poly[7] = { { (double)x0, (double)y0 },
+                    { (double)x1, (double)y1 },
+                    { (double)x2, (double)y2 } };
+    int n = 3;
+
+    // Clip the running polygon against one half-plane (`inside`), inserting
+    // the exact edge/plane intersection (`isect`) wherever consecutive
+    // vertices straddle it. Standard Sutherland-Hodgman inner loop; `plane`
+    // carries the clip constant (0.0 or BLT_FB_WIDTH/HEIGHT) into both
+    // callbacks so one lambda pair serves both the low and high edge of an
+    // axis.
+    auto clip = [&](bool (*inside)(const Pt &, double), double plane,
+                    Pt (*isect)(const Pt &, const Pt &, double)) {
+        Pt out[7];
+        int m = 0;
+        for (int i = 0; i < n; i++) {
+            const Pt &cur  = poly[i];
+            const Pt &prev = poly[(i + n - 1) % n];
+            bool cur_in  = inside(cur, plane);
+            bool prev_in = inside(prev, plane);
+            if (cur_in) {
+                if (!prev_in) out[m++] = isect(prev, cur, plane);
+                out[m++] = cur;
+            } else if (prev_in) {
+                out[m++] = isect(prev, cur, plane);
+            }
+        }
+        n = m;
+        for (int i = 0; i < n; i++) poly[i] = out[i];
+    };
+
+    clip([](const Pt &p, double lo) { return p.x >= lo; }, 0.0,
+         [](const Pt &a, const Pt &b, double lo) {
+             double t = (lo - a.x) / (b.x - a.x);
+             return Pt{ lo, a.y + t * (b.y - a.y) };
+         });
+    if (n == 0) return 0.0;
+    clip([](const Pt &p, double hi) { return p.x <= hi; }, (double)BLT_FB_WIDTH,
+         [](const Pt &a, const Pt &b, double hi) {
+             double t = (hi - a.x) / (b.x - a.x);
+             return Pt{ hi, a.y + t * (b.y - a.y) };
+         });
+    if (n == 0) return 0.0;
+    clip([](const Pt &p, double lo) { return p.y >= lo; }, 0.0,
+         [](const Pt &a, const Pt &b, double lo) {
+             double t = (lo - a.y) / (b.y - a.y);
+             return Pt{ a.x + t * (b.x - a.x), lo };
+         });
+    if (n == 0) return 0.0;
+    clip([](const Pt &p, double hi) { return p.y <= hi; }, (double)BLT_FB_HEIGHT,
+         [](const Pt &a, const Pt &b, double hi) {
+             double t = (hi - a.y) / (b.y - a.y);
+             return Pt{ a.x + t * (b.x - a.x), hi };
+         });
+    if (n < 3) return 0.0;   // clipped away entirely, or collapsed to a point/edge
+
+    double area2 = 0.0;
+    for (int i = 0; i < n; i++) {
+        const Pt &p = poly[i];
+        const Pt &q = poly[(i + 1) % n];
+        area2 += p.x * q.y - q.x * p.y;
+    }
+    return (area2 < 0.0 ? -area2 : area2) * 0.5;
+}
+
+// Host-side covered-pixel estimate. No fabric counter publishes covered_px, and
+// the ~3.1x overdraw figure on record was back-calculated by dividing device
+// dpath by the sim's 13 cyc/px — which assumes the very throughput the number is
+// then used to characterize. This breaks that circularity.
+//
+// Sum of each triangle's RECT-CLIPPED area (mf_clip_tri_area above) into a
+// running accumulator = covered area INCLUDING cross-triangle overdraw. A
+// triangle mostly or fully off the render target now contributes only its
+// true on-screen slice, not its full geometric area — the previous version
+// summed unclipped |cross|/2 and merely clamped a SINGLE triangle's
+// contribution to one screen's worth of pixels, which does not bound a
+// scene's total (many partly-offscreen triangles each still counted their
+// full area) and was measured to inflate cov_px_est by a SCENE-DEPENDENT
+// factor: 2.9x between a static title screen and a scrolling gameplay scene
+// whose parallax layers extend past both edges (8.67 vs 3.01 cyc/px on
+// device, when the true ratio should be ~constant — see the ledger). It
+// remains an ESTIMATE even after clipping: it still does not model per-pixel
+// depth/blend rejection, overdraw REJECTED by blend state within a draw
+// (every clipped triangle still counts fully, whether or not its pixels
+// survive blending), or sub-pixel/edge rasterization rules. Degenerate
+// (zero-area or collapsed) triangles count as zero, never NaN.
+//
+// Called from mf_emit_group ONLY, after a triangle group has actually been
+// pushed into the fabric command ring (blt_push_tris + a successful
+// blt_trilist) — review found the original call site (blitter.cpp, the
+// generic backend-dispatch point) counted triangles the active backend went
+// on to silently discard (in-flight-batch drop, self-referential appsurf
+// guard, the CRT-ghost strip — on by default and ~124,000px/frame in
+// gameplay, duplicate-draw elision), inflating cov_px_est by ~6.6x on
+// device. Reported as cov_px_est, never as exact. Gated by mf_stat_on() at
+// the call site so this costs nothing when GMLOADER_MFSUBMIT_STAT is unset;
+// backend_sw never calls this at all, so the SW backend reports zero
+// coverage (expected for this phase — we're measuring the fabric).
+//
+// Declared out here (not inside the MISTER_NATIVE_VIDEO block) purely so the
+// call site in mf_emit_group — which is unconditional — type-checks in a
+// host build too.
+//
+// mf_stat_on() itself lives here for the same reason (mf_emit_group's guard
+// on it is unconditional too); the perf-counter instrumentation this gates on
+// device (C_DONE busy-wait characterization, min≈max over a 30-submit window)
+// is documented at its device-only call site in mf_submit_stat below. Enable
+// with GMLOADER_MFSUBMIT_STAT=1. Zero cost when unset.
+static int mf_stat_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_MFSUBMIT_STAT"); v = (e && *e) ? 1 : 0; }
+    return v;
+}
+
+static double g_cov_px_accum = 0.0;
+
+static void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2, float y2) {
+    g_cov_px_accum += mf_clip_tri_area(x0, y0, x1, y1, x2, y2);
+}
+
 #ifdef MISTER_NATIVE_VIDEO
 // ── Device fabric transport (FO Task 4; in-place DDR model, mirrors fabric_probe.c)
 // On device the emitter binds DIRECTLY to the mmap'd DDR command region: blt_upload/
@@ -392,16 +532,6 @@ static bool mf_ddr_map(void) {
     g_dev_ok = true;
     return true;
 }
-// Instrumentation (perf profiling of the "capture" bucket): characterize the
-// C_DONE busy-wait — how long we blocked, how many spin iterations that cost,
-// and whether it exited on match vs timeout. min≈max over a 30-submit window ⇒
-// the wait is quantized (vsync-locked fabric completion) rather than jittery.
-// Enable with GMLOADER_MFSUBMIT_STAT=1. Zero cost when unset.
-static int mf_stat_on(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("GMLOADER_MFSUBMIT_STAT"); v = (e && *e) ? 1 : 0; }
-    return v;
-}
 // Fire-and-forget probe (GMLOADER_MFSUBMIT_NOWAIT=1): ring the doorbell and
 // return WITHOUT polling C_DONE, to measure the throughput ceiling when the host
 // stops serially waiting out the fabric's ~3-vsync completion latency. Unsafe for
@@ -456,46 +586,6 @@ static long mf_timeout_ms(void) {
 // Reading them isolates fabric COMPUTE from the host-observed doorbell→done wait: if
 // compute << wait, the 3-vsync latency is notice/DDR-visibility, not the fabric.
 #define MF_CLK_SYS_MHZ 98.4375
-
-// Host-side covered-pixel estimate. No fabric counter publishes covered_px, and
-// the ~3.1x overdraw figure on record was back-calculated by dividing device
-// dpath by the sim's 13 cyc/px — which assumes the very throughput the number is
-// then used to characterize. This breaks that circularity.
-//
-// Sum of |cross product| / 2 over submitted triangles = covered area INCLUDING
-// overdraw. It is an ESTIMATE: it ignores scissor and clipping (Blitter_OnScissor
-// is a no-op and the per-draw cull tests one aggregate bbox for the whole batch —
-// see blitter.cpp), so a triangle that is mostly off the render target is still
-// summed at its full geometric area, not its clipped area. We do NOT implement
-// per-triangle clipping here; the per-triangle clamp below (to a full screen)
-// only bounds the worst case, it does not make the estimate exact. Degenerate
-// triangles count as zero.
-//
-// Called from mf_emit_group ONLY, after a triangle group has actually been
-// pushed into the fabric command ring (blt_push_tris + a successful
-// blt_trilist) — review found the original call site (blitter.cpp, the
-// generic backend-dispatch point) counted triangles the active backend went
-// on to silently discard (in-flight-batch drop, self-referential appsurf
-// guard, the CRT-ghost strip — on by default and ~124,000px/frame in
-// gameplay, duplicate-draw elision), inflating cov_px_est by ~6.6x on
-// device. Reported as cov_px_est, never as exact. Gated by mf_stat_on() at
-// the call site so this costs nothing when GMLOADER_MFSUBMIT_STAT is unset;
-// backend_sw never calls this at all, so the SW backend reports zero
-// coverage (expected for this phase — we're measuring the fabric).
-static double g_cov_px_accum = 0.0;
-
-static void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2, float y2) {
-    const double cross = (double)(x1 - x0) * (double)(y2 - y0)
-                       - (double)(x2 - x0) * (double)(y1 - y0);
-    double area = (cross < 0.0 ? -cross : cross) * 0.5;
-    // MINOR: clamp a single triangle's contribution to a full render-target's
-    // worth of pixels, so a wildly offscreen/degenerate-huge triangle can't
-    // blow up the estimate. BLT_FB_WIDTH/HEIGHT is the fabric's fixed target
-    // geometry (same denominator mf_submit_stat uses for `overdraw` below).
-    const double screen_px = (double)BLT_FB_WIDTH * (double)BLT_FB_HEIGHT;
-    if (area > screen_px) area = screen_px;
-    g_cov_px_accum += area;
-}
 
 static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     if (!mf_stat_on()) return;
@@ -1544,6 +1634,16 @@ extern "C" void RasterBackend_MFGPU_TestCopyFB565(int w, int h, uint16_t *out) {
     for (int y = 0; y < h; y++)
         memcpy(out + (size_t)y * w, g_fb565 + (size_t)y * BLT_FB_WIDTH,
                (size_t)w * sizeof(uint16_t));
+}
+
+// Host test hook (TDD; see gmloader/mister/mf_cov_clip_test.cpp): expose the
+// pure rect-clip area function directly, independent of mf_stat_on()/the
+// accumulator/any device state, so the coverage estimator's actual clipping
+// geometry can be unit-tested. See mf_clip_tri_area's definition (above
+// mf_texel565's #ifdef MISTER_NATIVE_VIDEO neighbor) for the algorithm.
+extern "C" double RasterBackend_MFGPU_TestClipTriArea(float x0, float y0, float x1, float y1,
+                                                       float x2, float y2) {
+    return mf_clip_tri_area(x0, y0, x1, y1, x2, y2);
 }
 
 // Host/Task-6 hook: tell the backend which surface pixels are the default fb, so
