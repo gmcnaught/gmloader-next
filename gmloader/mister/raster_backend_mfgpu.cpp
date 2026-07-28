@@ -270,13 +270,41 @@ static uint32_t   g_evict_attempts = 0;
 // bumped before the guard runs and the refusal then undoes the upload -- so a refused insert
 // still counts as an upload.
 static uint32_t   g_cachefull_drops = 0;
-// [Phase 1 B3] Did a cache-full refusal contribute to THIS frame's overflow? Both that
-// refusal and a genuine ring/vertex capacity overflow set g_e.overflow and print the same
-// "emitter overflow this frame - frame dropped", but they have OPPOSITE fixes: pinned-set
-// pressure means size the texture heap, capacity overflow means grow the ring or emit less.
-// The natural reach on the undisambiguated message is the ring, which is wrong for exactly
-// the case the two-frame retention floor made more reachable.
-static bool       g_frame_cachefull = false;
+// [Phase 1 B3] Why did THIS frame overflow? THREE paths reach mf_frame_end's overflow
+// branch, and they have three DIFFERENT remedies -- so a message naming the wrong one sends
+// the reader to the wrong lever, which is worse than saying nothing:
+//
+//   CACHE_FULL - the cache TABLE was full and every entry was pinned by the last two
+//                frames. Remedy: more slots (MF_TEX_CACHE_N), or fewer DISTINCT textures
+//                per frame. NOT heap bytes -- the heap can be nearly empty when this fires.
+//   HEAP_FULL  - texture BYTES exhausted even after eviction. Remedy: size the heap.
+//                This is the path the two-frame retention floor made more reachable, since
+//                protecting two frames strictly shrinks the eviction-eligible set.
+//   UNKNOWN    - neither refusal was recorded, so ring/vertex capacity is what remains.
+//                Phrased as what is left rather than asserted, because nothing observed it.
+//
+// FIRST cause wins: the refusal that started the frame's trouble is the informative one, and
+// a later different failure is usually its consequence.
+enum MfOvfCause { MF_OVF_UNKNOWN = 0, MF_OVF_CACHE_FULL = 1, MF_OVF_HEAP_FULL = 2 };
+static MfOvfCause g_frame_ovf_cause = MF_OVF_UNKNOWN;
+static inline void mf_note_ovf_cause(MfOvfCause c) {
+    if (g_frame_ovf_cause == MF_OVF_UNKNOWN) g_frame_ovf_cause = c;
+}
+// One definition, used by both the device and oracle overflow sites, so the two cannot drift.
+static const char *mf_ovf_cause_str(void) {
+    switch (g_frame_ovf_cause) {
+    case MF_OVF_CACHE_FULL:
+        return "(CACHE-FULL: every texture-cache slot was pinned by the last two frames -- "
+               "raise MF_TEX_CACHE_N or draw fewer distinct textures per frame; this is NOT "
+               "a heap-size problem)";
+    case MF_OVF_HEAP_FULL:
+        return "(HEAP-FULL: texture bytes exhausted even after eviction -- size the texture "
+               "heap, not the ring)";
+    default:
+        return "(no heap or cache-full refusal was recorded this frame; ring/vertex capacity "
+               "is the remaining cause)";
+    }
+}
 // [Phase 1 B3] The floor EVICTION compares against, which lags g_lru_frame_floor by one
 // frame. With the ring double-buffered the host builds frame N+1 while the fabric is still
 // reading N, so a texture touched in N is live even though N is "over". Evicting or
@@ -933,7 +961,7 @@ static void mf_init_once(void) {
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
     g_evict_attempts = 0; g_cachefull_drops = 0;   // [Phase 1 B3] pressure + refusal witnesses
-    g_frame_cachefull = false;                     // [Phase 1 B3] per-frame overflow cause
+    g_frame_ovf_cause = MF_OVF_UNKNOWN;            // [Phase 1 B3] per-frame overflow cause
     g_lru_evict_floor = 0;                         // [Phase 1 B3] lagging floor
     g_publish_count = 0; g_await_count = 0;   // [Phase 1 B2] submit-seam counters
     g_arena = 0;                                                              // [Phase 1 B1] arena parity
@@ -1023,7 +1051,7 @@ static void mf_frame_begin(void) {
     }
     g_drop_run = 0;
     g_frame_dropped = false;
-    g_frame_cachefull = false;   // [Phase 1 B3] per-frame: reset before anything can stage
+    g_frame_ovf_cause = MF_OVF_UNKNOWN;   // [Phase 1 B3] per-frame: reset before staging
     g_last_draw.valid = false;   // [duplicate-draw elimination] never span frames
     g_appsurf_presented = false; // [strip CRT] the present must re-land every frame
     // Snapshot the pin floor for this frame: any g_texcache entry touched
@@ -1268,7 +1296,7 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
     // DROPPED frame, never a wrong-pixel frame.
     if (g_texcache[slot].used && g_texcache[slot].lru > g_lru_evict_floor) {
         g_cachefull_drops++;   // [Phase 1 B3] refusal witness
-        g_frame_cachefull = true;   // ...and disambiguate this frame's overflow message
+        mf_note_ovf_cause(MF_OVF_CACHE_FULL);   // ...and name the cause in the log
         if (mf_heaplog_on())
             fprintf(stderr, "HEAPLOG CACHE-FULL %s key=%u: all %d slots frame-pinned "
                     "- dropping frame\n", what, key, MF_TEX_CACHE_N);
@@ -1754,6 +1782,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         bool has_key = false;
         blt_surface_ref_t tex = stage_texture(0u, t, &has_key);
         if (!tex.valid) {
+            mf_note_ovf_cause(MF_OVF_HEAP_FULL);
             fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
             return;
         }
@@ -1771,6 +1800,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         bool has_key = false;
         blt_surface_ref_t tex = stage_texture(tex_key, t, &has_key);
         if (!tex.valid) {
+            mf_note_ovf_cause(MF_OVF_HEAP_FULL);
             fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
             return;
         }
@@ -1811,7 +1841,8 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
             bool has_key = false;
             blt_surface_ref_t tex = stage_texture(tex_key, t, &has_key);
             if (!tex.valid) {
-                fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
+                mf_note_ovf_cause(MF_OVF_HEAP_FULL);
+            fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
                 return;
             }
             mf_emit_group(tex, tex.w, tex.h, gv, 2, bl, has_key, /*extra_flags=*/0);
@@ -1845,6 +1876,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
             // The failed upload left g_e.overflow set -> the whole frame drops at
             // frame_end (correct: a texture that can't fit -- heap or cache-table
             // -- must not render half a command list). No point emitting the rest.
+            mf_note_ovf_cause(MF_OVF_HEAP_FULL);
             fprintf(stderr, "backend_mfgpu: sub-region cannot fit heap after eviction - draw dropped\n");
             return;
         }
@@ -1914,12 +1946,8 @@ static void mf_frame_end(void) {
     // doorbell, and poll C_DONE — the fabric composites into on-chip BRAM and scans
     // itself out. No blt_execute, no g_fb565 on the hot path.
     if (g_e.overflow) {
-        fprintf(stderr, g_frame_cachefull
-                ? "backend_mfgpu: emitter overflow this frame - frame dropped "
-                  "(CACHE-FULL: every texture slot was pinned by the last two frames; "
-                  "this is texture-heap pressure -- size the heap, NOT the ring)\n"
-                : "backend_mfgpu: emitter overflow this frame - frame dropped "
-                  "(ring/vertex capacity exceeded)\n");
+        fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped %s\n",
+                mf_ovf_cause_str());
         return;
     }
     // [Phase 1 B2] Publish and return. The await moved to mf_frame_begin, so the engine's
@@ -1933,12 +1961,8 @@ static void mf_frame_end(void) {
     // Host oracle: software-execute the ring into g_fb565 (parity tests read it back).
     memset(g_fb565, 0, sizeof g_fb565);
     if (g_e.overflow) {
-        fprintf(stderr, g_frame_cachefull
-                ? "backend_mfgpu: emitter overflow this frame - frame dropped "
-                  "(CACHE-FULL: every texture slot was pinned by the last two frames; "
-                  "this is texture-heap pressure -- size the heap, NOT the ring)\n"
-                : "backend_mfgpu: emitter overflow this frame - frame dropped "
-                  "(ring/vertex capacity exceeded)\n");
+        fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped %s\n",
+                mf_ovf_cause_str());
         return;   // nothing safe to execute this frame
     }
     // [Phase 1 B2] Drive the same submit seam the device path uses, so the publish/await
@@ -2059,10 +2083,10 @@ extern "C" uint32_t  RasterBackend_MFGPU_TestEvictAttempts(void) { return g_evic
 // that fills a hardcoded 256 slots stops filling the table the moment MF_TEX_CACHE_N grows,
 // and goes quietly vacuous with nothing failing.
 extern "C" uint32_t  RasterBackend_MFGPU_TestCacheFullDrops(void) { return g_cachefull_drops; }
-// [Phase 1 B3] Did a cache-full refusal contribute to the frame just closed? Exposed so the
-// flag that selects the overflow message is itself asserted -- a flag that is never set
-// would silently restore the ambiguity it exists to remove, and nothing would fail.
-extern "C" int       RasterBackend_MFGPU_TestFrameCacheFull(void) { return g_frame_cachefull ? 1 : 0; }
+// [Phase 1 B3] Which cause was recorded for the frame just closed. Exposed so the value that
+// SELECTS the overflow message is itself asserted -- a cause that is never recorded would
+// silently restore the ambiguity it exists to remove, and nothing would fail.
+extern "C" int       RasterBackend_MFGPU_TestFrameOvfCause(void) { return (int)g_frame_ovf_cause; }
 extern "C" uint32_t  RasterBackend_MFGPU_TestTexCacheSlots(void)  { return MF_TEX_CACHE_N; }
 extern "C" uintptr_t RasterBackend_MFGPU_TestRingBase(void) { return (uintptr_t)g_e.ring; }
 extern "C" uintptr_t RasterBackend_MFGPU_TestVtxBase(void)  { return (uintptr_t)g_e.vtx_buf; }

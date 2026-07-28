@@ -86,7 +86,9 @@ extern "C" uint32_t RasterBackend_MFGPU_TestEvictAttempts(void);
 // [Phase 1 B3] full-table inserts the pin-aware guard refused, and the cache's slot count —
 // read from the backend rather than mirrored here, so the fill loop cannot drift from it.
 extern "C" uint32_t RasterBackend_MFGPU_TestCacheFullDrops(void);
-extern "C" int      RasterBackend_MFGPU_TestFrameCacheFull(void);
+extern "C" int      RasterBackend_MFGPU_TestFrameOvfCause(void);
+// Mirrors MfOvfCause in raster_backend_mfgpu.cpp. Three overflow paths, three remedies.
+enum { OVF_UNKNOWN = 0, OVF_CACHE_FULL = 1, OVF_HEAP_FULL = 2 };
 extern "C" uint32_t RasterBackend_MFGPU_TestTexCacheSlots(void);
 // blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
@@ -1887,6 +1889,11 @@ static int case_lru_protects_two_frames(void) {
     const uint32_t ev_after_1 = RasterBackend_MFGPU_TestEvictAttempts();
 
     mf_test_drive_frame_with_texture(/*key=*/2, /*tag=*/200);
+    // Frame 2 exhausted the heap (its only eviction candidate was pinned), which is a
+    // DIFFERENT overflow path from the cache-full refusal and carries the opposite remedy.
+    // Captured before frame 3 resets it. Path 3 is the one the two-frame floor made more
+    // reachable, so mislabelling it as a ring overflow is the most likely wrong turn.
+    const int ovf_cause_frame2 = RasterBackend_MFGPU_TestFrameOvfCause();
     mf_test_drive_frame_with_texture(/*key=*/1, /*tag=*/40);
 
     const uint32_t up_after_3 = RasterBackend_MFGPU_TestUploadCount();
@@ -1905,6 +1912,12 @@ static int case_lru_protects_two_frames(void) {
     if (up_after_3 != up_after_1) {
         printf("  FAIL lru-2frame: uploads %u -> %u; texture A was evicted while still live "
                "to the fabric\n", up_after_1, up_after_3);
+        return 0;
+    }
+    if (ovf_cause_frame2 != OVF_HEAP_FULL) {
+        printf("  FAIL lru-2frame: heap exhaustion recorded as cause %d, expected %d "
+               "(HEAP_FULL); the frame would be misreported and the wrong lever pulled\n",
+               ovf_cause_frame2, OVF_HEAP_FULL);
         return 0;
     }
     printf("  OK   lru-2frame  A survived an intervening frame under real heap pressure "
@@ -1958,17 +1971,6 @@ static int case_pin_insert_protects_two_frames(void) {
     const uint32_t up2    = RasterBackend_MFGPU_TestUploadCount();
     const uint32_t drops2 = RasterBackend_MFGPU_TestCacheFullDrops();
 
-    // The per-frame flag that selects the overflow message must actually track the refusal.
-    // It is diagnostic-only, so nothing else would notice it being stuck false — and a stuck
-    // flag silently restores the very ambiguity it was added to remove: cache-full pressure
-    // reported as a ring/vertex overflow, sending a reader to grow the ring when the fix is
-    // to size the heap.
-    if (!RasterBackend_MFGPU_TestFrameCacheFull()) {
-        printf("  FAIL pin-insert-2frame: cache-full refusal did not set the per-frame "
-               "overflow-cause flag; the frame would be misreported as a ring overflow\n");
-        return 0;
-    }
-
     // VACUITY GUARD 2 — the guard must actually have refused the insert. Note this cannot be
     // inferred from the upload count: g_upload_count is bumped BEFORE the pin-aware guard
     // runs and the refusal then undoes the upload, so a refused insert still counts as one
@@ -1976,6 +1978,22 @@ static int case_pin_insert_protects_two_frames(void) {
     if (drops2 == drops1) {
         printf("  FAIL pin-insert-2frame: the full-table insert was never refused "
                "(cache-full drops %u -> %u); the guard did not fire\n", drops1, drops2);
+        return 0;
+    }
+
+    // Ordered AFTER guard 2 deliberately: the recorded cause is DERIVED from the refusal,
+    // and the refusal is the fundamental fact. Checking it first would report a mechanism
+    // failure ("the cause was not recorded") as a diagnostic-plumbing problem and send the
+    // reader to the logging rather than to the guard. Most fundamental cause first, most
+    // derived symptom last.
+    //
+    // Diagnostic-only, and asserted anyway because a WRONG cause causes a WRONG ACTION:
+    // cache-full and heap-full have opposite remedies (more cache slots vs. more heap bytes)
+    // and this message is an input to the device A/B's drop attribution.
+    if (RasterBackend_MFGPU_TestFrameOvfCause() != OVF_CACHE_FULL) {
+        printf("  FAIL pin-insert-2frame: overflow cause recorded as %d, expected %d "
+               "(CACHE_FULL); the frame would be misreported and the wrong lever pulled\n",
+               RasterBackend_MFGPU_TestFrameOvfCause(), OVF_CACHE_FULL);
         return 0;
     }
 
