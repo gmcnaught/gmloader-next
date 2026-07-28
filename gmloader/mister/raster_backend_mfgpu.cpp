@@ -456,6 +456,23 @@ static long mf_timeout_ms(void) {
 // Reading them isolates fabric COMPUTE from the host-observed doorbell→done wait: if
 // compute << wait, the 3-vsync latency is notice/DDR-visibility, not the fabric.
 #define MF_CLK_SYS_MHZ 98.4375
+
+// Host-side covered-pixel estimate. No fabric counter publishes covered_px, and
+// the ~3.1x overdraw figure on record was back-calculated by dividing device
+// dpath by the sim's 13 cyc/px — which assumes the very throughput the number is
+// then used to characterize. This breaks that circularity.
+//
+// Sum of |cross product| / 2 over submitted triangles = covered area INCLUDING
+// overdraw. It is an ESTIMATE: it ignores scissor and clipping, and counts
+// degenerate triangles as zero. Reported as cov_px_est, never as exact.
+static double g_cov_px_accum = 0.0;
+
+void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2, float y2) {
+    const double cross = (double)(x1 - x0) * (double)(y2 - y0)
+                       - (double)(x2 - x0) * (double)(y1 - y0);
+    g_cov_px_accum += (cross < 0.0 ? -cross : cross) * 0.5;
+}
+
 static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     if (!mf_stat_on()) return;
     struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
@@ -468,16 +485,26 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     double frame_ms = (double)mf_ctrl_rd_hi(MF_C_DONE)   / (MF_CLK_SYS_MHZ * 1000.0);
     double texw_ms  = (double)mf_ctrl_rd_hi(MF_C_STATUS) / (MF_CLK_SYS_MHZ * 1000.0);
     double tri_ms   = (double)mf_ctrl_rd_hi(MF_C_SRCSEL) / (MF_CLK_SYS_MHZ * 1000.0);
-    static unsigned n = 0, to = 0; static double lo = 1e12, hi = 0, sum = 0; static long it_sum = 0;
-    static double fsum = 0, tsum = 0, xsum = 0;
+    static unsigned n = 0, to = 0; static double sum = 0; static long it_sum = 0;
+    static double fsum = 0, tsum = 0, xsum = 0, csum = 0;
     n++; to += timeout ? 1u : 0u; sum += us; it_sum += iters; fsum += frame_ms; tsum += tri_ms; xsum += texw_ms;
-    if (us < lo) lo = us; if (us > hi) hi = us;
+    csum += g_cov_px_accum; g_cov_px_accum = 0.0;   // per-frame: reset after folding in
     if (n % 30 == 0) {
-        double f=fsum/30.0, t=tsum/30.0, x=xsum/30.0;
+        double f=fsum/30.0, t=tsum/30.0, x=xsum/30.0, c=csum/30.0;
+        // cyc_px uses the fabric clock: dpath_ms * clk_MHz * 1000 / covered_px.
+        double dpath_ms = t - x;
+        double cyc_px = (c > 1.0) ? (dpath_ms * MF_CLK_SYS_MHZ * 1000.0) / c : 0.0;
+        // Screen area comes from the fabric geometry macros, never a literal:
+        // MISTER_WIDTH/HEIGHT arrive as -D flags, so a hardcoded 288x216 here
+        // would silently survive a geometry change and report a wrong overdraw.
+        const double screen_px = (double)BLT_FB_WIDTH * (double)BLT_FB_HEIGHT;
         fprintf(stderr, "MFSUBMIT n=%u wait_ms[avg=%.2f] fabric_ms[frame=%.2f tri=%.2f "
-                "texwait=%.2f dpath=%.2f ovhd=%.2f] spin_avg=%ld to=%u\n",
-                n, (sum/30.0)/1e3, f, t, x, t-x, f-t, it_sum/30, to);
-        lo = 1e12; hi = 0; sum = 0; it_sum = 0; to = 0; fsum = 0; tsum = 0; xsum = 0;
+                "texwait=%.2f dpath=%.2f ovhd=%.2f] cov_px_est=%.0f overdraw=%.2f "
+                "cyc_px=%.1f spin_avg=%ld to=%u\n",
+                n, (sum/30.0)/1e3, f, t, x, dpath_ms, f-t,
+                c, c / screen_px, cyc_px, it_sum/30, to);
+        sum = 0; it_sum = 0; to = 0;
+        fsum = 0; tsum = 0; xsum = 0; csum = 0;
     }
 }
 

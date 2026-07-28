@@ -29,6 +29,9 @@ extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba);
 // is selected (same as SetDefaultSurface).
 extern "C" void RasterBackend_MFGPU_SetAppSurface(uint32_t fbo, uint32_t tex);
 
+// Defined in raster_backend_mfgpu.cpp — host-side covered-pixel estimate.
+void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2, float y2);
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -598,6 +601,16 @@ static int handle_draw(const char *kind, GLenum mode, int count,
                     uint64_t _t0 = g_prof ? bl_now_ns() : 0;
                     RasterBackend_Select()->draw(&rt, &s_verts[0], count / 3, &tex, blend, 0.0f, g_boundTex2D);
                     if (g_prof) { g_pf_raster += bl_now_ns() - _t0; g_pf_draws++; g_pf_tris += count/3; }
+                    // Coverage estimate (Task 4): same screen-space verts just handed to
+                    // the backend, summed per-triangle. This is the actual submission
+                    // site — every draw that reaches RasterBackend_Select()->draw() above
+                    // goes through here, culled/invisible draws never reach this line.
+                    for (int t = 0; t < count / 3; t++) {
+                        const BVtx &a = s_verts[t * 3 + 0];
+                        const BVtx &b = s_verts[t * 3 + 1];
+                        const BVtx &c = s_verts[t * 3 + 2];
+                        mf_cov_add_triangle(a.x, a.y, b.x, b.y, c.x, c.y);
+                    }
                     rast = 1;
                 }
             }
