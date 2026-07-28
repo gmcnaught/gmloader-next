@@ -83,6 +83,10 @@ extern "C" uintptr_t RasterBackend_MFGPU_TestVtxBase(void);
 // [Phase 1 B3] times evict_one_lru was CALLED (not times it succeeded). Proves the heap was
 // genuinely under pressure, so a retention assertion cannot pass by never being tested.
 extern "C" uint32_t RasterBackend_MFGPU_TestEvictAttempts(void);
+// [Phase 1 B3] full-table inserts the pin-aware guard refused, and the cache's slot count —
+// read from the backend rather than mirrored here, so the fill loop cannot drift from it.
+extern "C" uint32_t RasterBackend_MFGPU_TestCacheFullDrops(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestTexCacheSlots(void);
 // blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void);
@@ -1775,7 +1779,10 @@ static int case_ringsel_value_tracks_arena(void) {
     return 1;
 }
 
-// [Phase 1 B3] Texture heap capped to hold exactly ONE 512x512 page (512 KiB) plus slack,
+// [Phase 1 B3] Texture heap capped to hold exactly ONE page and no more.
+// Arithmetic, since the whole case turns on it: the pages below are 512x512 RGB565, so
+// 512 * 512 * 2 = 524288 B = 512 KiB each. A 768 KiB cap admits one (256 KiB slack) and
+// cannot admit a second (1024 KiB > 768 KiB). Same shape as case_eviction's 1.25 MB for two.
 // so a second texture cannot be admitted without evicting the first. Sizing convention
 // follows case_eviction (1.25 MB for two such pages); this is the one-page equivalent.
 //
@@ -1866,15 +1873,42 @@ static int case_pin_insert_protects_two_frames(void) {
     RSurface s = { rgba, BW, BH };
     RasterBackend_MFGPU_SetDefaultSurface(rgba);
 
-    backend_mfgpu.frame_begin();
-    for (uint32_t k = 1; k <= 256; k++)
-        backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, k);
-    backend_mfgpu.frame_end();
+    // Driven from the backend's own slot count, never a literal: a hardcoded 256 silently
+    // stops filling the table the moment MF_TEX_CACHE_N grows, and the case goes vacuous
+    // with nothing failing anywhere.
+    const uint32_t slots = RasterBackend_MFGPU_TestTexCacheSlots();
 
     backend_mfgpu.frame_begin();
-    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, /*257th key=*/9999);
+    for (uint32_t k = 1; k <= slots; k++)
+        backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, k);
     backend_mfgpu.frame_end();
-    const uint32_t up2 = RasterBackend_MFGPU_TestUploadCount();
+    const uint32_t up1 = RasterBackend_MFGPU_TestUploadCount();
+
+    // VACUITY GUARD 1 — the table must actually be full. If it is not, frame 2's insert
+    // finds a free slot, never reaches the pin-aware guard, and everything below passes
+    // while testing nothing.
+    if (up1 != slots) {
+        printf("  FAIL pin-insert-2frame: table not saturated (%u uploads for %u slots); "
+               "the pin-aware guard is unreachable and this case is vacuous\n", up1, slots);
+        return 0;
+    }
+
+    const uint32_t drops1 = RasterBackend_MFGPU_TestCacheFullDrops();
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, /*one key past the table=*/9999);
+    backend_mfgpu.frame_end();
+    const uint32_t up2    = RasterBackend_MFGPU_TestUploadCount();
+    const uint32_t drops2 = RasterBackend_MFGPU_TestCacheFullDrops();
+
+    // VACUITY GUARD 2 — the guard must actually have refused the insert. Note this cannot be
+    // inferred from the upload count: g_upload_count is bumped BEFORE the pin-aware guard
+    // runs and the refusal then undoes the upload, so a refused insert still counts as one
+    // (up2 == up1 + 1 even when the code is correct). Hence a dedicated refusal witness.
+    if (drops2 == drops1) {
+        printf("  FAIL pin-insert-2frame: the full-table insert was never refused "
+               "(cache-full drops %u -> %u); the guard did not fire\n", drops1, drops2);
+        return 0;
+    }
 
     backend_mfgpu.frame_begin();
     backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, /*the LRU victim=*/1);
@@ -1886,8 +1920,8 @@ static int case_pin_insert_protects_two_frames(void) {
                "was overwritten in the cache table while still live to the fabric\n", up2, up3);
         return 0;
     }
-    printf("  OK   pin-insert-2frame  prior-frame entry survived a full-table insert "
-           "(uploads steady at %u)\n", up3);
+    printf("  OK   pin-insert-2frame  %u slots filled, insert refused, prior-frame entry "
+           "survived (uploads steady at %u)\n", slots, up3);
     return 1;
 }
 

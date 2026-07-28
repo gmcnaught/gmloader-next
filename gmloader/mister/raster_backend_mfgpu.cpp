@@ -265,6 +265,11 @@ static uint64_t   g_lru_frame_floor = 0;
 // test that cannot show the heap was under pressure cannot distinguish "the texture was
 // protected" from "nothing was ever at risk"; this is what makes that distinction assertable.
 static uint32_t   g_evict_attempts = 0;
+// [Phase 1 B3] Times the pin-aware INSERT guard refused a full-table insert. The direct
+// witness that that guard fired: the upload counter cannot serve, because g_upload_count is
+// bumped before the guard runs and the refusal then undoes the upload -- so a refused insert
+// still counts as an upload.
+static uint32_t   g_cachefull_drops = 0;
 // [Phase 1 B3] The floor EVICTION compares against, which lags g_lru_frame_floor by one
 // frame. With the ring double-buffered the host builds frame N+1 while the fabric is still
 // reading N, so a texture touched in N is live even though N is "over". Evicting or
@@ -909,7 +914,8 @@ static void mf_init_once(void) {
 #endif
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
-    g_evict_attempts = 0; g_lru_evict_floor = 0;   // [Phase 1 B3] pressure witness + lagging floor
+    g_evict_attempts = 0; g_cachefull_drops = 0;   // [Phase 1 B3] pressure + refusal witnesses
+    g_lru_evict_floor = 0;                         // [Phase 1 B3] lagging floor
     g_publish_count = 0; g_await_count = 0;   // [Phase 1 B2] submit-seam counters
     g_arena = 0;                                                              // [Phase 1 B1] arena parity
     g_publish_depth = 0; g_unpaired_awaits = 0; g_seam_depth_violations = 0;  // [Phase 1 B2] ordering witness
@@ -1212,6 +1218,7 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
     // fail the stage so the caller drops the draw. A busy frame degrades to a
     // DROPPED frame, never a wrong-pixel frame.
     if (g_texcache[slot].used && g_texcache[slot].lru > g_lru_evict_floor) {
+        g_cachefull_drops++;   // [Phase 1 B3] refusal witness
         if (mf_heaplog_on())
             fprintf(stderr, "HEAPLOG CACHE-FULL %s key=%u: all %d slots frame-pinned "
                     "- dropping frame\n", what, key, MF_TEX_CACHE_N);
@@ -1972,6 +1979,12 @@ extern "C" uint32_t RasterBackend_MFGPU_TestTraceVal(uint32_t i) {
 extern "C" uint32_t  RasterBackend_MFGPU_TestArena(void)    { return g_arena; }
 // [Phase 1 B3] eviction ATTEMPTS since reinit — the vacuity guard for the retention case.
 extern "C" uint32_t  RasterBackend_MFGPU_TestEvictAttempts(void) { return g_evict_attempts; }
+// [Phase 1 B3] full-table inserts refused by the pin-aware guard, and the table's slot count.
+// The slot count is exposed rather than mirrored in the test so the two cannot drift: a test
+// that fills a hardcoded 256 slots stops filling the table the moment MF_TEX_CACHE_N grows,
+// and goes quietly vacuous with nothing failing.
+extern "C" uint32_t  RasterBackend_MFGPU_TestCacheFullDrops(void) { return g_cachefull_drops; }
+extern "C" uint32_t  RasterBackend_MFGPU_TestTexCacheSlots(void)  { return MF_TEX_CACHE_N; }
 extern "C" uintptr_t RasterBackend_MFGPU_TestRingBase(void) { return (uintptr_t)g_e.ring; }
 extern "C" uintptr_t RasterBackend_MFGPU_TestVtxBase(void)  { return (uintptr_t)g_e.vtx_buf; }
 // [Phase 1 B1] Seed C_SRCSEL's shadow so the read-modify-write has a non-zero throttle
