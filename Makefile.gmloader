@@ -255,6 +255,13 @@ native-audio-writer-test:
 	  gmloader/mister/native_audio_writer.c \
 	  -o /tmp/nawt && /tmp/nawt
 
+.PHONY: joy-script-test
+joy-script-test:
+	cc -std=c11 -O0 -g -Itools \
+	  tools/joy_script_parse_test.c \
+	  tools/joy_script_parse.c \
+	  -o /tmp/jspt && /tmp/jspt
+
 .PHONY: native-audio-shim-test
 native-audio-shim-test:
 	c++ -std=c++17 -O0 -g -Igmloader/mister $(shell pkg-config sdl2 --cflags) \
