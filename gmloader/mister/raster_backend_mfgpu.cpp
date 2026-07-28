@@ -463,14 +463,38 @@ static long mf_timeout_ms(void) {
 // then used to characterize. This breaks that circularity.
 //
 // Sum of |cross product| / 2 over submitted triangles = covered area INCLUDING
-// overdraw. It is an ESTIMATE: it ignores scissor and clipping, and counts
-// degenerate triangles as zero. Reported as cov_px_est, never as exact.
+// overdraw. It is an ESTIMATE: it ignores scissor and clipping (Blitter_OnScissor
+// is a no-op and the per-draw cull tests one aggregate bbox for the whole batch —
+// see blitter.cpp), so a triangle that is mostly off the render target is still
+// summed at its full geometric area, not its clipped area. We do NOT implement
+// per-triangle clipping here; the per-triangle clamp below (to a full screen)
+// only bounds the worst case, it does not make the estimate exact. Degenerate
+// triangles count as zero.
+//
+// Called from mf_emit_group ONLY, after a triangle group has actually been
+// pushed into the fabric command ring (blt_push_tris + a successful
+// blt_trilist) — review found the original call site (blitter.cpp, the
+// generic backend-dispatch point) counted triangles the active backend went
+// on to silently discard (in-flight-batch drop, self-referential appsurf
+// guard, the CRT-ghost strip — on by default and ~124,000px/frame in
+// gameplay, duplicate-draw elision), inflating cov_px_est by ~6.6x on
+// device. Reported as cov_px_est, never as exact. Gated by mf_stat_on() at
+// the call site so this costs nothing when GMLOADER_MFSUBMIT_STAT is unset;
+// backend_sw never calls this at all, so the SW backend reports zero
+// coverage (expected for this phase — we're measuring the fabric).
 static double g_cov_px_accum = 0.0;
 
-void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2, float y2) {
+static void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2, float y2) {
     const double cross = (double)(x1 - x0) * (double)(y2 - y0)
                        - (double)(x2 - x0) * (double)(y1 - y0);
-    g_cov_px_accum += (cross < 0.0 ? -cross : cross) * 0.5;
+    double area = (cross < 0.0 ? -cross : cross) * 0.5;
+    // MINOR: clamp a single triangle's contribution to a full render-target's
+    // worth of pixels, so a wildly offscreen/degenerate-huge triangle can't
+    // blow up the estimate. BLT_FB_WIDTH/HEIGHT is the fabric's fixed target
+    // geometry (same denominator mf_submit_stat uses for `overdraw` below).
+    const double screen_px = (double)BLT_FB_WIDTH * (double)BLT_FB_HEIGHT;
+    if (area > screen_px) area = screen_px;
+    g_cov_px_accum += area;
 }
 
 static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
@@ -1032,8 +1056,24 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
     }
     g_last_trilist_blend = blend_mode;   // host-test hook (opaque-ALPHA -> COPY promotion)
     if (blt_trilist(&g_e, tex, blend_mode, colorkey, /*alpha=*/255,
-                    eoff, nt, extra_flags) != 0)
+                    eoff, nt, extra_flags) != 0) {
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", nt);
+        return;
+    }
+    // Coverage estimate (Task 4, moved here per review — see the long comment at
+    // g_cov_px_accum's declaration): this is the actual point triangles are pushed
+    // into the fabric ring, downstream of every silent-discard path in mf_draw
+    // (in-flight-batch guard, self-referential appsurf guard, CRT-ghost strip,
+    // duplicate-draw elision) and of both overflow checks above. `verts` are still
+    // the pre-bvtx_to_blt screen-space coordinates, same space blitter.cpp decoded.
+    if (mf_stat_on()) {
+        for (int i = 0; i < nt; i++) {
+            const BVtx &a = verts[i * 3 + 0];
+            const BVtx &b = verts[i * 3 + 1];
+            const BVtx &c = verts[i * 3 + 2];
+            mf_cov_add_triangle(a.x, a.y, b.x, b.y, c.x, c.y);
+        }
+    }
 }
 
 // ── [Y-orientation bring-up capture] GMLOADER_MFGPU_UVLOG ────────────────────
