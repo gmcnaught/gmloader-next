@@ -1555,7 +1555,10 @@ static int case_submit_publish_await_split(void) {
         return 0;
     }
 
-    mf_test_drive_one_frame();   // emits a trivial frame and closes it
+    // Two frames: the await is deferred to the top of the next frame (B2), so one frame
+    // alone publishes without ever awaiting. Driving two closes the pair.
+    mf_test_drive_one_frame();
+    mf_test_drive_one_frame();
 
     // Checked BEFORE the raw counts: "a batch was published while another was still in
     // flight" is a strictly more specific diagnosis than "expected 1 publish, got 2", and
@@ -1570,21 +1573,30 @@ static int case_submit_publish_await_split(void) {
 
     const uint32_t pub1 = RasterBackend_MFGPU_TestPublishCount();
     const uint32_t awa1 = RasterBackend_MFGPU_TestAwaitCount();
-    if (pub1 != 1) {
-        printf("  FAIL submit-split: expected 1 publish, got %u\n", pub1);
+    if (pub1 != 2) {
+        printf("  FAIL submit-split: expected 2 publishes, got %u\n", pub1);
         return 0;
     }
-    if (awa1 != 1) {
-        printf("  FAIL submit-split: expected 1 await, got %u\n", awa1);
+    if (awa1 != 1) {   // frame 2 awaited frame 1; frame 2's own await is still deferred
+        printf("  FAIL submit-split: expected 1 await after 2 frames, got %u\n", awa1);
         return 0;
     }
 
-    // The seam must sit BEHIND the drop guard: a frame the in-flight guard drops rebuilds
-    // no ring, so it must ring no doorbell either. mf_frame_end returns on g_frame_dropped
-    // before blt_end_frame and before both submit sites; this pins that placement, which
-    // Task 4 moves publish and await straight across. A publish on a dropped frame would
+    // PUBLISH must sit behind the drop guard: a frame the in-flight guard drops rebuilds no
+    // ring, so it must ring no doorbell either. mf_frame_end returns on g_frame_dropped
+    // before blt_end_frame and before the publish. A publish on a dropped frame would
     // re-ring the doorbell with submit_seq unchanged, over a ring the fabric is still
-    // reading -- the corruption cascade documented at raster_backend_mfgpu.cpp:707.
+    // reading -- the corruption cascade documented at raster_backend_mfgpu.cpp's in-flight
+    // guard.
+    //
+    // AWAIT is different since [Phase 1 B2] deferred it, and the distinction is the point:
+    // the await now runs at the TOP of mf_frame_begin, for the PREVIOUS frame's batch, and
+    // strictly before this frame's drop decision has even been made. So a dropped frame does
+    // legitimately drive exactly one await -- the one belonging to the batch it is waiting
+    // on. Asserting "await must not advance" here would be asserting the pre-deferral
+    // design. What is still load-bearing, and still asserted strictly, is that the doorbell
+    // is untouched; and the await is bounded at one, so a drop run cannot re-enter the
+    // blocking poll frame after frame.
     RasterBackend_MFGPU_TestSetFabricBusy(1);   // fabric "still busy" -> next frame drops
     const uint32_t drop0 = RasterBackend_MFGPU_TestDropCount();
     mf_test_drive_one_frame();                  // must be dropped whole
@@ -1600,9 +1612,15 @@ static int case_submit_publish_await_split(void) {
                "no-seam-on-drop check below would pass vacuously\n", drop0, drop1);
         return 0;
     }
-    if (pub2 != pub1 || awa2 != awa1) {
-        printf("  FAIL submit-split: dropped frame still drove the seam "
-               "(publish %u->%u, await %u->%u)\n", pub1, pub2, awa1, awa2);
+    if (pub2 != pub1) {
+        printf("  FAIL submit-split: dropped frame rang the doorbell "
+               "(publish %u->%u) over a ring the fabric is still reading\n", pub1, pub2);
+        return 0;
+    }
+    if (awa2 > awa1 + 1) {
+        printf("  FAIL submit-split: dropped frame drove %u awaits, expected at most 1 "
+               "(the previous batch's); a drop run must not re-enter the blocking poll\n",
+               awa2 - awa1);
         return 0;
     }
 
@@ -1675,8 +1693,48 @@ static int case_submit_publish_await_split(void) {
         }
     }
 
-    printf("  OK   submit-split  publish=%u await=%u; dropped frame drove neither; "
+    printf("  OK   submit-split  publish=%u await=%u; dropped frame rang no doorbell; "
            "0 unpaired awaits; doorbell last after barrier\n", pub1, awa1);
+    return 1;
+}
+
+// [Phase 1 B2] The await must move to the top of the NEXT frame, so Process() for
+// frame N+1 runs between the doorbell for N and the wait for N. The barrier is the
+// first control-word write of N+1, not the end of N's present(): C_CMDCOUNT/C_TARGET/
+// C_CLEAR/C_FLAGS/C_SRCSEL are a SINGLE shared block, so they must not be rewritten
+// until the fabric has consumed the previous frame's values.
+static int case_await_deferred_one_frame(void) {
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+
+    mf_test_drive_one_frame();          // frame 1: publishes, must NOT await
+    const uint32_t pub1 = RasterBackend_MFGPU_TestPublishCount();
+    const uint32_t awa1 = RasterBackend_MFGPU_TestAwaitCount();
+    if (pub1 != 1 || awa1 != 0) {
+        printf("  FAIL await-deferred: after frame 1 expected pub=1 await=0, "
+               "got pub=%u await=%u\n", pub1, awa1);
+        return 0;
+    }
+
+    mf_test_drive_one_frame();          // frame 2: awaits frame 1, then publishes
+    const uint32_t pub2 = RasterBackend_MFGPU_TestPublishCount();
+    const uint32_t awa2 = RasterBackend_MFGPU_TestAwaitCount();
+    if (pub2 != 2 || awa2 != 1) {
+        printf("  FAIL await-deferred: after frame 2 expected pub=2 await=1, "
+               "got pub=%u await=%u\n", pub2, awa2);
+        return 0;
+    }
+    // The seam invariants must survive the deferral: with publish and await now separated
+    // across a frame boundary they are no longer trivially paired by a common caller.
+    if (RasterBackend_MFGPU_TestUnpairedAwaits() != 0 ||
+        RasterBackend_MFGPU_TestSeamDepthViolations() != 0) {
+        printf("  FAIL await-deferred: seam invariants broke under deferral "
+               "(unpaired=%u depth_violations=%u)\n",
+               RasterBackend_MFGPU_TestUnpairedAwaits(),
+               RasterBackend_MFGPU_TestSeamDepthViolations());
+        return 0;
+    }
+    printf("  OK   await-deferred  one frame of slack (pub=%u await=%u)\n", pub2, awa2);
     return 1;
 }
 
@@ -1782,9 +1840,8 @@ static int case_ringsel_value_tracks_arena(void) {
 // [Phase 1 B3] Texture heap capped to hold exactly ONE page and no more.
 // Arithmetic, since the whole case turns on it: the pages below are 512x512 RGB565, so
 // 512 * 512 * 2 = 524288 B = 512 KiB each. A 768 KiB cap admits one (256 KiB slack) and
-// cannot admit a second (1024 KiB > 768 KiB). Same shape as case_eviction's 1.25 MB for two.
-// so a second texture cannot be admitted without evicting the first. Sizing convention
-// follows case_eviction (1.25 MB for two such pages); this is the one-page equivalent.
+// cannot admit a second (1024 KiB > 768 KiB), so the second texture cannot be admitted
+// without evicting the first. Same shape as case_eviction's 1.25 MB for two such pages.
 //
 // Deliberately NOT the "two textures fit, a third evicts" sizing the plan suggested: with
 // two pages resident nothing is ever under pressure in a three-frame test, evict_one_lru is
@@ -1915,6 +1972,12 @@ static int case_pin_insert_protects_two_frames(void) {
     backend_mfgpu.frame_end();
     const uint32_t up3 = RasterBackend_MFGPU_TestUploadCount();
 
+    // ATTRIBUTION NOTE: guard 2 above shadows this check. Reverting the pin-aware guard
+    // makes the case return there (the insert was never refused), so this assertion is not
+    // reached and no mutation in the current set falsifies it. Both are kept deliberately —
+    // guard 2 checks the MECHANISM fired, this checks the OUTCOME held — but this one must
+    // not be credited with catching the reverted-guard mutation. It is the backstop for a
+    // future fault where the guard fires and the entry is clobbered anyway.
     if (up3 != up2) {
         printf("  FAIL pin-insert-2frame: uploads %u -> %u; the previous frame's LRU entry "
                "was overwritten in the cache table while still live to the fabric\n", up2, up3);
@@ -2263,6 +2326,8 @@ int main(void){
     else printf("raster_backend mfgpu-inflight-drop-limit OK\n");
     if (!case_submit_publish_await_split()) { printf("FAIL mfgpu-submit-split\n"); ok = 0; }
     else printf("raster_backend mfgpu-submit-split OK\n");
+    if (!case_await_deferred_one_frame()) { printf("FAIL mfgpu-await-deferred\n"); ok = 0; }
+    else printf("raster_backend mfgpu-await-deferred OK\n");
     if (!case_arena_alternates()) { printf("FAIL mfgpu-arena-alt\n"); ok = 0; }
     else printf("raster_backend mfgpu-arena-alt OK\n");
     if (!case_ringsel_value_tracks_arena()) { printf("FAIL mfgpu-ringsel\n"); ok = 0; }

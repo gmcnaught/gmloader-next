@@ -787,11 +787,12 @@ static struct timespec g_publish_t0;
 // On device the inversion is not cosmetic: await would poll C_DONE for a sequence that was
 // never submitted, and mf_submit_stat would measure from a stale g_publish_t0.
 //
-// Lifetime: publish INCREMENTS it; a successful ack DECREMENTS it; a timeout deliberately
-// does NOT. A timed-out batch is still live (that is the whole premise of the in-flight
-// guard at :707), so when Task 4 re-awaits it from the next mf_frame_begin that await is
-// properly paired. Decrementing on timeout would make the invariant fire on the device's
-// most common failure path and invite someone to weaken it.
+// Lifetime: publish INCREMENTS it; it is cleared where mf_frame_begin clears
+// g_fabric_pending, which is the single point at which the batch stops being in flight —
+// acked by the await, found done by the cheap re-check during a drop run, or abandoned by a
+// reclaim. A timed-out batch is deliberately still counted as outstanding (that is the whole
+// premise of the in-flight guard below), so the drop run that follows does not look
+// unpaired. Resolving it anywhere else would let the three exit paths disagree.
 //
 // A DEPTH rather than a bool, because a bool is idempotent: publish(); publish(); await()
 // leaves a bool looking perfectly paired even though the doorbell was rung twice for one
@@ -841,12 +842,11 @@ static void mf_device_await(void) {
     if (g_publish_depth <= 0) g_unpaired_awaits++;
 #ifdef MISTER_NATIVE_VIDEO
     struct timespec t0 = g_publish_t0;
-    if (mf_nowait_on()) { if (g_publish_depth > 0) g_publish_depth--; mf_submit_stat(&t0, 0, /*timeout=*/0); return; }  // probe: no poll
+    if (mf_nowait_on()) { mf_submit_stat(&t0, 0, /*timeout=*/0); return; }  // probe: no poll
     long iters = 0;
     const long poll_us = mf_poll_us();
     for (;;) {
         if (mf_ctrl_rd(MF_C_DONE) == g_e.submit_seq) {   // fabric consumed it
-            if (g_publish_depth > 0) g_publish_depth--;   // acked: no longer in flight
             mf_submit_stat(&t0, iters, /*timeout=*/0);
             return;
         }
@@ -879,16 +879,8 @@ static void mf_device_await(void) {
         }
     }
 #endif // MISTER_NATIVE_VIDEO
-    // Host oracle: blt_execute is synchronous, so the batch is always acked by the time
-    // the caller gets here. (Unreachable on device — every branch above returns.)
-    if (g_publish_depth > 0) g_publish_depth--;
-}
-
-// [Phase 1 B2] Unchanged behaviour for callers that still want the blocking form.
-// Task 4 replaces the single call site with a deferred publish/await pair.
-static void mf_device_submit(void) {
-    mf_device_publish();
-    mf_device_await();
+    // Host oracle: nothing to poll. Resolution (and the depth clear) happens in
+    // mf_frame_begin where g_fabric_pending is cleared, identically to the device path.
 }
 
 static void mf_init_once(void) {
@@ -929,8 +921,12 @@ static void mf_init_once(void) {
 // [in-flight-batch guard] The emitter builds the command ring, the vertex buffer and the
 // texture heap IN PLACE in the DDR the fabric reads (mf_init_once binds g_dev_ring/g_dev_src).
 // The ONLY thing keeping the host from overwriting a batch the fabric is still executing is
-// the blocking C_DONE poll in mf_device_submit -- and its timeout abandons exactly that
-// guarantee. Device-measured 2026-07-24: with the stock 200ms budget a single stalled frame
+// the C_DONE await -- and its timeout abandons exactly that guarantee. [Phase 1 B2] That
+// await is no longer at the end of the frame that published: it now runs at the top of the
+// NEXT mf_frame_begin, so the host builds frame N+1's arena while the fabric still reads N's.
+// What keeps that safe is not the poll's position but the double-buffering underneath it --
+// ring and vertex arenas alternate (B1) and textures stay pinned for two frames (B3), so the
+// batch the fabric is reading is never the one being rebuilt. Device-measured 2026-07-24: with the stock 200ms budget a single stalled frame
 // produced ~78 timeouts, i.e. 78 successive frames that called blt_begin_frame (cmd_count=0,
 // vtx_used=0) and re-staged textures straight over the batch the fabric was mid-way through
 // reading. That is the mechanism behind the garbage geometry, "the game's stored tilemap
@@ -953,6 +949,24 @@ static void mf_frame_begin(void) {
     // [in-flight-batch guard] Decide BEFORE blt_begin_frame: it is the call that would
     // rewind the cursors over a live batch.
     if (g_fabric_pending) {
+        // [Phase 1 B2] The deferred await. This is the barrier: everything below rewrites
+        // the SINGLE shared control block (C_CMDCOUNT/C_TARGET/C_CLEAR/C_FLAGS/C_SRCSEL),
+        // so the fabric must have consumed the previous frame's values first. It latches
+        // them all in its prologue immediately after detecting a new C_SUBMIT (verified in
+        // blitter_top.sv's S_GOT_SRCSEL), so this is the minimal correct barrier — and
+        // every millisecond of Process() since the doorbell is overlap we did not have.
+        //
+        // NOT wrapped in #ifdef MISTER_NATIVE_VIDEO and NOT gated on g_dev_ok. Task 1 moved
+        // the definition outside the guard with only the MMIO poll nested inside, precisely
+        // so the oracle reaches this line; re-gating it here makes the deferral untestable
+        // off-device.
+        // Once per PUBLISHED BATCH, not once per frame. drop_run==0 means this is the first
+        // frame after the doorbell, i.e. the batch this await belongs to. During a drop run
+        // the cheap non-blocking mf_fabric_still_busy() read below is what discovers the
+        // fabric finishing; re-entering the blocking poll every frame would add a full
+        // timeout budget (200 ms) per dropped frame — ~12 s across a 60-frame drop run,
+        // turning a wedge into a far longer freeze than before pipelining.
+        if (g_drop_run == 0) mf_device_await();
         if (mf_fabric_still_busy() && g_drop_run < mf_drop_limit()) {
             g_frame_dropped = true;
             g_frame_active  = true;   // so present() still closes the frame
@@ -968,10 +982,17 @@ static void mf_frame_begin(void) {
         // That is strictly worse than the corruption the guard exists to prevent. After
         // MF_DROP_LIMIT consecutive drops, reclaim the ring and rebuild: one deliberate
         // stomp as a last resort, instead of one per frame.
-        if (g_drop_run >= mf_drop_limit())
+        if (g_drop_run >= mf_drop_limit()) {
             fprintf(stderr, "backend_mfgpu: fabric never acked seq=%u after %u frames - "
                     "reclaiming the ring\n", g_pending_seq, mf_drop_limit());
+        }
+        // [Phase 1 B2] THE resolution point for the batch, and the only one. Exactly one
+        // batch is ever outstanding, so when pending clears — whether the await acked it,
+        // the cheap re-check found it done mid-drop-run, or we reclaimed and abandoned it —
+        // it is no longer in flight and the pairing depth must say so. Keeping this on a
+        // single line is what stops the three exit paths from disagreeing.
         g_fabric_pending = false;     // acked (or reclaimed): the ring is ours again
+        g_publish_depth  = 0;
     }
     g_drop_run = 0;
     g_frame_dropped = false;
@@ -1867,7 +1888,12 @@ static void mf_frame_end(void) {
         fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped\n");
         return;
     }
-    if (g_dev_ok) mf_device_submit();
+    // [Phase 1 B2] Publish and return. The await moved to mf_frame_begin, so the engine's
+    // Process() for the next frame now overlaps the fabric's raster window instead of running
+    // strictly before the submit. Safe only because the ring and vertex buffer are
+    // double-buffered (B1) and textures are pinned for two frames (B3) — without both, this
+    // is the corruption cascade documented at the in-flight-batch guard below.
+    if (g_dev_ok) { mf_device_publish(); g_fabric_pending = true; g_pending_seq = g_e.submit_seq; }
     else          fprintf(stderr, "backend_mfgpu: device DDR unmapped - frame dropped\n");
 #else
     // Host oracle: software-execute the ring into g_fb565 (parity tests read it back).
@@ -1879,7 +1905,12 @@ static void mf_frame_end(void) {
     // [Phase 1 B2] Drive the same submit seam the device path uses, so the publish/await
     // bookkeeping is observable off-device. blt_execute below stands in for the fabric and
     // is synchronous, so the await is trivially satisfied and costs nothing here.
-    mf_device_submit();
+    // [Phase 1 B2] Oracle: publish, then let blt_execute stand in for the fabric. The await
+    // moves to the next mf_frame_begin exactly as on device, so the deferral is observable
+    // off-device — without setting g_fabric_pending here the oracle never reaches the await
+    // and case_await_deferred_one_frame is unsatisfiable.
+    mf_device_publish();
+    g_fabric_pending = true; g_pending_seq = g_e.submit_seq;
     int n = g_e.cmd_count;
     if (n > MF_MAX_CMDS) n = MF_MAX_CMDS;
     for (int i = 0; i < n; i++)
