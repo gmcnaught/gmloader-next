@@ -304,8 +304,17 @@ int update_inputs(SDL_Window *win)
     SDL_GameControllerUpdate();
 
 #ifdef MISTER_NATIVE_VIDEO
-    if (g_joyshm_ready == -1) g_joyshm_ready = JoyShm_Init() ? 1 : 0;
-    if (g_joyddr_ready == -1) g_joyddr_ready = JoyDdr_Init() ? 1 : 0;
+    if (g_joyshm_ready == -1 || g_joyddr_ready == -1) {
+        if (g_joyshm_ready == -1) g_joyshm_ready = JoyShm_Init() ? 1 : 0;
+        if (g_joyddr_ready == -1) g_joyddr_ready = JoyDdr_Init() ? 1 : 0;
+        // Log the winning transport ONCE. Selection latches here and is never
+        // re-evaluated, and a failed shm injection is otherwise indistinguishable
+        // from a working one — a scripted bench run would silently fall back to
+        // the physical joystick and sit on the title screen for its whole life.
+        fprintf(stderr, "JOYSRC transport=%s\n",
+                (g_joyshm_ready == 1) ? "shm"
+                                      : (g_joyddr_ready == 1) ? "ddr" : "sdl");
+    }
     if (g_joyshm_ready == 1 || g_joyddr_ready == 1) {
         // MiSTer is the authoritative input source (it holds the exclusive
         // evdev grab): drive yoyo_gamepads[] from its normalized mask instead

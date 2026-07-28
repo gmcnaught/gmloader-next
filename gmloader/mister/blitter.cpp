@@ -29,6 +29,20 @@ extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba);
 // is selected (same as SetDefaultSurface).
 extern "C" void RasterBackend_MFGPU_SetAppSurface(uint32_t fbo, uint32_t tex);
 
+// NOTE: the host-side covered-pixel estimate (Task 4) does NOT live here.
+// This generic dispatch site sees every triangle handed to
+// RasterBackend_Select()->draw(), but backend_mfgpu can still silently
+// discard triangles downstream of that call (in-flight-batch drop, the
+// self-referential appsurf guard, the CRT-ghost strip, duplicate-draw
+// elision) before anything reaches the fabric. Counting here over-counted
+// by ~6.6x on device (review pass, see task-4-report.md). The accumulator
+// now lives in raster_backend_mfgpu.cpp, at the point triangles are
+// actually pushed into the fabric command ring (mf_emit_group, after a
+// successful blt_trilist), so only triangles that really reach the fabric
+// are counted. backend_sw does not call it at all, so the SW backend
+// reports zero coverage — expected for this phase (we're measuring the
+// fabric), not a bug.
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -598,6 +612,10 @@ static int handle_draw(const char *kind, GLenum mode, int count,
                     uint64_t _t0 = g_prof ? bl_now_ns() : 0;
                     RasterBackend_Select()->draw(&rt, &s_verts[0], count / 3, &tex, blend, 0.0f, g_boundTex2D);
                     if (g_prof) { g_pf_raster += bl_now_ns() - _t0; g_pf_draws++; g_pf_tris += count/3; }
+                    // Coverage estimate (Task 4) is NOT accumulated here — see the
+                    // note near the top of this file. draw() reaching this line only
+                    // means the triangles were SUBMITTED to the selected backend, not
+                    // that the fabric actually rasterized them.
                     rast = 1;
                 }
             }
