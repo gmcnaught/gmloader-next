@@ -126,7 +126,7 @@ ifeq ($(MISTER_BUILD),1)
 CFLAGS   += -DMISTER_NATIVE_VIDEO=1 -DMISTER_WIDTH=288 -DMISTER_HEIGHT=216
 CXXFLAGS += -DMISTER_NATIVE_VIDEO=1 -DMISTER_WIDTH=288 -DMISTER_HEIGHT=216
 LDFLAGS  += -L$(CURDIR)/3rdparty/gles2-sw -lGLES_sw -Wl,-rpath,'$$ORIGIN'
-MISTER_SRCS = gmloader/mister/native_video_writer.c gmloader/mister/native_audio_writer.c gmloader/mister/mister_native_audio.cpp gmloader/mister/frame_capture.cpp gmloader/mister/draw_trace.cpp gmloader/mister/blitter.cpp gmloader/mister/blitter_raster.cpp gmloader/mister/raster_backend_sw.cpp gmloader/mister/raster_backend_mfgpu.cpp gmloader/mister/joy_shm_reader.cpp gmloader/mister/joy_ddr_reader.cpp
+MISTER_SRCS = gmloader/mister/native_video_writer.c gmloader/mister/native_audio_writer.c gmloader/mister/mister_native_audio.cpp gmloader/mister/frame_capture.cpp gmloader/mister/draw_trace.cpp gmloader/mister/blitter.cpp gmloader/mister/blitter_raster.cpp gmloader/mister/raster_backend_sw.cpp gmloader/mister/raster_backend_mfgpu.cpp gmloader/mister/joy_shm_reader.cpp gmloader/mister/joy_ddr_reader.cpp gmloader/mister/bench_godmode.cpp gmloader/mister/bench_godmode_core.c
 endif
 
 # Used by generate_libc.py to generate the function tables that are exported to the
@@ -274,6 +274,13 @@ fps-overlay-test:
 	cc -std=c11 -Wall -Wextra -O2 -Igmloader/mister \
 	  gmloader/mister/fps_overlay_test.c \
 	  -o /tmp/fpsov && /tmp/fpsov
+
+.PHONY: bench-godmode-test
+bench-godmode-test:
+	cc -std=c11 -Wall -Wextra -O2 -Igmloader/mister \
+	  gmloader/mister/bench_godmode_test.c \
+	  gmloader/mister/bench_godmode_core.c \
+	  -o /tmp/bgt && /tmp/bgt
 
 .PHONY: joy-script-test
 joy-script-test:
