@@ -54,6 +54,54 @@ extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes);
 // read how many whole frames the guard has dropped since reinit.
 extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy);
 extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void);
+// [Phase 1 B2] submit-seam counters: how many times the frame loop rang the doorbell
+// (publish) and how many times it waited for the ack (await), since reinit.
+extern "C" uint32_t RasterBackend_MFGPU_TestPublishCount(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void);
+// awaits that ran with no batch in flight — the only way to observe publish/await ORDER on
+// a host build, where both halves are near-no-ops and counters look identical either way.
+extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestSeamDepthViolations(void);
+// Control-word write trace for the last publish (see raster_backend_mfgpu.cpp's trace shim).
+extern "C" uint32_t RasterBackend_MFGPU_TestTraceLen(void);
+extern "C" int      RasterBackend_MFGPU_TestTraceReg(uint32_t i);
+extern "C" uint32_t RasterBackend_MFGPU_TestTraceOverflow(void);
+
+// BLTCTRL qword indices, mirroring the MF_C_* enum in raster_backend_mfgpu.cpp. These are
+// the wire contract (3rdparty/mfgpu/docs/blitter-protocol.md §2), not build-dependent
+// addresses. MF_TRACE_BARRIER is the sentinel the shim records where the memory barrier sits.
+enum { TC_SUBMIT = 0, TC_CMDCOUNT = 1, TC_TARGET = 2, TC_CLEAR = 3, TC_FLAGS = 4,
+       TC_SRCSEL = 7, TC_BARRIER = -1 };
+// [Phase 1 B1] value recorded alongside the register, and a seed for C_SRCSEL's
+// read-modify-write so "the throttle field survives" is a real claim, not 0 == 0.
+extern "C" uint32_t RasterBackend_MFGPU_TestTraceVal(uint32_t i);
+extern "C" void     RasterBackend_MFGPU_TestSetCtrlSrcsel(uint32_t v);
+// [Phase 1 B1] arena alternation + the emitter's current bases.
+extern "C" uint32_t  RasterBackend_MFGPU_TestArena(void);
+extern "C" uintptr_t RasterBackend_MFGPU_TestRingBase(void);
+extern "C" uintptr_t RasterBackend_MFGPU_TestVtxBase(void);
+// [Phase 1 B3] times evict_one_lru was CALLED (not times it succeeded). Proves the heap was
+// genuinely under pressure, so a retention assertion cannot pass by never being tested.
+extern "C" uint32_t RasterBackend_MFGPU_TestEvictAttempts(void);
+// [Phase 1 B3] full-table inserts the pin-aware guard refused, and the cache's slot count —
+// read from the backend rather than mirrored here, so the fill loop cannot drift from it.
+extern "C" uint32_t RasterBackend_MFGPU_TestCacheFullDrops(void);
+extern "C" int      RasterBackend_MFGPU_TestFrameOvfCause(void);
+// Read from the backend rather than mirrored: a hand-copied enum is a second source of truth
+// that drifts silently, the same reason MF_TEX_CACHE_N is exposed via a hook.
+extern "C" int RasterBackend_MFGPU_OvfCauseUnknown(void);
+extern "C" int RasterBackend_MFGPU_OvfCauseCacheFull(void);
+extern "C" int RasterBackend_MFGPU_OvfCauseHeapFull(void);
+#define OVF_CACHE_FULL (RasterBackend_MFGPU_OvfCauseCacheFull())
+#define OVF_HEAP_FULL  (RasterBackend_MFGPU_OvfCauseHeapFull())
+// [Phase 1 A4] The covered-pixel derivation: pure arithmetic over values that come from the
+// fabric. Reading C_FLAGS.hi needs hardware; this does not, and is testable anywhere.
+extern "C" void RasterBackend_MFGPU_TestDeriveCov(double dpath_ms, double cov_exact,
+                                                  double cov_est, double screen_px,
+                                                  double clk_mhz, double *cov_den,
+                                                  double *cyc_px, double *overdraw,
+                                                  double *est_ratio, int *estimated);
+extern "C" uint32_t RasterBackend_MFGPU_TestTexCacheSlots(void);
 // blend mode of the last emitted TRILIST (opaque-ALPHA -> COPY promotion)
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void);
@@ -1442,6 +1490,12 @@ static int case_inflight_drop_limit(void) {
 
     // the fabric never acks -- hold "busy" for far longer than the limit
     RasterBackend_MFGPU_TestSetFabricBusy(1);
+    // [Phase 1 B2] Seam baseline before the drop RUN. case_submit_publish_await_split
+    // drives exactly one dropped frame, so a publish conditioned on drop-run length slips
+    // past it; this walk covers frames 2..N and the reclaim boundary, where the path really
+    // is run-length-dependent (g_drop_run >= mf_drop_limit() stops dropping and rebuilds).
+    const uint32_t pub_pre = RasterBackend_MFGPU_TestPublishCount();
+    const uint32_t awa_pre = RasterBackend_MFGPU_TestAwaitCount();
     int executed_at = -1;
     static uint16_t fbN[BW*BH];
     for (int f = 0; f < 200; f++) {
@@ -1461,7 +1515,582 @@ static int case_inflight_drop_limit(void) {
                executed_at);
         return 0;
     }
-    printf("  OK   inflight-drop-limit  reclaimed the ring at frame %d (no deadlock)\n", executed_at);
+    // [Phase 1 B2] Across the whole run, exactly ONE frame drove the seam: the frame that
+    // reclaimed the ring and rebuilt. Every dropped frame before it must have rung no
+    // doorbell — a publish over a ring the fabric is still reading is the :707 cascade.
+    // Asserting the delta (not just "no publish") also pins that the reclaiming frame DID
+    // submit, so a guard that silently stopped submitting would not read as success.
+    const uint32_t pub_d = RasterBackend_MFGPU_TestPublishCount() - pub_pre;
+    const uint32_t awa_d = RasterBackend_MFGPU_TestAwaitCount()   - awa_pre;
+    if (pub_d != 1 || awa_d != 1) {
+        printf("  FAIL inflight-drop-limit  seam ran %u publish / %u await across a %d-frame "
+               "drop run; expected exactly 1 each (only the reclaiming frame)\n",
+               pub_d, awa_d, executed_at + 1);
+        return 0;
+    }
+    if (RasterBackend_MFGPU_TestUnpairedAwaits() != 0) {
+        printf("  FAIL inflight-drop-limit  %u await(s) ran with no batch in flight\n",
+               RasterBackend_MFGPU_TestUnpairedAwaits());
+        return 0;
+    }
+    printf("  OK   inflight-drop-limit  reclaimed the ring at frame %d (no deadlock); "
+           "seam ran once across the run\n", executed_at);
+    return 1;
+}
+
+// [Phase 1 B2] Drive one complete frame through the real vtable and close it: clear, one
+// small textured triangle, present. Mirrors how case_inflight_drop above drives its
+// frames — the submit-seam cases care about the publish/await bookkeeping a closed frame
+// produces, not about the pixels, so the geometry is deliberately the same trivial one.
+static void mf_test_drive_one_frame(void) {
+    static const uint8_t white[4] = { 255, 255, 255, 255 };
+    RTexture t = { white, 1, 1, 1, 1, 0, 1 };
+    BVtx v[3] = { {1,1,0,0,1,1,1,1}, {60,1,1,0,1,1,1,1}, {1,60,0,1,1,1,1,1} };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    backend_mfgpu.clear(&s, 0,0,0,255);
+    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, next_key());
+    backend_mfgpu.present(&s);
+}
+
+// [Phase 1 B2] The submit path must be separable into a non-blocking publish and a
+// blocking await, so the host can run Process() for frame N+1 between them. This is
+// the seam the pipelining depends on; without it, deferring the poll means
+// restructuring the timeout and drop-frame logic at the same time.
+static int case_submit_publish_await_split(void) {
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);   // ask for the real predicate
+
+    const uint32_t pub0 = RasterBackend_MFGPU_TestPublishCount();
+    const uint32_t awa0 = RasterBackend_MFGPU_TestAwaitCount();
+    if (pub0 != 0 || awa0 != 0) {
+        printf("  FAIL submit-split: counters not zeroed by reinit (pub=%u await=%u)\n",
+               pub0, awa0);
+        return 0;
+    }
+
+    // Two frames: the await is deferred to the top of the next frame (B2), so one frame
+    // alone publishes without ever awaiting. Driving two closes the pair.
+    mf_test_drive_one_frame();
+    mf_test_drive_one_frame();
+
+    // Checked BEFORE the raw counts: "a batch was published while another was still in
+    // flight" is a strictly more specific diagnosis than "expected 1 publish, got 2", and
+    // both fire on the same fault. Depth is what makes the pairing witness non-idempotent —
+    // a bool would read as perfectly paired through publish(); publish(); await().
+    if (RasterBackend_MFGPU_TestSeamDepthViolations() != 0) {
+        printf("  FAIL submit-split: %u publish(es) issued with a batch already in flight "
+               "(doorbell re-rung for one frame)\n",
+               RasterBackend_MFGPU_TestSeamDepthViolations());
+        return 0;
+    }
+
+    const uint32_t pub1 = RasterBackend_MFGPU_TestPublishCount();
+    const uint32_t awa1 = RasterBackend_MFGPU_TestAwaitCount();
+    if (pub1 != 2) {
+        printf("  FAIL submit-split: expected 2 publishes, got %u\n", pub1);
+        return 0;
+    }
+    if (awa1 != 1) {   // frame 2 awaited frame 1; frame 2's own await is still deferred
+        printf("  FAIL submit-split: expected 1 await after 2 frames, got %u\n", awa1);
+        return 0;
+    }
+
+    // PUBLISH must sit behind the drop guard: a frame the in-flight guard drops rebuilds no
+    // ring, so it must ring no doorbell either. mf_frame_end returns on g_frame_dropped
+    // before blt_end_frame and before the publish. A publish on a dropped frame would
+    // re-ring the doorbell with submit_seq unchanged, over a ring the fabric is still
+    // reading -- the corruption cascade documented at raster_backend_mfgpu.cpp's in-flight
+    // guard.
+    //
+    // AWAIT is different since [Phase 1 B2] deferred it, and the distinction is the point:
+    // the await now runs at the TOP of mf_frame_begin, for the PREVIOUS frame's batch, and
+    // strictly before this frame's drop decision has even been made. So a dropped frame does
+    // legitimately drive exactly one await -- the one belonging to the batch it is waiting
+    // on. Asserting "await must not advance" here would be asserting the pre-deferral
+    // design. What is still load-bearing, and still asserted strictly, is that the doorbell
+    // is untouched; and the await is bounded at one, so a drop run cannot re-enter the
+    // blocking poll frame after frame.
+    RasterBackend_MFGPU_TestSetFabricBusy(1);   // fabric "still busy" -> next frame drops
+    const uint32_t drop0 = RasterBackend_MFGPU_TestDropCount();
+    mf_test_drive_one_frame();                  // must be dropped whole
+    const uint32_t pub2  = RasterBackend_MFGPU_TestPublishCount();
+    const uint32_t awa2  = RasterBackend_MFGPU_TestAwaitCount();
+    const uint32_t drop1 = RasterBackend_MFGPU_TestDropCount();
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);  // restore before any early return below
+
+    // Vacuity guard: if the frame was never actually dropped, "no publish happened" says
+    // nothing about the drop path -- the case would pass for the wrong reason.
+    if (drop1 != drop0 + 1) {
+        printf("  FAIL submit-split: frame was NOT dropped (drops %u -> %u), so the "
+               "no-seam-on-drop check below would pass vacuously\n", drop0, drop1);
+        return 0;
+    }
+    if (pub2 != pub1) {
+        printf("  FAIL submit-split: dropped frame rang the doorbell "
+               "(publish %u->%u) over a ring the fabric is still reading\n", pub1, pub2);
+        return 0;
+    }
+    if (awa2 != awa1 + 1) {   // exactly one: '>' would also accept an await that never ran
+        printf("  FAIL submit-split: dropped frame drove %u awaits, expected at most 1 "
+               "(the previous batch's); a drop run must not re-enter the blocking poll\n",
+               awa2 - awa1);
+        return 0;
+    }
+
+    // ORDER, which the counters above cannot see. On a host build both halves of the seam
+    // are near-no-ops (the MMIO and the poll compile out), so swapping them leaves every
+    // count identical and every case green — measured: with mf_device_submit's two calls
+    // inverted, all 69 cases passed. An await with no batch in flight is the observable
+    // that does distinguish them. On device the inversion polls C_DONE for a sequence that
+    // was never submitted, and times mf_submit_stat from a stale publish timestamp.
+    if (RasterBackend_MFGPU_TestUnpairedAwaits() != 0) {
+        printf("  FAIL submit-split: %u await(s) ran with no batch in flight — publish and "
+               "await are out of order\n", RasterBackend_MFGPU_TestUnpairedAwaits());
+        return 0;
+    }
+
+    // WRITE ORDER INSIDE publish, which neither the counters nor the pairing witness can
+    // see: mf_ctrl_wr's store compiles out on the oracle, so publish's body was invisible.
+    // The contract the fabric actually depends on is that it latches every control word in
+    // its prologue the instant it sees a new C_SUBMIT -- so the doorbell must be written
+    // LAST and the barrier must sit immediately before it, or it latches values the host
+    // had not finished writing. Asserted as the contract rather than as a literal sequence,
+    // so Task 2's C_SRCSEL write (specified before the barrier) does not have to fight it.
+    {
+        // Checked FIRST: if the trace truncated, every ordering claim below is vacuous —
+        // "the doorbell is last" would pass because later entries were dropped, not because
+        // they never happened.
+        if (RasterBackend_MFGPU_TestTraceOverflow() != 0) {
+            printf("  FAIL submit-split: control-write trace overflowed (%u dropped); the "
+                   "ordering assertions below cannot be trusted\n",
+                   RasterBackend_MFGPU_TestTraceOverflow());
+            return 0;
+        }
+        const uint32_t n = RasterBackend_MFGPU_TestTraceLen();
+        if (n < 6) {
+            printf("  FAIL submit-split: publish traced %u control writes, expected >= 6 "
+                   "(4 control words + barrier + doorbell)\n", n);
+            return 0;
+        }
+        if (RasterBackend_MFGPU_TestTraceReg(n - 1) != TC_SUBMIT) {
+            printf("  FAIL submit-split: doorbell is not the LAST control write "
+                   "(last entry is reg %d)\n", RasterBackend_MFGPU_TestTraceReg(n - 1));
+            return 0;
+        }
+        if (RasterBackend_MFGPU_TestTraceReg(n - 2) != TC_BARRIER) {
+            printf("  FAIL submit-split: no memory barrier immediately before the doorbell "
+                   "(entry before it is reg %d)\n", RasterBackend_MFGPU_TestTraceReg(n - 2));
+            return 0;
+        }
+        // Every control word present exactly once, and all of them before the barrier.
+        const int need[4] = { TC_CMDCOUNT, TC_TARGET, TC_CLEAR, TC_FLAGS };
+        static const char *nm[4] = { "C_CMDCOUNT", "C_TARGET", "C_CLEAR", "C_FLAGS" };
+        for (int k = 0; k < 4; k++) {
+            int seen = 0;
+            for (uint32_t i = 0; i + 2 < n; i++)             // [0, barrier)
+                if (RasterBackend_MFGPU_TestTraceReg(i) == need[k]) seen++;
+            if (seen != 1) {
+                printf("  FAIL submit-split: %s written %d times before the barrier, "
+                       "expected exactly 1\n", nm[k], seen);
+                return 0;
+            }
+        }
+        // ...and the doorbell exactly once overall.
+        int subs = 0;
+        for (uint32_t i = 0; i < n; i++)
+            if (RasterBackend_MFGPU_TestTraceReg(i) == TC_SUBMIT) subs++;
+        if (subs != 1) {
+            printf("  FAIL submit-split: doorbell written %d times in one publish, "
+                   "expected exactly 1\n", subs);
+            return 0;
+        }
+    }
+
+    printf("  OK   submit-split  publish=%u await=%u; dropped frame rang no doorbell; "
+           "0 unpaired awaits; doorbell last after barrier\n", pub1, awa1);
+    return 1;
+}
+
+// [Phase 1 A4] The covered-pixel derivation is pure arithmetic over fabric-sourced values.
+// Whether C_FLAGS.hi means what we think is untestable off-device -- but the arithmetic over
+// it is a total function, and fusing the two is what let a provenance bug survive into the
+// very change meant to make provenance explicit: the "estimated" marker covered cyc_px but
+// not overdraw, though BOTH derive from the same denominator.
+static int case_cov_derivation(void) {
+    const double SCREEN = 288.0 * 216.0, MHZ = 98.4375, DPATH = 10.0;
+    double den, cyc, ovd, ratio; int est;
+
+    // Exact path: the fabric reported a real count, so everything derives from it.
+    RasterBackend_MFGPU_TestDeriveCov(DPATH, /*exact=*/100000.0, /*est=*/120000.0,
+                                      SCREEN, MHZ, &den, &cyc, &ovd, &ratio, &est);
+    if (est != 0 || den != 100000.0) {
+        printf("  FAIL cov-derive: exact count ignored (estimated=%d den=%.0f)\n", est, den);
+        return 0;
+    }
+    if (ovd != den / SCREEN) {
+        printf("  FAIL cov-derive: overdraw not derived from the same denominator as cyc_px "
+               "(%.4f vs %.4f)\n", ovd, den / SCREEN);
+        return 0;
+    }
+    if (ratio < 1.19 || ratio > 1.21) {
+        printf("  FAIL cov-derive: est_ratio %.3f, expected ~1.20\n", ratio);
+        return 0;
+    }
+
+    // Fallback path: fabric reports 0 (a bitstream without A4 -- the OPERATIVE path today).
+    RasterBackend_MFGPU_TestDeriveCov(DPATH, /*exact=*/0.0, /*est=*/120000.0,
+                                      SCREEN, MHZ, &den, &cyc, &ovd, &ratio, &est);
+    if (est != 1 || den != 120000.0) {
+        printf("  FAIL cov-derive: fallback did not engage (estimated=%d den=%.0f)\n", est, den);
+        return 0;
+    }
+    // THE bug this case exists for: overdraw and cyc_px must BOTH follow the fallback, so a
+    // single provenance marker covers both. If overdraw were computed from the exact value
+    // it would silently mean something different from the label on the line.
+    if (ovd != 120000.0 / SCREEN) {
+        printf("  FAIL cov-derive: overdraw did not follow the fallback (%.4f, expected "
+               "%.4f) -- the line's provenance marker would be wrong for this field\n",
+               ovd, 120000.0 / SCREEN);
+        return 0;
+    }
+    if (cyc <= 0.0) {
+        printf("  FAIL cov-derive: fallback produced cyc_px=%.2f; a zero here reads as "
+               "'pixels are free'\n", cyc);
+        return 0;
+    }
+    if (ratio >= 0.0) {
+        printf("  FAIL cov-derive: est_ratio=%.2f on the fallback; must signal n/a rather "
+               "than put an out-of-domain value in a field whose invariant is >= 1.0\n", ratio);
+        return 0;
+    }
+
+    // Degenerate: no covered pixels at all must not divide by zero.
+    RasterBackend_MFGPU_TestDeriveCov(DPATH, 0.0, 0.0, SCREEN, MHZ, &den, &cyc, &ovd, &ratio, &est);
+    if (cyc != 0.0 || ovd != 0.0) {
+        printf("  FAIL cov-derive: empty frame produced cyc_px=%.2f overdraw=%.4f\n", cyc, ovd);
+        return 0;
+    }
+    printf("  OK   cov-derive  exact/fallback/degenerate all consistent; overdraw and cyc_px "
+           "share one provenance\n");
+    return 1;
+}
+
+// [Phase 1 B2] The await must move to the top of the NEXT frame, so Process() for
+// frame N+1 runs between the doorbell for N and the wait for N. The barrier is the
+// first control-word write of N+1, not the end of N's present(): C_CMDCOUNT/C_TARGET/
+// C_CLEAR/C_FLAGS/C_SRCSEL are a SINGLE shared block, so they must not be rewritten
+// until the fabric has consumed the previous frame's values.
+static int case_await_deferred_one_frame(void) {
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+
+    mf_test_drive_one_frame();          // frame 1: publishes, must NOT await
+    const uint32_t pub1 = RasterBackend_MFGPU_TestPublishCount();
+    const uint32_t awa1 = RasterBackend_MFGPU_TestAwaitCount();
+    if (pub1 != 1 || awa1 != 0) {
+        printf("  FAIL await-deferred: after frame 1 expected pub=1 await=0, "
+               "got pub=%u await=%u\n", pub1, awa1);
+        return 0;
+    }
+
+    mf_test_drive_one_frame();          // frame 2: awaits frame 1, then publishes
+    const uint32_t pub2 = RasterBackend_MFGPU_TestPublishCount();
+    const uint32_t awa2 = RasterBackend_MFGPU_TestAwaitCount();
+    if (pub2 != 2 || awa2 != 1) {
+        printf("  FAIL await-deferred: after frame 2 expected pub=2 await=1, "
+               "got pub=%u await=%u\n", pub2, awa2);
+        return 0;
+    }
+    // The seam invariants must survive the deferral: with publish and await now separated
+    // across a frame boundary they are no longer trivially paired by a common caller.
+    if (RasterBackend_MFGPU_TestUnpairedAwaits() != 0 ||
+        RasterBackend_MFGPU_TestSeamDepthViolations() != 0) {
+        printf("  FAIL await-deferred: seam invariants broke under deferral "
+               "(unpaired=%u depth_violations=%u)\n",
+               RasterBackend_MFGPU_TestUnpairedAwaits(),
+               RasterBackend_MFGPU_TestSeamDepthViolations());
+        return 0;
+    }
+    printf("  OK   await-deferred  one frame of slack (pub=%u await=%u)\n", pub2, awa2);
+    return 1;
+}
+
+// [Phase 1 B1] The ring and vertex buffer must alternate between two arenas so the host
+// can build frame N+1 in one while the fabric reads N from the other. Without this, the
+// deferred poll in Task 4 reproduces the documented corruption cascade
+// (raster_backend_mfgpu.cpp:707): re-staging straight over a batch the fabric is
+// mid-way through reading.
+static int case_arena_alternates(void) {
+    RasterBackend_MFGPU_TestReinit(0);
+
+    uint32_t seen[4];
+    uintptr_t ring[4], vtx[4];
+    for (int i = 0; i < 4; i++) {
+        mf_test_drive_one_frame();
+        seen[i] = RasterBackend_MFGPU_TestArena();
+        ring[i] = RasterBackend_MFGPU_TestRingBase();
+        vtx[i]  = RasterBackend_MFGPU_TestVtxBase();
+    }
+
+    // Alternating, not stuck and not free-running.
+    if (!(seen[0] != seen[1] && seen[1] != seen[2] && seen[2] != seen[3])) {
+        printf("  FAIL arena-alt: not alternating (%u %u %u %u)\n",
+               seen[0], seen[1], seen[2], seen[3]);
+        return 0;
+    }
+    if (seen[0] != seen[2] || seen[1] != seen[3]) {
+        printf("  FAIL arena-alt: period is not 2 (%u %u %u %u)\n",
+               seen[0], seen[1], seen[2], seen[3]);
+        return 0;
+    }
+    // The two arenas must be genuinely disjoint memory, not the same base relabelled.
+    if (ring[0] == ring[1] || vtx[0] == vtx[1]) {
+        printf("  FAIL arena-alt: arenas share memory (ring %p/%p vtx %p/%p)\n",
+               (void*)ring[0], (void*)ring[1], (void*)vtx[0], (void*)vtx[1]);
+        return 0;
+    }
+    if (ring[0] != ring[2] || vtx[0] != vtx[2]) {
+        printf("  FAIL arena-alt: arena 0 base moved between frames\n");
+        return 0;
+    }
+    printf("  OK   arena-alt  ring %p/%p vtx %p/%p\n",
+           (void*)ring[0], (void*)ring[1], (void*)vtx[0], (void*)vtx[1]);
+    return 1;
+}
+
+// [Phase 1 B1, Step 6b] The ring-select BIT must track g_arena. Position alone is not
+// enough: Task 1's trace proves WHERE a control write happened, not WHAT was written, and
+// a bit stuck at 0 selects ring A every frame, passes every ordering assertion already in
+// place, and surfaces only as the fabric reading a ring the host never wrote — no build
+// error, no test failure, garbage geometry on device.
+//   frame N   : arena a  -> C_SRCSEL bit 2 == a
+//   frame N+1 : arena !a -> C_SRCSEL bit 2 == !a
+// Both are asserted, because a stuck bit passes on whichever frame happens to match.
+static int case_ringsel_value_tracks_arena(void) {
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+
+    // Seed the f2h write-throttle field (bits 15:8) so "preserved" is a real claim and not
+    // a vacuous 0 == 0. Clobbering it is a silent performance regression, not a failure.
+    const uint32_t THROTTLE = 0x3700u;          // bits 15:8 = 0x37
+    RasterBackend_MFGPU_TestSetCtrlSrcsel(THROTTLE);
+
+    uint32_t arena[2] = {0,0}, sel[2] = {0,0};
+    for (int i = 0; i < 2; i++) {
+        mf_test_drive_one_frame();
+        arena[i] = RasterBackend_MFGPU_TestArena();
+        int at = -1;
+        for (uint32_t k = 0; k < RasterBackend_MFGPU_TestTraceLen(); k++)
+            if (RasterBackend_MFGPU_TestTraceReg(k) == TC_SRCSEL) at = (int)k;
+        if (at < 0) {
+            printf("  FAIL ringsel: frame %d's publish wrote no C_SRCSEL at all\n", i);
+            return 0;
+        }
+        sel[i] = RasterBackend_MFGPU_TestTraceVal((uint32_t)at);
+    }
+
+    // The two frames must genuinely differ, or a stuck bit is indistinguishable.
+    if (arena[0] == arena[1]) {
+        printf("  FAIL ringsel: arena did not alternate across the two frames (%u, %u); "
+               "a stuck select bit would be undetectable\n", arena[0], arena[1]);
+        return 0;
+    }
+    for (int i = 0; i < 2; i++) {
+        const uint32_t bit = (sel[i] >> 2) & 1u;
+        if (bit != arena[i]) {
+            printf("  FAIL ringsel: frame %d wrote C_SRCSEL=0x%08X -> bit2=%u, arena=%u "
+                   "(fabric would read the wrong ring)\n", i, sel[i], bit, arena[i]);
+            return 0;
+        }
+        if ((sel[i] & 0xFF00u) != THROTTLE) {
+            printf("  FAIL ringsel: frame %d clobbered the f2h throttle field: "
+                   "wrote 0x%08X, bits15:8=0x%02X want 0x37\n",
+                   i, sel[i], (sel[i] >> 8) & 0xFFu);
+            return 0;
+        }
+    }
+    printf("  OK   ringsel  bit2 tracked arena across both frames (0x%08X / 0x%08X), "
+           "throttle preserved\n", sel[0], sel[1]);
+    return 1;
+}
+
+// [Phase 1 B3] Texture heap capped to hold exactly ONE page and no more.
+// Arithmetic, since the whole case turns on it: the pages below are 512x512 RGB565, so
+// 512 * 512 * 2 = 524288 B = 512 KiB each. A 768 KiB cap admits one (256 KiB slack) and
+// cannot admit a second (1024 KiB > 768 KiB), so the second texture cannot be admitted
+// without evicting the first. Same shape as case_eviction's 1.25 MB for two such pages.
+//
+// Deliberately NOT the "two textures fit, a third evicts" sizing the plan suggested: with
+// two pages resident nothing is ever under pressure in a three-frame test, evict_one_lru is
+// never called, and the case passes IDENTICALLY with and without the two-frame floor. That
+// is the vacuity this task was hardened against, reachable straight from the plan's text.
+enum { MF_TEST_TINY_HEAP = 768u * 1024u };
+
+// Drive one frame that uses exactly one keyed texture.
+// Deliberately not routed through draw_tagged/battery_case_key: under the CORRECT two-frame
+// floor the second texture's upload is refused (its only eviction candidate is pinned) and
+// the draw is dropped — the designed safe behaviour, documented at case_intra_frame_no_alias
+// — but the SW oracle still draws it, so a parity comparison would report that as a failure.
+static void mf_test_drive_frame_with_texture(uint32_t key, uint8_t tag) {
+    enum { TW = 512, TH = 512 };
+    static uint8_t buf[TW*TH*4];
+    for (int i = 0; i < TW*TH; i++) { buf[i*4]=tag; buf[i*4+1]=tag; buf[i*4+2]=tag; buf[i*4+3]=255; }
+    RTexture t = { buf, TW, TH, 1, 1, 0, 1 };
+    BVtx v[3] = { {0,0,0,0,1,1,1,1}, {200,0,1,0,1,1,1,1}, {0,150,0,1,1,1,1,1} };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, key);
+    backend_mfgpu.frame_end();
+}
+
+// [Phase 1 B3] With two frames in flight, a texture touched in frame N is still being read
+// by the fabric while the host builds N+1. The eviction floor must therefore protect the
+// last TWO frames, not one. Re-staging over a texture the fabric is mid-read produces no
+// error at all — just garbage, the same silent class as the cascade at :707.
+//
+//   frame 1: texture A  -> uploaded, sole resident
+//   frame 2: texture B  -> heap full. A was touched LAST frame, so it is still live to the
+//                          fabric. A one-frame floor evicts it; a two-frame floor refuses,
+//                          and B's draw is dropped instead (safe, and designed).
+//   frame 3: texture A  -> must be a cache HIT. If A was evicted in frame 2 this re-uploads.
+static int case_lru_protects_two_frames(void) {
+    RasterBackend_MFGPU_TestReinit(MF_TEST_TINY_HEAP);
+
+    mf_test_drive_frame_with_texture(/*key=*/1, /*tag=*/40);
+    const uint32_t up_after_1 = RasterBackend_MFGPU_TestUploadCount();
+    const uint32_t ev_after_1 = RasterBackend_MFGPU_TestEvictAttempts();
+
+    mf_test_drive_frame_with_texture(/*key=*/2, /*tag=*/200);
+    // Frame 2 exhausted the heap (its only eviction candidate was pinned), which is a
+    // DIFFERENT overflow path from the cache-full refusal and carries the opposite remedy.
+    // Captured before frame 3 resets it. Path 3 is the one the two-frame floor made more
+    // reachable, so mislabelling it as a ring overflow is the most likely wrong turn.
+    const int ovf_cause_frame2 = RasterBackend_MFGPU_TestFrameOvfCause();
+    mf_test_drive_frame_with_texture(/*key=*/1, /*tag=*/40);
+
+    const uint32_t up_after_3 = RasterBackend_MFGPU_TestUploadCount();
+    const uint32_t ev_after_3 = RasterBackend_MFGPU_TestEvictAttempts();
+
+    // VACUITY GUARD, checked BEFORE concluding anything from A's survival. If the heap never
+    // filled, A survived because nothing was ever under pressure — and "A survived" would
+    // read as success while testing nothing. A later change to the heap cap or the texture
+    // size could reintroduce that silently; this assertion is what makes it loud.
+    if (ev_after_3 == ev_after_1) {
+        printf("  FAIL lru-2frame: the heap was never under pressure (evict attempts %u -> "
+               "%u); A's survival proves nothing and this case is vacuous\n",
+               ev_after_1, ev_after_3);
+        return 0;
+    }
+    if (up_after_3 != up_after_1) {
+        printf("  FAIL lru-2frame: uploads %u -> %u; texture A was evicted while still live "
+               "to the fabric\n", up_after_1, up_after_3);
+        return 0;
+    }
+    if (ovf_cause_frame2 != OVF_HEAP_FULL) {
+        printf("  FAIL lru-2frame: heap exhaustion recorded as cause %d, expected %d "
+               "(HEAP_FULL); the frame would be misreported and the wrong lever pulled\n",
+               ovf_cause_frame2, OVF_HEAP_FULL);
+        return 0;
+    }
+    printf("  OK   lru-2frame  A survived an intervening frame under real heap pressure "
+           "(uploads %u, evict attempts %u)\n", up_after_3, ev_after_3 - ev_after_1);
+    return 1;
+}
+
+// [Phase 1 B3] The SECOND site the lagging floor governs: the pin-aware insert guard, which
+// fires when the 256-slot cache TABLE is full (not when the heap is). It must protect the
+// previous frame's entries for the same reason eviction must -- the fabric is still reading
+// that frame's batch. Heap pressure never reaches this path, so case_lru_protects_two_frames
+// cannot cover it: reverting this one guard alone leaves the whole suite green.
+//
+//   frame 1: fill all 256 slots. Key 1 is the global LRU from here on.
+//   frame 2: a 257th key. The table is full and the LRU victim (key 1) was touched LAST
+//            frame, so it is still live. Must be refused, not overwritten.
+//   frame 3: key 1 must still be resident -- a cache hit, no re-upload.
+static int case_pin_insert_protects_two_frames(void) {
+    RasterBackend_MFGPU_TestReinit(0);
+    static const uint8_t px[4] = { 90, 90, 90, 255 };
+    RTexture t = { px, 1, 1, 1, 1, 0, 1 };
+    BVtx v[3] = { {1,1,0,0,1,1,1,1}, {30,1,1,0,1,1,1,1}, {1,30,0,1,1,1,1,1} };
+    static uint8_t rgba[BW*BH*4];
+    RSurface s = { rgba, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba);
+
+    // Driven from the backend's own slot count, never a literal: a hardcoded 256 silently
+    // stops filling the table the moment MF_TEX_CACHE_N grows, and the case goes vacuous
+    // with nothing failing anywhere.
+    const uint32_t slots = RasterBackend_MFGPU_TestTexCacheSlots();
+
+    backend_mfgpu.frame_begin();
+    for (uint32_t k = 1; k <= slots; k++)
+        backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, k);
+    backend_mfgpu.frame_end();
+    const uint32_t up1 = RasterBackend_MFGPU_TestUploadCount();
+
+    // VACUITY GUARD 1 — the table must actually be full. If it is not, frame 2's insert
+    // finds a free slot, never reaches the pin-aware guard, and everything below passes
+    // while testing nothing.
+    if (up1 != slots) {
+        printf("  FAIL pin-insert-2frame: table not saturated (%u uploads for %u slots); "
+               "the pin-aware guard is unreachable and this case is vacuous\n", up1, slots);
+        return 0;
+    }
+
+    const uint32_t drops1 = RasterBackend_MFGPU_TestCacheFullDrops();
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, /*one key past the table=*/9999);
+    backend_mfgpu.frame_end();
+    const uint32_t up2    = RasterBackend_MFGPU_TestUploadCount();
+    const uint32_t drops2 = RasterBackend_MFGPU_TestCacheFullDrops();
+
+    // VACUITY GUARD 2 — the guard must actually have refused the insert. Note this cannot be
+    // inferred from the upload count: g_upload_count is bumped BEFORE the pin-aware guard
+    // runs and the refusal then undoes the upload, so a refused insert still counts as one
+    // (up2 == up1 + 1 even when the code is correct). Hence a dedicated refusal witness.
+    if (drops2 == drops1) {
+        printf("  FAIL pin-insert-2frame: the full-table insert was never refused "
+               "(cache-full drops %u -> %u); the guard did not fire\n", drops1, drops2);
+        return 0;
+    }
+
+    // Ordered AFTER guard 2 deliberately: the recorded cause is DERIVED from the refusal,
+    // and the refusal is the fundamental fact. Checking it first would report a mechanism
+    // failure ("the cause was not recorded") as a diagnostic-plumbing problem and send the
+    // reader to the logging rather than to the guard. Most fundamental cause first, most
+    // derived symptom last.
+    //
+    // Diagnostic-only, and asserted anyway because a WRONG cause causes a WRONG ACTION:
+    // cache-full and heap-full have opposite remedies (more cache slots vs. more heap bytes)
+    // and this message is an input to the device A/B's drop attribution.
+    if (RasterBackend_MFGPU_TestFrameOvfCause() != OVF_CACHE_FULL) {
+        printf("  FAIL pin-insert-2frame: overflow cause recorded as %d, expected %d "
+               "(CACHE_FULL); the frame would be misreported and the wrong lever pulled\n",
+               RasterBackend_MFGPU_TestFrameOvfCause(), OVF_CACHE_FULL);
+        return 0;
+    }
+
+    backend_mfgpu.frame_begin();
+    backend_mfgpu.draw(&s, v, 1, &t, RB_NONE, 0.f, /*the LRU victim=*/1);
+    backend_mfgpu.frame_end();
+    const uint32_t up3 = RasterBackend_MFGPU_TestUploadCount();
+
+    // ATTRIBUTION NOTE: guard 2 above shadows this check. Reverting the pin-aware guard
+    // makes the case return there (the insert was never refused), so this assertion is not
+    // reached and no mutation in the current set falsifies it. Both are kept deliberately —
+    // guard 2 checks the MECHANISM fired, this checks the OUTCOME held — but this one must
+    // not be credited with catching the reverted-guard mutation. It is the backstop for a
+    // future fault where the guard fires and the entry is clobbered anyway.
+    if (up3 != up2) {
+        printf("  FAIL pin-insert-2frame: uploads %u -> %u; the previous frame's LRU entry "
+               "was overwritten in the cache table while still live to the fabric\n", up2, up3);
+        return 0;
+    }
+    printf("  OK   pin-insert-2frame  %u slots filled, insert refused, prior-frame entry "
+           "survived (uploads steady at %u)\n", slots, up3);
     return 1;
 }
 
@@ -1801,6 +2430,20 @@ int main(void){
     else printf("raster_backend mfgpu-inflight-drop OK\n");
     if (!case_inflight_drop_limit()) { printf("FAIL mfgpu-inflight-drop-limit\n"); ok = 0; }
     else printf("raster_backend mfgpu-inflight-drop-limit OK\n");
+    if (!case_submit_publish_await_split()) { printf("FAIL mfgpu-submit-split\n"); ok = 0; }
+    else printf("raster_backend mfgpu-submit-split OK\n");
+    if (!case_cov_derivation()) { printf("FAIL mfgpu-cov-derive\n"); ok = 0; }
+    else printf("raster_backend mfgpu-cov-derive OK\n");
+    if (!case_await_deferred_one_frame()) { printf("FAIL mfgpu-await-deferred\n"); ok = 0; }
+    else printf("raster_backend mfgpu-await-deferred OK\n");
+    if (!case_arena_alternates()) { printf("FAIL mfgpu-arena-alt\n"); ok = 0; }
+    else printf("raster_backend mfgpu-arena-alt OK\n");
+    if (!case_ringsel_value_tracks_arena()) { printf("FAIL mfgpu-ringsel\n"); ok = 0; }
+    else printf("raster_backend mfgpu-ringsel OK\n");
+    if (!case_lru_protects_two_frames()) { printf("FAIL mfgpu-lru-2frame\n"); ok = 0; }
+    else printf("raster_backend mfgpu-lru-2frame OK\n");
+    if (!case_pin_insert_protects_two_frames()) { printf("FAIL mfgpu-pin-insert-2frame\n"); ok = 0; }
+    else printf("raster_backend mfgpu-pin-insert-2frame OK\n");
     if (!case_opaque_alpha_to_copy()) { printf("FAIL mfgpu-opaque-alpha-copy\n"); ok = 0; }
     else printf("raster_backend mfgpu-opaque-alpha-copy OK\n");
     if (!case_dup_draw_elision()) { printf("FAIL mfgpu-dup-draw\n"); ok = 0; }

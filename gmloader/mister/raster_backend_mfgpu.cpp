@@ -72,6 +72,8 @@ extern "C" {
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   // getenv (GMLOADER_MFGPU_HEAPLOG diagnostic, Task 9 bring-up)
+#include <time.h>     // [Phase 1 B2] clock_gettime for the publish timestamp, which is
+                      // recorded in BOTH builds (mf_device_publish is not device-only)
 
 // The mfgpu backend scans the fabric FB out as the display verbatim — the two
 // geometry roots must be identical (native-288x216 single-source rule).
@@ -85,8 +87,15 @@ extern "C" const RasterBackend backend_sw;   /* FBO / RB_PREMULT fallback */
 // One frame's worth of host-side emitter buffers. Static/file-scope is fine for
 // this single-threaded backend; Task 6 points these at the real DDR ring/heap.
 enum {
-    MF_RING_CAP    = 64 * 1024,
-    MF_VTX_REGION  = 128 * 1024,                 // per-frame TRILIST vertex buffer
+    MF_RING_CAP    = 64 * 1024,                  // capacity of ONE host-oracle ring arena
+    // [Phase 1 B1] DOUBLE-BUFFERED vertex region: two 128 KiB halves, alternated per
+    // frame, so the host can build frame N+1's vertices while the fabric reads N's.
+    // Grown rather than split because 128 KiB is ~2730 triangles of headroom and halving
+    // it is a real ceiling; the cost is 128 KiB out of a ~14.4 MiB texture heap.
+    // Needs NO RTL change: TRILIST commands carry the vertex offset, so the fabric
+    // follows wherever blt_vtx_buf_init points.
+    MF_VTX_HALF    = 128 * 1024,                 // one frame's TRILIST vertex buffer
+    MF_VTX_REGION  = 2 * MF_VTX_HALF,            // both halves; heap starts above this
     MF_TEX_HEAP    = 32u * 1024 * 1024,          // persistent texture pages (32MB)
     MF_SRCDRAM_CAP = MF_VTX_REGION + MF_TEX_HEAP,
     MF_MAX_CMDS    = MF_RING_CAP / BLT_CMD_BYTES,
@@ -99,7 +108,10 @@ enum {
     // default). Every entry is a real heap page, but each sub-rect is a few KB.
     MF_TEX_CACHE_N = 256,                         // resident-page table size
 };
-static uint8_t       g_ring[MF_RING_CAP];
+// [Phase 1 B1] TWO host-oracle ring arenas. The device has ring A/ring B at fixed DDR
+// offsets; the oracle needs the same disjointness or the alternation is untestable and
+// case_arena_alternates would be asserting against one buffer relabelled.
+static uint8_t       g_ring[2][MF_RING_CAP];
 // Deliberate ~40MB static footprint (32MB texture heap here + 8MB conversion
 // scratch below): safe and unremarkable on the MiSTer ARM's DDR3, not a
 // mistake to "optimize away".
@@ -139,6 +151,7 @@ static MfTexEntry g_texcache[MF_TEX_CACHE_N];
 static uint64_t   g_lru_clock   = 0;
 static uint32_t   g_upload_count = 0;   // real blt_upload calls since reinit (test hook)
 static uint32_t   g_stage_count  = 0;   // BLT_OP_STAGE emits since reinit (FO Task 3 test hook)
+static uint32_t g_arena            = 0;      // [Phase 1 B1] which arena this frame owns (0/1)
 static bool     g_fabric_pending   = false;  // a submitted batch has not been acked yet
 static uint32_t g_pending_seq      = 0;      // the submit_seq we are waiting on
 static bool     g_frame_dropped    = false;  // this frame is being dropped (emit nothing)
@@ -248,6 +261,72 @@ static uint32_t   g_tex_heap_cap = 0;   // 0 => full MF_TEX_HEAP; else test over
 // draw onto different pixels. evict_one_lru() only considers entries with
 // .lru <= floor (untouched this frame) as eviction candidates.
 static uint64_t   g_lru_frame_floor = 0;
+// [Phase 1 B3] How many times eviction was ATTEMPTED (not how many succeeded). A retention
+// test that cannot show the heap was under pressure cannot distinguish "the texture was
+// protected" from "nothing was ever at risk"; this is what makes that distinction assertable.
+static uint32_t   g_evict_attempts = 0;
+// [Phase 1 B3] Times the pin-aware INSERT guard refused a full-table insert. The direct
+// witness that that guard fired: the upload counter cannot serve, because g_upload_count is
+// bumped before the guard runs and the refusal then undoes the upload -- so a refused insert
+// still counts as an upload.
+static uint32_t   g_cachefull_drops = 0;
+// [Phase 1 B3] Why did THIS frame overflow? THREE paths reach mf_frame_end's overflow
+// branch, and they have three DIFFERENT remedies -- so a message naming the wrong one sends
+// the reader to the wrong lever, which is worse than saying nothing:
+//
+//   CACHE_FULL - the cache TABLE was full and every entry was pinned by the last two
+//                frames. Remedy: more slots (MF_TEX_CACHE_N), or fewer DISTINCT textures
+//                per frame. NOT heap bytes -- the heap can be nearly empty when this fires.
+//   HEAP_FULL  - texture BYTES exhausted even after eviction. Remedy: size the heap.
+//                This is the path the two-frame retention floor made more reachable, since
+//                protecting two frames strictly shrinks the eviction-eligible set.
+//   UNKNOWN    - neither refusal was recorded, so ring/vertex capacity is what remains.
+//                Phrased as what is left rather than asserted, because nothing observed it.
+//
+// FIRST cause wins, and that is a CORRECTNESS MECHANISM rather than a tie-break preference --
+// do not "simplify" it to last-wins.
+//
+// mf_draw's four staging-failure sites CANNOT distinguish the two causes: stage_texture
+// returns an invalid ref for a heap-byte exhaustion and for a pin-aware table refusal alike
+// (the cache-full guard returns `bad.valid = 0`, exactly as the !ref.valid path does). So all
+// four blanket-assert MF_OVF_HEAP_FULL on any staging failure. That is correct ONLY because
+// the cache-full path already called mf_note_ovf_cause(MF_OVF_CACHE_FULL) deeper in the
+// stack, inside mf_upload_and_cache, before returning -- and first-wins then discards the
+// outer, coarser claim.
+//
+// Flip this to last-wins and EVERY cache-full frame reports as heap-full: the precise defect
+// this enum exists to fix, restored, and pointing readers at the wrong lever again. The
+// outer sites depend on the inner note having landed first.
+//
+// (Secondary, and the reason first-wins is also the right reading: the refusal that started
+// the frame's trouble is the informative one; a later different failure is usually its
+// consequence.)
+enum MfOvfCause { MF_OVF_UNKNOWN = 0, MF_OVF_CACHE_FULL = 1, MF_OVF_HEAP_FULL = 2 };
+static MfOvfCause g_frame_ovf_cause = MF_OVF_UNKNOWN;
+static inline void mf_note_ovf_cause(MfOvfCause c) {
+    if (g_frame_ovf_cause == MF_OVF_UNKNOWN) g_frame_ovf_cause = c;
+}
+// One definition, used by both the device and oracle overflow sites, so the two cannot drift.
+static const char *mf_ovf_cause_str(void) {
+    switch (g_frame_ovf_cause) {
+    case MF_OVF_CACHE_FULL:
+        return "(CACHE-FULL: every texture-cache slot was pinned by the last two frames -- "
+               "raise MF_TEX_CACHE_N or draw fewer distinct textures per frame; this is NOT "
+               "a heap-size problem)";
+    case MF_OVF_HEAP_FULL:
+        return "(HEAP-FULL: texture bytes exhausted even after eviction -- size the texture "
+               "heap, not the ring)";
+    default:
+        return "(no heap or cache-full refusal was recorded this frame; ring/vertex capacity "
+               "is the remaining cause)";
+    }
+}
+// [Phase 1 B3] The floor EVICTION compares against, which lags g_lru_frame_floor by one
+// frame. With the ring double-buffered the host builds frame N+1 while the fabric is still
+// reading N, so a texture touched in N is live even though N is "over". Evicting or
+// re-staging it writes straight over memory the fabric is mid-read — the same class of
+// failure as the in-flight-batch cascade at :707, and just as silent.
+static uint64_t   g_lru_evict_floor = 0;
 
 // Free the least-recently-used cached entry that is NOT pinned by this
 // frame (see g_lru_frame_floor above). Returns false if no unpinned entry
@@ -470,8 +549,102 @@ static int mf_stat_on(void) {
 
 static double g_cov_px_accum = 0.0;
 
+// [Phase 1 A4] The derived covered-pixel figures, as a PURE function of its inputs.
+//
+// Deliberately outside #ifdef MISTER_NATIVE_VIDEO and free of globals. Reading C_FLAGS.hi
+// needs a fabric and cannot be tested off-device -- but the arithmetic OVER that value is a
+// total function with definite correct behaviour, and is testable anywhere. Keeping the two
+// fused is what let a provenance bug (the "estimated" marker covering cyc_px but not
+// overdraw, though both derive from the same denominator) survive into a change whose entire
+// purpose was making provenance explicit.
+struct MfCovDerived {
+    double cov_den;     // the denominator actually used
+    double cyc_px;      // dpath_ms * clk_MHz * 1000 / cov_den
+    double overdraw;    // cov_den / screen_px
+    double est_ratio;   // cov_est / cov_exact; < 0 means "not computable"
+    int    estimated;   // 1 = fell back to the estimate; cov_den is NOT the fabric's count
+};
+static MfCovDerived mf_derive_cov(double dpath_ms, double cov_exact, double cov_est,
+                                  double screen_px, double clk_mhz) {
+    MfCovDerived d;
+    // Fall back when the fabric reports nothing -- an older bitstream without A4, where
+    // C_FLAGS.hi reads 0. Without this, cyc_px divides by zero and prints 0.0, which reads
+    // as "pixels are free": the most misleading possible output for a perf task.
+    d.estimated = (cov_exact > 1.0) ? 0 : 1;
+    d.cov_den   = d.estimated ? cov_est : cov_exact;
+    d.cyc_px    = (d.cov_den > 1.0) ? (dpath_ms * clk_mhz * 1000.0) / d.cov_den : 0.0;
+    d.overdraw  = (screen_px > 0.0) ? d.cov_den / screen_px : 0.0;
+    // Only meaningful against a real exact count. Reporting 0.00 would put an out-of-domain
+    // value in a field whose invariant is >= 1.0 (the estimate is blind to per-pixel
+    // rejection, so it must over-count, never under-count).
+    d.est_ratio = d.estimated ? -1.0 : cov_est / cov_exact;
+    return d;
+}
+
+
 static void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2, float y2) {
     g_cov_px_accum += mf_clip_tri_area(x0, y0, x1, y1, x2, y2);
+}
+
+// ── CONTROL-BLOCK REGISTER INDICES + WRITE TRACE (Phase 1 B2) ────────────────
+// Hoisted out of the device block so mf_device_publish's body can compile in BOTH builds.
+// These are qword indices into BLTCTRL, the wire contract in
+// 3rdparty/mfgpu/docs/blitter-protocol.md §2 — not addresses, so they are build-independent.
+enum {
+    MF_C_SUBMIT = 0, MF_C_CMDCOUNT = 1, MF_C_TARGET = 2, MF_C_CLEAR = 3,
+    MF_C_FLAGS = 4, MF_C_DONE = 5, MF_C_STATUS = 6, MF_C_SRCSEL = 7,
+};
+
+// [Phase 1 B2] Publish writes a SINGLE shared control block and the fabric latches every
+// word of it in its prologue the moment it sees a new C_SUBMIT. So the ORDER of these
+// writes is the contract, not an implementation detail: the doorbell must be last and the
+// barrier must precede it, or the fabric latches values the host had not finished writing.
+//
+// None of that was observable on the host oracle. mf_ctrl_wr's store compiles out there, so
+// publish's entire body was invisible: counters see how many times the seam ran, the
+// pairing witness sees in what order its two halves ran, and neither reaches INSIDE publish.
+// Measured escapes before this shim, each passing all 69 cases: barrier moved after the
+// doorbell, C_SUBMIT written first, and any single control word simply deleted.
+//
+// So mf_ctrl_wr records every write to a trace buffer in both builds and stores only on
+// device — the same lift that made the seam itself testable, applied one level down.
+//
+// The trace is HOST-ONLY. Nothing on device ever reads it, and compiling it in would perturb
+// the exact path the shim exists to protect — so on a device build mf_ctrl_wr below is
+// byte-for-byte the volatile store it always was. Nothing is lost: the write ORDER lives in
+// publish's source, which is identical in both builds, so checking it on the oracle checks
+// the order the device executes.
+enum { MF_TRACE_MAX = 32, MF_TRACE_BARRIER = -1 };   // -1 is not a valid qword index
+struct MfCtrlTraceEnt { int reg; uint32_t val; };
+static MfCtrlTraceEnt g_ctrl_trace[MF_TRACE_MAX];
+static uint32_t       g_ctrl_trace_n        = 0;
+static uint32_t       g_ctrl_trace_overflow = 0;   // sticky; asserted 0 by the host test
+
+static inline void mf_trace_add(int reg, uint32_t v) {
+#ifndef MISTER_NATIVE_VIDEO
+    if (g_ctrl_trace_n >= MF_TRACE_MAX) {
+        // FAIL LOUDLY. A trace that silently truncates makes the ordering assertion vacuous:
+        // "the doorbell is last" would pass because the later writes were dropped, not
+        // because they never happened. Sticky, so it cannot be missed by a later reset.
+        if (!g_ctrl_trace_overflow)
+            fprintf(stderr, "backend_mfgpu: FATAL control-write trace overflow (>%d entries "
+                            "in one publish) — ordering assertions are no longer valid\n",
+                    MF_TRACE_MAX);
+        g_ctrl_trace_overflow++;
+        return;
+    }
+    g_ctrl_trace[g_ctrl_trace_n].reg = reg;
+    g_ctrl_trace[g_ctrl_trace_n].val = v;
+    g_ctrl_trace_n++;
+#else
+    (void)reg; (void)v;   // device: no trace at all (see above)
+#endif
+}
+
+static inline void mf_trace_reset(void) {
+#ifndef MISTER_NATIVE_VIDEO
+    g_ctrl_trace_n = 0;   // overflow is deliberately NOT cleared: it is sticky
+#endif
 }
 
 #ifdef MISTER_NATIVE_VIDEO
@@ -486,29 +659,36 @@ static void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
-#include <time.h>
 #include <stdlib.h>   // getenv (GMLOADER_MFSUBMIT_STAT instrumentation)
+// <time.h> was here; hoisted to the top includes when mf_device_publish stopped being
+// device-only and needed clock_gettime in both builds.
 enum {
     MF_DEV_PHYS_BASE = 0x3B000000u,
     MF_DEV_MAP_SIZE  = 0x01000000u,   // 16 MiB dedicated blitter region
-    MF_DEV_RING_OFF  = 0x00000040u,   // BLTCTRL (8 qwords) precedes the ring
-    MF_DEV_SRC_OFF   = 0x00080000u,   // SRC_QW = 0x3B080000 (DDR3 source heap)
+    // [Phase 1 B1] DOUBLE-BUFFERED command ring. Must match the RTL exactly:
+    // blitter_defs.vh RING_QW = 0x3B000040 (ring A), RING_B_QW = 0x3B040000 (ring B),
+    // selected by C_SRCSEL bit 2 (C_RINGSEL_BIT). The 512 KiB region is SPLIT rather
+    // than grown so SRC_QW / OFF_HEAP stays put -- blitter_defs.vh flags that constant
+    // as a must-match-across-repos hazard.
+    // Canonical source for these values is
+    // wt-maldita-60fps/fpga/rtl/blitter_defs.vh -- NOT 3rdparty/mfgpu/rtl/blitter_defs.vh,
+    // whose RING_QW/SRC_QW are small windowed sim addresses that disagree.
+    MF_DEV_RING_OFF  = 0x00000040u,   // ring A: BLTCTRL (8 qwords) precedes it
+    MF_DEV_RING_B_OFF= 0x00040000u,   // ring B
+    MF_DEV_SRC_OFF   = 0x00080000u,   // SRC_QW = 0x3B080000 (DDR3 source heap) -- UNCHANGED
     MF_DEV_TLBUF_OFF = 0x00F40000u,   // bounds the usable SRC heap (~14.8 MiB)
-    MF_DEV_RING_CAP  = MF_DEV_SRC_OFF   - MF_DEV_RING_OFF,
+    MF_DEV_RING_CAP  = MF_DEV_RING_B_OFF - MF_DEV_RING_OFF,   // 256 KiB, ~8190 commands
     MF_DEV_SRC_CAP   = MF_DEV_TLBUF_OFF - MF_DEV_SRC_OFF,
-    MF_C_SUBMIT = 0, MF_C_CMDCOUNT = 1, MF_C_TARGET = 2, MF_C_CLEAR = 3,
-    MF_C_FLAGS = 4, MF_C_DONE = 5, MF_C_STATUS = 6, MF_C_SRCSEL = 7,
     MF_DEV_DONE_TIMEOUT_MS = 200,
+    // MF_C_* register indices moved above the guard: publish's body compiles in both builds.
 };
 static volatile uint8_t *g_dev_base = nullptr;   // mmap of 0x3B000000
 static volatile uint8_t *g_dev_ctrl = nullptr;   // = base (control block)
 static uint8_t          *g_dev_ring = nullptr;   // = base + RING_OFF
+static uint8_t          *g_dev_ring_b = nullptr; // [Phase 1 B1] = base + RING_B_OFF
 static uint8_t          *g_dev_src  = nullptr;   // = base + SRC_OFF
 static bool              g_dev_ok   = false;     // mmap ok -> submits reach the fabric
 
-static inline void mf_ctrl_wr(int qw, uint32_t v) {
-    *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u) = v;   // low u32 of each 8B qword
-}
 static inline uint32_t mf_ctrl_rd(int qw) {
     return *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u);
 }
@@ -527,6 +707,7 @@ static bool mf_ddr_map(void) {
     g_dev_base = (volatile uint8_t *)m;
     g_dev_ctrl = g_dev_base;
     g_dev_ring = (uint8_t *)(g_dev_base + MF_DEV_RING_OFF);
+    g_dev_ring_b = (uint8_t *)(g_dev_base + MF_DEV_RING_B_OFF);   // [Phase 1 B1]
     g_dev_src  = (uint8_t *)(g_dev_base + MF_DEV_SRC_OFF);
     memset((void *)g_dev_ctrl, 0, MF_DEV_RING_OFF);   // zero the control block
     g_dev_ok = true;
@@ -599,42 +780,173 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     double frame_ms = (double)mf_ctrl_rd_hi(MF_C_DONE)   / (MF_CLK_SYS_MHZ * 1000.0);
     double texw_ms  = (double)mf_ctrl_rd_hi(MF_C_STATUS) / (MF_CLK_SYS_MHZ * 1000.0);
     double tri_ms   = (double)mf_ctrl_rd_hi(MF_C_SRCSEL) / (MF_CLK_SYS_MHZ * 1000.0);
+    // [Phase 1 A4] EXACT covered-pixel count from the fabric, replacing cov_px_est as the
+    // cyc/px denominator. cov_px_est is a Sutherland-Hodgman clip estimate and is blind to
+    // per-pixel depth and blend rejection, so it over-counts whatever the fabric discards.
+    // Keep reporting the estimate alongside for one bring-up period: the two disagreeing is
+    // the ANSWER to Phase 0's open question #1 (measured ~8.0 vs sim ~6-7 cyc/px), not a
+    // discrepancy to suppress.
+    double cov_exact = (double)mf_ctrl_rd_hi(MF_C_FLAGS);
     static unsigned n = 0, to = 0; static double sum = 0; static long it_sum = 0;
-    static double fsum = 0, tsum = 0, xsum = 0, csum = 0;
+    static double fsum = 0, tsum = 0, xsum = 0, csum = 0, esum = 0;
     n++; to += timeout ? 1u : 0u; sum += us; it_sum += iters; fsum += frame_ms; tsum += tri_ms; xsum += texw_ms;
+    esum += cov_exact;
+    // [Phase 1 B2] Still correctly paired with the batch being measured after the deferral.
+    // mf_device_await -- and therefore this function -- now runs at the TOP of the next
+    // mf_frame_begin, but strictly before blt_begin_frame and before any draw of that frame
+    // calls mf_cov_add_triangle. So the accumulator still holds the estimate for the batch
+    // whose counters were just read. Moving the await below blt_begin_frame would silently
+    // fold the wrong frame's estimate in.
     csum += g_cov_px_accum; g_cov_px_accum = 0.0;   // per-frame: reset after folding in
     if (n % 30 == 0) {
-        double f=fsum/30.0, t=tsum/30.0, x=xsum/30.0, c=csum/30.0;
-        // cyc_px uses the fabric clock: dpath_ms * clk_MHz * 1000 / covered_px.
+        double f=fsum/30.0, t=tsum/30.0, x=xsum/30.0, c=csum/30.0, e=esum/30.0;
         double dpath_ms = t - x;
-        double cyc_px = (c > 1.0) ? (dpath_ms * MF_CLK_SYS_MHZ * 1000.0) / c : 0.0;
         // Screen area comes from the fabric geometry macros, never a literal:
         // MISTER_WIDTH/HEIGHT arrive as -D flags, so a hardcoded 288x216 here
         // would silently survive a geometry change and report a wrong overdraw.
         const double screen_px = (double)BLT_FB_WIDTH * (double)BLT_FB_HEIGHT;
+        MfCovDerived d = mf_derive_cov(dpath_ms, e, c, screen_px, MF_CLK_SYS_MHZ);
+        // cov_src labels the provenance of the WHOLE derived group -- overdraw and cyc_px
+        // both come from d.cov_den, so a marker attached to only one of them would leave the
+        // other silently reinterpreted. est_ratio prints n/a rather than 0.00 so the field
+        // never carries a value outside its own invariant's domain (>= 1.0).
+        char ratio_buf[16];
+        if (d.est_ratio < 0.0) snprintf(ratio_buf, sizeof ratio_buf, "n/a");
+        else                   snprintf(ratio_buf, sizeof ratio_buf, "%.2f", d.est_ratio);
         fprintf(stderr, "MFSUBMIT n=%u wait_ms[avg=%.2f] fabric_ms[frame=%.2f tri=%.2f "
-                "texwait=%.2f dpath=%.2f ovhd=%.2f] cov_px_est=%.0f overdraw=%.2f "
-                "cyc_px=%.1f spin_avg=%ld to=%u\n",
+                "texwait=%.2f dpath=%.2f ovhd=%.2f] cov_px=%.0f cov_px_est=%.0f "
+                "est_ratio=%s overdraw=%.2f cyc_px=%.1f cov_src=%s spin_avg=%ld to=%u\n",
                 n, (sum/30.0)/1e3, f, t, x, dpath_ms, f-t,
-                c, c / screen_px, cyc_px, it_sum/30, to);
+                e, c, ratio_buf, d.overdraw, d.cyc_px,
+                d.estimated ? "est" : "exact", it_sum/30, to);
         sum = 0; it_sum = 0; to = 0;
-        fsum = 0; tsum = 0; xsum = 0; csum = 0;
+        fsum = 0; tsum = 0; xsum = 0; csum = 0; esum = 0;
     }
 }
+#endif // MISTER_NATIVE_VIDEO — device transport internals end here
 
-// Publish the emitter's control-block mirror, ring the doorbell (submit_seq LAST,
-// after a barrier), poll C_DONE. Ring + heap are already resident in DDR (the
-// emitter was bound to g_dev_ring/g_dev_src), so there is nothing to copy. This
-// core's C_STATUS is OSD-mirror, not an error latch — completion == C_DONE match,
-// failure == timeout.
-static void mf_device_submit(void) {
+#ifndef MISTER_NATIVE_VIDEO
+// [Phase 1 B1] Host-oracle shadow of the control block. mf_ctrl_rd is device-only, so
+// without this the read-modify-write C_SRCSEL needs (preserve bits 15:8, change bit 2)
+// could not run off-device at all -- and the throttle-preservation property would be
+// untestable. Writes land here instead of in MMIO; reads come back from it.
+static uint32_t g_ctrl_shadow[8] = {0};
+static inline uint32_t mf_ctrl_rd(int qw) { return g_ctrl_shadow[qw & 7]; }
+#endif
+
+// [Phase 1 B2] Control-word write: traced in BOTH builds, stored only on device. Device
+// behaviour is unchanged — same store, same order; the trace is a few array writes per
+// frame alongside five uncached MMIO round trips.
+static inline void mf_ctrl_wr(int qw, uint32_t v) {
+#ifdef MISTER_NATIVE_VIDEO
+    *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u) = v;   // low u32 of each 8B qword
+#else
+    mf_trace_add(qw, v);   // oracle: record instead of store, so publish's order is checkable
+    g_ctrl_shadow[qw & 7] = v;   // ...and remain readable, for read-modify-write registers
+#endif
+}
+
+// [Phase 1 B2] The publish barrier AND its trace marker, deliberately one call. If these
+// were two statements a mutation could move __sync_synchronize() while leaving the marker
+// behind, and the trace would still claim a barrier that is no longer there. Moving this
+// moves both, so the test sees the real ordering.
+static inline void mf_ctrl_barrier(void) {
+    mf_trace_add(MF_TRACE_BARRIER, 0);   // no-op on device; one call, so it cannot drift
+    __sync_synchronize();
+}
+
+// ── SUBMIT SEAM (Phase 1 B2) ─────────────────────────────────────────────────
+// The frame's handoff to the fabric, in three parts: mf_device_publish (control-block
+// mirror, barrier, doorbell), mf_device_await (poll C_DONE), and mf_device_submit, which
+// is just the two in order. Split so Task 4 can run the engine's Process() for frame N+1
+// in between; see each function for its own contract.
+//
+// Common to both halves: the ring + heap are already resident in DDR (the emitter was
+// bound to g_dev_ring/g_dev_src), so there is nothing to copy. This core's C_STATUS is
+// OSD-mirror, not an error latch — completion == C_DONE match, failure == timeout.
+//
+// Both halves sit BEHIND mf_frame_end's g_frame_dropped guard: a dropped frame rebuilds
+// no ring and must ring no doorbell (pinned by case_submit_publish_await_split).
+//
+// These three deliberately sit OUTSIDE #ifdef MISTER_NATIVE_VIDEO, with only the
+// MMIO and the poll loop guarded, because the host oracle has to be able to observe
+// the seam: the raster-backend-test target does not define MISTER_NATIVE_VIDEO, so
+// device-only publish/await counters would be permanently zero there and the
+// pipelining this split exists to enable could not be tested without hardware.
+// On the oracle the two functions reduce to the counter bump and the timestamp.
+
+// [Phase 1 B2] Counters for the host-oracle test that publish and await are separable.
+static uint32_t g_publish_count = 0;
+static uint32_t g_await_count   = 0;
+// Timestamp of the publish we are waiting on, so mf_submit_stat still measures the
+// full doorbell->C_DONE interval even when the await happens a frame later.
+static struct timespec g_publish_t0;
+
+// [Phase 1 B2] ORDERING WITNESS. Counting publishes and awaits pins how many times and on
+// which frames the seam runs, but NOT the order: on the host oracle both halves are
+// near-no-ops (the MMIO and the poll compile out), so inverting them is behaviourally
+// invisible there and every counter still lands on its expected value. Measured: with
+// mf_device_submit's two calls swapped, all 69 host cases passed. This flag makes the
+// ordering itself observable, which is the only way to catch it without hardware.
+//
+// On device the inversion is not cosmetic: await would poll C_DONE for a sequence that was
+// never submitted, and mf_submit_stat would measure from a stale g_publish_t0.
+//
+// Lifetime: publish INCREMENTS it; it is cleared where mf_frame_begin clears
+// g_fabric_pending, which is the single point at which the batch stops being in flight —
+// acked by the await, found done by the cheap re-check during a drop run, or abandoned by a
+// reclaim. A timed-out batch is deliberately still counted as outstanding (that is the whole
+// premise of the in-flight guard below), so the drop run that follows does not look
+// unpaired. Resolving it anywhere else would let the three exit paths disagree.
+//
+// A DEPTH rather than a bool, because a bool is idempotent: publish(); publish(); await()
+// leaves a bool looking perfectly paired even though the doorbell was rung twice for one
+// frame. Depth must never exceed 1, and must return to 0.
+static int32_t  g_publish_depth        = 0;
+static uint32_t g_unpaired_awaits      = 0;   // awaits with nothing in flight: must stay 0
+static uint32_t g_seam_depth_violations = 0;  // publish while one was already in flight
+
+// [Phase 1 B2] Publish the emitter's control-block mirror and ring the doorbell.
+// Does NOT poll. Split out of the old mf_device_submit so the caller can run
+// Process() for the next frame between the doorbell and the wait.
+static void mf_device_publish(void) {
+    // Body is NOT #ifdef'd: mf_ctrl_wr traces in both builds and stores only on device, so
+    // the write order below is checkable on the host oracle. See the trace shim above.
+    mf_trace_reset();                           // each publish's trace stands alone
     mf_ctrl_wr(MF_C_CMDCOUNT, (uint32_t)g_e.cmd_count);
     mf_ctrl_wr(MF_C_TARGET,   (uint32_t)g_e.target_buf);
     mf_ctrl_wr(MF_C_CLEAR,    (uint32_t)g_e.clear_color);
     mf_ctrl_wr(MF_C_FLAGS,    (uint32_t)g_e.flags);
-    __sync_synchronize();                       // data before doorbell
+    // [Phase 1 B1] Tell the fabric which ring this frame is in. C_SRCSEL bit 2
+    // (C_RINGSEL_BIT); bits 0 and 1 are dead (source is hardwired to SDRAM,
+    // comp_pipeline is the sole renderer) and bits 15:8 are the f2h write throttle,
+    // which must be preserved -- hence read-modify-write rather than a plain store.
+    {
+        uint32_t srcsel = mf_ctrl_rd(MF_C_SRCSEL);
+        srcsel = (srcsel & ~(1u << 2)) | ((g_arena & 1u) << 2);
+        mf_ctrl_wr(MF_C_SRCSEL, srcsel);
+    }
+    mf_ctrl_barrier();                          // data before doorbell (traced)
     mf_ctrl_wr(MF_C_SUBMIT, g_e.submit_seq);    // doorbell LAST
-    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    clock_gettime(CLOCK_MONOTONIC, &g_publish_t0);
+    g_publish_count++;
+    // Depth, not a bool: a bool is idempotent, so publish(); publish(); await() would look
+    // perfectly paired while the doorbell had been rung twice for one frame — on device a
+    // re-submit of a sequence that is still in flight. Depth must never exceed 1.
+    if (++g_publish_depth > 1) g_seam_depth_violations++;
+}
+
+// [Phase 1 B2] Block until the fabric acks the published sequence. This is the old
+// mf_device_submit's tail, moved verbatim: the poll loop, the backoff, the timeout
+// budget, and the g_fabric_pending / g_pending_seq bookkeeping the in-flight-batch
+// guard reads are all unchanged.
+static void mf_device_await(void) {
+    g_await_count++;
+    // [Phase 1 B2] Ordering witness: awaiting with nothing in flight means publish and
+    // await ran out of order, or a publish was lost. See g_publish_depth.
+    if (g_publish_depth <= 0) g_unpaired_awaits++;
+#ifdef MISTER_NATIVE_VIDEO
+    struct timespec t0 = g_publish_t0;
     if (mf_nowait_on()) { mf_submit_stat(&t0, 0, /*timeout=*/0); return; }  // probe: no poll
     long iters = 0;
     const long poll_us = mf_poll_us();
@@ -666,11 +978,15 @@ static void mf_device_submit(void) {
             // whole rather than rebuilding the ring underneath it.
             g_fabric_pending = true;
             g_pending_seq    = g_e.submit_seq;
+            // g_publish_depth is NOT decremented on purpose: the batch is still in flight,
+            // so a later re-await of it (Task 4 awaits from mf_frame_begin) stays paired.
             return;
         }
     }
-}
 #endif // MISTER_NATIVE_VIDEO
+    // Host oracle: nothing to poll. Resolution (and the depth clear) happens in
+    // mf_frame_begin where g_fabric_pending is cleared, identically to the device path.
+}
 
 static void mf_init_once(void) {
     if (g_inited) return;
@@ -679,22 +995,29 @@ static void mf_init_once(void) {
         // In-place: the emitter builds ring + heap directly in the mmap'd DDR.
         blt_emitter_init(&g_e, g_dev_ring, MF_DEV_RING_CAP, g_dev_src, MF_DEV_SRC_CAP);
         blt_alloc_init(&g_e.alloc, MF_VTX_REGION, MF_DEV_SRC_CAP - MF_VTX_REGION);
-        blt_vtx_buf_init(&g_e, g_dev_src, MF_VTX_REGION);
+        blt_vtx_buf_init(&g_e, g_dev_src, MF_VTX_HALF);
     } else {
         // No /dev/mem: bind host RAM so the emitter never faults; g_dev_ok is false
         // so mf_frame_end drops (never submits to a null map).
-        blt_emitter_init(&g_e, g_ring, sizeof g_ring, g_srcdram, sizeof g_srcdram);
+        blt_emitter_init(&g_e, g_ring[0], MF_RING_CAP, g_srcdram, sizeof g_srcdram);
         blt_alloc_init(&g_e.alloc, MF_VTX_REGION, MF_TEX_HEAP);
-        blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_REGION);
+        blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_HALF);
     }
 #else
-    blt_emitter_init(&g_e, g_ring, sizeof g_ring, g_srcdram, sizeof g_srcdram);
+    blt_emitter_init(&g_e, g_ring[0], MF_RING_CAP, g_srcdram, sizeof g_srcdram);
     uint32_t cap = g_tex_heap_cap ? g_tex_heap_cap : MF_TEX_HEAP;
     blt_alloc_init(&g_e.alloc, MF_VTX_REGION, cap);       // texture allocator (persistent)
-    blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_REGION);     // per-frame vertex buffer
+    blt_vtx_buf_init(&g_e, g_srcdram, MF_VTX_HALF);       // per-frame vertex buffer
 #endif
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
+    g_evict_attempts = 0; g_cachefull_drops = 0;   // [Phase 1 B3] pressure + refusal witnesses
+    g_frame_ovf_cause = MF_OVF_UNKNOWN;            // [Phase 1 B3] per-frame overflow cause
+    g_lru_evict_floor = 0;                         // [Phase 1 B3] lagging floor
+    g_publish_count = 0; g_await_count = 0;   // [Phase 1 B2] submit-seam counters
+    g_arena = 0;                                                              // [Phase 1 B1] arena parity
+    g_publish_depth = 0; g_unpaired_awaits = 0; g_seam_depth_violations = 0;  // [Phase 1 B2] ordering witness
+    g_ctrl_trace_n = 0; g_ctrl_trace_overflow = 0;                             // [Phase 1 B2] control-write trace
     g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
     g_last_draw.valid = false; g_dup_skipped = 0;
     g_appsurf_presented = false; g_crt_stripped = 0;
@@ -704,8 +1027,12 @@ static void mf_init_once(void) {
 // [in-flight-batch guard] The emitter builds the command ring, the vertex buffer and the
 // texture heap IN PLACE in the DDR the fabric reads (mf_init_once binds g_dev_ring/g_dev_src).
 // The ONLY thing keeping the host from overwriting a batch the fabric is still executing is
-// the blocking C_DONE poll in mf_device_submit -- and its timeout abandons exactly that
-// guarantee. Device-measured 2026-07-24: with the stock 200ms budget a single stalled frame
+// the C_DONE await -- and its timeout abandons exactly that guarantee. [Phase 1 B2] That
+// await is no longer at the end of the frame that published: it now runs at the top of the
+// NEXT mf_frame_begin, so the host builds frame N+1's arena while the fabric still reads N's.
+// What keeps that safe is not the poll's position but the double-buffering underneath it --
+// ring and vertex arenas alternate (B1) and textures stay pinned for two frames (B3), so the
+// batch the fabric is reading is never the one being rebuilt. Device-measured 2026-07-24: with the stock 200ms budget a single stalled frame
 // produced ~78 timeouts, i.e. 78 successive frames that called blt_begin_frame (cmd_count=0,
 // vtx_used=0) and re-staged textures straight over the batch the fabric was mid-way through
 // reading. That is the mechanism behind the garbage geometry, "the game's stored tilemap
@@ -728,6 +1055,24 @@ static void mf_frame_begin(void) {
     // [in-flight-batch guard] Decide BEFORE blt_begin_frame: it is the call that would
     // rewind the cursors over a live batch.
     if (g_fabric_pending) {
+        // [Phase 1 B2] The deferred await. This is the barrier: everything below rewrites
+        // the SINGLE shared control block (C_CMDCOUNT/C_TARGET/C_CLEAR/C_FLAGS/C_SRCSEL),
+        // so the fabric must have consumed the previous frame's values first. It latches
+        // them all in its prologue immediately after detecting a new C_SUBMIT (verified in
+        // blitter_top.sv's S_GOT_SRCSEL), so this is the minimal correct barrier — and
+        // every millisecond of Process() since the doorbell is overlap we did not have.
+        //
+        // NOT wrapped in #ifdef MISTER_NATIVE_VIDEO and NOT gated on g_dev_ok. Task 1 moved
+        // the definition outside the guard with only the MMIO poll nested inside, precisely
+        // so the oracle reaches this line; re-gating it here makes the deferral untestable
+        // off-device.
+        // Once per PUBLISHED BATCH, not once per frame. drop_run==0 means this is the first
+        // frame after the doorbell, i.e. the batch this await belongs to. During a drop run
+        // the cheap non-blocking mf_fabric_still_busy() read below is what discovers the
+        // fabric finishing; re-entering the blocking poll every frame would add a full
+        // timeout budget (200 ms) per dropped frame — ~12 s across a 60-frame drop run,
+        // turning a wedge into a far longer freeze than before pipelining.
+        if (g_drop_run == 0) mf_device_await();
         if (mf_fabric_still_busy() && g_drop_run < mf_drop_limit()) {
             g_frame_dropped = true;
             g_frame_active  = true;   // so present() still closes the frame
@@ -743,20 +1088,57 @@ static void mf_frame_begin(void) {
         // That is strictly worse than the corruption the guard exists to prevent. After
         // MF_DROP_LIMIT consecutive drops, reclaim the ring and rebuild: one deliberate
         // stomp as a last resort, instead of one per frame.
-        if (g_drop_run >= mf_drop_limit())
+        if (g_drop_run >= mf_drop_limit()) {
             fprintf(stderr, "backend_mfgpu: fabric never acked seq=%u after %u frames - "
                     "reclaiming the ring\n", g_pending_seq, mf_drop_limit());
+        }
+        // [Phase 1 B2] THE resolution point for the batch, and the only one. Exactly one
+        // batch is ever outstanding, so when pending clears — whether the await acked it,
+        // the cheap re-check found it done mid-drop-run, or we reclaimed and abandoned it —
+        // it is no longer in flight and the pairing depth must say so. Keeping this on a
+        // single line is what stops the three exit paths from disagreeing.
         g_fabric_pending = false;     // acked (or reclaimed): the ring is ours again
+        g_publish_depth  = 0;
     }
     g_drop_run = 0;
     g_frame_dropped = false;
+    g_frame_ovf_cause = MF_OVF_UNKNOWN;   // [Phase 1 B3] per-frame: reset before staging
     g_last_draw.valid = false;   // [duplicate-draw elimination] never span frames
     g_appsurf_presented = false; // [strip CRT] the present must re-land every frame
     // Snapshot the pin floor for this frame: any g_texcache entry touched
     // (hit or staged) from here through mf_frame_end gets .lru > this value
     // and is thus protected from eviction until the NEXT frame begins (see
     // g_lru_frame_floor and evict_one_lru).
+    // [Phase 1 B3] Retire this frame's floor to the eviction floor BEFORE taking the new
+    // snapshot, so entries touched in the previous frame stay pinned through this one.
+    g_lru_evict_floor = g_lru_frame_floor;
     g_lru_frame_floor = g_lru_clock;
+    // [Phase 1 B1] Flip to the other arena before rebuilding. The fabric is (or will
+    // shortly be) reading the previous frame's arena, so this frame must not touch it.
+    // Rebinding here — not at init — is what makes the alternation take effect, since
+    // blt_begin_frame rewinds cursors into whatever buffers the emitter currently holds.
+    //
+    // The ring pointer is rebound DIRECTLY rather than via blt_emitter_init, which the plan
+    // text suggested. blt_emitter_init memsets the whole emitter and re-runs
+    // blt_alloc_init(&e->alloc, 0, heap_cap). Per frame that would zero submit_seq (so the
+    // doorbell never advances — a permanent device wedge), wipe sdram_alloc / sdram_perm /
+    // sdram_src (the resident atlas), and reset the texture allocator to base 0, overlapping
+    // the vertex region, while g_texcache still believes those pages are live — handing out
+    // heap the cache thinks it owns. That is the same silent aliasing this plan exists to
+    // prevent. Only ring / ring_cap / the vertex window may move per frame.
+    g_arena ^= 1u;
+#ifdef MISTER_NATIVE_VIDEO
+    if (g_dev_ok) {
+        g_e.ring     = g_arena ? g_dev_ring_b : g_dev_ring;
+        g_e.ring_cap = MF_DEV_RING_CAP;
+        blt_vtx_buf_init(&g_e, g_dev_src + (g_arena ? MF_VTX_HALF : 0), MF_VTX_HALF);
+    } else
+#endif
+    {
+        g_e.ring     = g_ring[g_arena & 1u];
+        g_e.ring_cap = MF_RING_CAP;
+        blt_vtx_buf_init(&g_e, g_srcdram + (g_arena ? MF_VTX_HALF : 0), MF_VTX_HALF);
+    }
     // Textures persist across frames now (cache in g_texcache). Only the vtx
     // cursor + command list reset here (blt_begin_frame). No blt_heap_reset.
     blt_begin_frame(&g_e, /*target_buf=*/0, /*clear=*/0, /*clear_color=*/0);
@@ -799,17 +1181,20 @@ static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
 }
 
 static bool evict_one_lru(void) {
-    // Pin-this-frame invariant: an entry with .lru > g_lru_frame_floor was
-    // hit or staged during the CURRENT frame, so a blt_trilist command
-    // already emitted this frame may reference its heap offset — that
-    // command isn't consumed until blt_execute runs at frame end. Freeing
-    // such an entry now would let a later stage_texture's retry reuse the
-    // same offset with different pixels, so the earlier (already-emitted)
-    // draw would sample the wrong texture when the frame finally executes.
-    // Only entries from a PRIOR frame (.lru <= floor) are eviction-eligible.
+    g_evict_attempts++;   // [Phase 1 B3] pressure witness: called, not necessarily succeeded
+    // Pin-for-TWO-frames invariant: an entry with .lru > g_lru_evict_floor was hit or
+    // staged during the current frame OR the previous one.
+    //   - current frame: a blt_trilist command already emitted this frame may reference its
+    //     heap offset, and that command isn't consumed until blt_execute runs at frame end.
+    //     Freeing it now would let a later stage_texture's retry reuse the same offset with
+    //     different pixels, so the earlier (already-emitted) draw samples the wrong texture.
+    //   - previous frame [Phase 1 B3]: with the ring double-buffered the fabric is still
+    //     reading that frame's batch while the host builds this one, so its textures are
+    //     live in hardware even though the frame is "over".
+    // Only entries older than BOTH (.lru <= g_lru_evict_floor) are eviction-eligible.
     int victim = -1; uint64_t best = ~0ull;
     for (int i = 0; i < MF_TEX_CACHE_N; i++) {
-        if (g_texcache[i].used && g_texcache[i].lru <= g_lru_frame_floor && g_texcache[i].lru < best) {
+        if (g_texcache[i].used && g_texcache[i].lru <= g_lru_evict_floor && g_texcache[i].lru < best) {
             best = g_texcache[i].lru; victim = i;
         }
     }
@@ -960,7 +1345,9 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
     // (mirror the heap-overflow graceful path): undo this upload, set overflow, and
     // fail the stage so the caller drops the draw. A busy frame degrades to a
     // DROPPED frame, never a wrong-pixel frame.
-    if (g_texcache[slot].used && g_texcache[slot].lru > g_lru_frame_floor) {
+    if (g_texcache[slot].used && g_texcache[slot].lru > g_lru_evict_floor) {
+        g_cachefull_drops++;   // [Phase 1 B3] refusal witness
+        mf_note_ovf_cause(MF_OVF_CACHE_FULL);   // ...and name the cause in the log
         if (mf_heaplog_on())
             fprintf(stderr, "HEAPLOG CACHE-FULL %s key=%u: all %d slots frame-pinned "
                     "- dropping frame\n", what, key, MF_TEX_CACHE_N);
@@ -1117,6 +1504,13 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         fprintf(stderr, "backend_mfgpu: vertex push overflow (%d tris) - draw dropped\n", nt);
         return;
     }
+    // [Phase 1 B1] blt_push_tris returns an offset relative to vtx_buf, but the consumer —
+    // blt_execute and the fabric alike — resolves it as heap_base + entry_off (see
+    // blt_vtx_buf_init's comment in 3rdparty/mfgpu). Those coincided only while vtx_buf WAS
+    // the heap base. Arena 1's vertex window starts MF_VTX_HALF up, so the offset must be
+    // rebased or every TRILIST reads its vertices from the wrong address — garbage geometry
+    // with no error, on device and in the oracle alike.
+    eoff += g_arena ? (uint32_t)MF_VTX_HALF : 0u;
     uint8_t blend_mode;
     uint16_t colorkey;
     if (has_key && min_vtx_a * 255.0f >= 254.0f) {
@@ -1439,6 +1833,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         bool has_key = false;
         blt_surface_ref_t tex = stage_texture(0u, t, &has_key);
         if (!tex.valid) {
+            mf_note_ovf_cause(MF_OVF_HEAP_FULL);
             fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
             return;
         }
@@ -1456,6 +1851,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         bool has_key = false;
         blt_surface_ref_t tex = stage_texture(tex_key, t, &has_key);
         if (!tex.valid) {
+            mf_note_ovf_cause(MF_OVF_HEAP_FULL);
             fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
             return;
         }
@@ -1496,6 +1892,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
             bool has_key = false;
             blt_surface_ref_t tex = stage_texture(tex_key, t, &has_key);
             if (!tex.valid) {
+                mf_note_ovf_cause(MF_OVF_HEAP_FULL);
                 fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
                 return;
             }
@@ -1530,6 +1927,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
             // The failed upload left g_e.overflow set -> the whole frame drops at
             // frame_end (correct: a texture that can't fit -- heap or cache-table
             // -- must not render half a command list). No point emitting the rest.
+            mf_note_ovf_cause(MF_OVF_HEAP_FULL);
             fprintf(stderr, "backend_mfgpu: sub-region cannot fit heap after eviction - draw dropped\n");
             return;
         }
@@ -1581,6 +1979,17 @@ static void mf_frame_end(void) {
         }
     }
 #endif
+    // [Phase 1 B1] Ring capacity halved to ~8190 commands when the ring was
+    // double-buffered. Log a new high-water mark so approaching the cap is visible
+    // instead of surfacing as an overflow-driven black frame.
+    {
+        static uint32_t hw = 0;
+        if ((uint32_t)g_e.cmd_count > hw) {
+            hw = (uint32_t)g_e.cmd_count;
+            if (hw > 4096u)
+                fprintf(stderr, "backend_mfgpu: cmd_count high-water %u (ring cap ~8190)\n", hw);
+        }
+    }
     blt_end_frame(&g_e);
 #ifdef MISTER_NATIVE_VIDEO
     // Device: the ring + heap are already resident in the mmap'd DDR (the emitter
@@ -1588,22 +1997,38 @@ static void mf_frame_end(void) {
     // doorbell, and poll C_DONE — the fabric composites into on-chip BRAM and scans
     // itself out. No blt_execute, no g_fb565 on the hot path.
     if (g_e.overflow) {
-        fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped\n");
+        fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped %s\n",
+                mf_ovf_cause_str());
         return;
     }
-    if (g_dev_ok) mf_device_submit();
+    // [Phase 1 B2] Publish and return. The await moved to mf_frame_begin, so the engine's
+    // Process() for the next frame now overlaps the fabric's raster window instead of running
+    // strictly before the submit. Safe only because the ring and vertex buffer are
+    // double-buffered (B1) and textures are pinned for two frames (B3) — without both, this
+    // is the corruption cascade documented at the in-flight-batch guard below.
+    if (g_dev_ok) { mf_device_publish(); g_fabric_pending = true; g_pending_seq = g_e.submit_seq; }
     else          fprintf(stderr, "backend_mfgpu: device DDR unmapped - frame dropped\n");
 #else
     // Host oracle: software-execute the ring into g_fb565 (parity tests read it back).
     memset(g_fb565, 0, sizeof g_fb565);
     if (g_e.overflow) {
-        fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped\n");
+        fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped %s\n",
+                mf_ovf_cause_str());
         return;   // nothing safe to execute this frame
     }
+    // [Phase 1 B2] Drive the same submit seam the device path uses, so the publish/await
+    // bookkeeping is observable off-device. blt_execute below stands in for the fabric and
+    // is synchronous, so the await is trivially satisfied and costs nothing here.
+    // [Phase 1 B2] Oracle: publish, then let blt_execute stand in for the fabric. The await
+    // moves to the next mf_frame_begin exactly as on device, so the deferral is observable
+    // off-device — without setting g_fabric_pending here the oracle never reaches the await
+    // and case_await_deferred_one_frame is unsatisfiable.
+    mf_device_publish();
+    g_fabric_pending = true; g_pending_seq = g_e.submit_seq;
     int n = g_e.cmd_count;
     if (n > MF_MAX_CMDS) n = MF_MAX_CMDS;
     for (int i = 0; i < n; i++)
-        blt_unpack_cmd(g_ring + (size_t)i * BLT_CMD_BYTES, &g_cmds[i]);
+        blt_unpack_cmd(g_e.ring + (size_t)i * BLT_CMD_BYTES, &g_cmds[i]);
     // The whole g_srcdram is the source region: vertices at low offsets, texture
     // pages above MF_VTX_REGION. blt_execute only reads (and clamps OOB), so
     // passing the full size keeps both offset ranges in-bounds.
@@ -1666,9 +2091,82 @@ extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy) {
     // busy>0 simulates the whole device condition, not just the predicate: a submit that
     // timed out and left a batch unacked. busy==0 deliberately LEAVES g_fabric_pending set,
     // so the next frame exercises the "acked -> clear the flag and resume" branch.
-    if (busy > 0) { g_fabric_pending = true; g_pending_seq = g_e.submit_seq; }
+    // [Phase 1 B2] Also model the PUBLISH the simulated in-flight batch implies. Setting
+    // g_fabric_pending alone would leave the pairing depth at 0, so the deferred await in
+    // the next mf_frame_begin would count an unpaired await -- a false positive created by
+    // the hook, not by the code. Assignment rather than increment: exactly one batch is ever
+    // outstanding, so this is idempotent whether or not a real publish already happened.
+    if (busy > 0) { g_fabric_pending = true; g_pending_seq = g_e.submit_seq; g_publish_depth = 1; }
 }
 extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void) { return g_drop_count; }
+// [Phase 1 B2] host-test hooks: prove publish and await are separable and each ran once.
+extern "C" uint32_t RasterBackend_MFGPU_TestPublishCount(void) { return g_publish_count; }
+extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void)   { return g_await_count; }
+// [Phase 1 B2] Ordering witness: awaits that ran with no batch in flight, and publishes
+// issued while one was already in flight. Both must always be 0 — counters alone cannot see
+// publish/await order on the oracle (see g_publish_depth).
+extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void) { return g_unpaired_awaits; }
+extern "C" uint32_t RasterBackend_MFGPU_TestSeamDepthViolations(void) { return g_seam_depth_violations; }
+// [Phase 1 B2] Control-word write trace for the LAST publish: reg index per entry
+// (MF_TRACE_BARRIER == -1 marks the memory barrier), so a test can pin that the doorbell is
+// written last and the barrier precedes it. Invisible to counters -- mf_ctrl_wr's store
+// compiles out on the oracle, so publish's body was otherwise untestable off-device.
+extern "C" uint32_t RasterBackend_MFGPU_TestTraceLen(void) { return g_ctrl_trace_n; }
+// Nonzero => the trace truncated, so every ordering assertion over it is vacuous. Asserted 0.
+extern "C" uint32_t RasterBackend_MFGPU_TestTraceOverflow(void) { return g_ctrl_trace_overflow; }
+extern "C" int RasterBackend_MFGPU_TestTraceReg(uint32_t i) {
+    return (i < g_ctrl_trace_n) ? g_ctrl_trace[i].reg : -99;
+}
+// [Phase 1 B1] The VALUE written, not just which register. Task 1's trace proved where a
+// write happened; Task 2's contract (C_SRCSEL bit 2 == g_arena) is a value property, and a
+// select bit stuck at 0 passes every ordering assertion while the fabric reads ring A
+// forever. Position alone cannot see it.
+extern "C" uint32_t RasterBackend_MFGPU_TestTraceVal(uint32_t i) {
+    return (i < g_ctrl_trace_n) ? g_ctrl_trace[i].val : 0u;
+}
+// [Phase 1 B1] host-test hooks: prove the arenas alternate and are disjoint. Field names
+// are the emitter's real ones (blt_emitter_t: `ring`, `vtx_buf`), not assumed.
+extern "C" uint32_t  RasterBackend_MFGPU_TestArena(void)    { return g_arena; }
+// [Phase 1 B3] eviction ATTEMPTS since reinit — the vacuity guard for the retention case.
+extern "C" uint32_t  RasterBackend_MFGPU_TestEvictAttempts(void) { return g_evict_attempts; }
+// [Phase 1 B3] full-table inserts refused by the pin-aware guard, and the table's slot count.
+// The slot count is exposed rather than mirrored in the test so the two cannot drift: a test
+// that fills a hardcoded 256 slots stops filling the table the moment MF_TEX_CACHE_N grows,
+// and goes quietly vacuous with nothing failing.
+extern "C" uint32_t  RasterBackend_MFGPU_TestCacheFullDrops(void) { return g_cachefull_drops; }
+// [Phase 1 B3] Which cause was recorded for the frame just closed. Exposed so the value that
+// SELECTS the overflow message is itself asserted -- a cause that is never recorded would
+// silently restore the ambiguity it exists to remove, and nothing would fail.
+extern "C" int       RasterBackend_MFGPU_TestFrameOvfCause(void) { return (int)g_frame_ovf_cause; }
+// Exposed so the test does not hand-mirror MfOvfCause's values. Same reasoning as
+// TestTexCacheSlots: a mirrored constant is a second source of truth that drifts silently.
+extern "C" int       RasterBackend_MFGPU_OvfCauseUnknown(void)   { return (int)MF_OVF_UNKNOWN; }
+extern "C" int       RasterBackend_MFGPU_OvfCauseCacheFull(void) { return (int)MF_OVF_CACHE_FULL; }
+extern "C" int       RasterBackend_MFGPU_OvfCauseHeapFull(void)  { return (int)MF_OVF_HEAP_FULL; }
+// [Phase 1 A4] The covered-pixel derivation, exposed for host testing. Reading C_FLAGS.hi
+// needs a fabric; the arithmetic over it does not, and is where the provenance bug lived.
+extern "C" void RasterBackend_MFGPU_TestDeriveCov(double dpath_ms, double cov_exact,
+                                                  double cov_est, double screen_px,
+                                                  double clk_mhz, double *cov_den,
+                                                  double *cyc_px, double *overdraw,
+                                                  double *est_ratio, int *estimated) {
+    MfCovDerived d = mf_derive_cov(dpath_ms, cov_exact, cov_est, screen_px, clk_mhz);
+    if (cov_den) *cov_den = d.cov_den;   if (cyc_px)   *cyc_px   = d.cyc_px;
+    if (overdraw) *overdraw = d.overdraw; if (est_ratio) *est_ratio = d.est_ratio;
+    if (estimated) *estimated = d.estimated;
+}
+extern "C" uint32_t  RasterBackend_MFGPU_TestTexCacheSlots(void)  { return MF_TEX_CACHE_N; }
+extern "C" uintptr_t RasterBackend_MFGPU_TestRingBase(void) { return (uintptr_t)g_e.ring; }
+extern "C" uintptr_t RasterBackend_MFGPU_TestVtxBase(void)  { return (uintptr_t)g_e.vtx_buf; }
+// [Phase 1 B1] Seed C_SRCSEL's shadow so the read-modify-write has a non-zero throttle
+// field (bits 15:8) to preserve — otherwise "the throttle survives" is a vacuous 0 == 0.
+extern "C" void RasterBackend_MFGPU_TestSetCtrlSrcsel(uint32_t v) {
+#ifndef MISTER_NATIVE_VIDEO
+    g_ctrl_shadow[MF_C_SRCSEL] = v;
+#else
+    (void)v;
+#endif
+}
 // Blend mode the last TRILIST went out with, so a test can pin the opaque-ALPHA -> COPY
 // promotion (and, just as importantly, that a NON-opaque draw is left alone).
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void) { return g_last_trilist_blend; }
@@ -1681,6 +2179,7 @@ extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap
     mf_init_once();                    // re-wires emitter, clears cache + counter
     g_lru_frame_floor = 0;             // start clean: nothing pinned before frame 1
+    g_lru_evict_floor = 0;             // [Phase 1 B3] ...and nothing pinned from before that
 }
 
 // Free the cached entry for GL texture `id` so the next draw re-stages it. Called
