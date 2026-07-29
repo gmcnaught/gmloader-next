@@ -32,6 +32,7 @@
 #include "mister/blitter.h"
 #include "mister/raster_backend.h"
 #include "mister/mister_native_audio.h"
+#include "mister/bench_godmode.h"
 // Global handle to bundled libGLES_sw.so — also used by egl.cpp and gles2.cpp via extern
 void* g_gles_handle = nullptr;
 
@@ -433,6 +434,9 @@ int main(int argc, char *argv[])
     patch_steam(libyoyo);
     patch_texture(libyoyo);
     patch_lua(libyoyo);
+#ifdef MISTER_NATIVE_VIDEO
+    patch_bench_godmode(libyoyo);
+#endif
     warning("DBG: all patches done\n");
 
     warning("DBG: before NewStringUTF apk_path\n");
