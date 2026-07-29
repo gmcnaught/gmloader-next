@@ -269,6 +269,12 @@ native-audio-writer-test:
 	  gmloader/mister/native_audio_writer.c \
 	  -o /tmp/nawt && /tmp/nawt
 
+.PHONY: fps-overlay-test
+fps-overlay-test:
+	cc -std=c11 -Wall -Wextra -O2 -Igmloader/mister \
+	  gmloader/mister/fps_overlay_test.c \
+	  -o /tmp/fpsov && /tmp/fpsov
+
 .PHONY: joy-script-test
 joy-script-test:
 	cc -std=c11 -O0 -g -Itools \

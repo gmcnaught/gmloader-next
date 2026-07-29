@@ -64,6 +64,7 @@
 // real per-texel alpha is a future RTL item.
 #include "raster_backend.h"
 #include "raster_backend_convert.h"
+#include "fps_overlay.h"   // [OSD-fps] clamp + 7-seg digit table (Solarus port)
 extern "C" {
 #include "blt_emitter.h"
 #include "blt_wire.h"
@@ -1944,6 +1945,88 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
     }
 }
 
+// ---- [OSD-fps] FPS overlay (ported from the Solarus core) -------------------
+// blitter_top.sv mirrors the OSD "FPS Overlay" toggle (status[20]) into
+// C_STATUS low32 bit1 every frame (S_WR_STATUS). When set, present() emits a
+// 2-digit 7-segment readout as plain BLT_OP_FILL rects after all of the
+// frame's draws, so it paints over the scene. Geometry mirrors the Solarus
+// implementation, re-anchored to the 288x216 fabric framebuffer.
+static const int      FPSOV_DIGIT_W = 8;
+static const int      FPSOV_DIGIT_H = 14;
+static const int      FPSOV_SEG_T   = 2;    // segment thickness
+static const int      FPSOV_GAP     = 2;    // gap between the two digits
+static const int      FPSOV_MARGIN  = 12;   // margin from the FB's right/bottom edges
+static const int      FPSOV_BG_PAD  = 2;    // background panel padding around the digits
+static const uint16_t FPSOV_BG      = 0x0000;   // black background panel
+static const uint16_t FPSOV_FG      = 0x07E0;   // green digits (RGB565)
+
+// Rolling FPS at present() cadence, the same 30-frame accumulator Solarus ran
+// in its MainLoop. mf_present is called once per engine frame, so the readout
+// is engine FPS (what the fabric actually displays), not fabric raster rate.
+static double g_fps_value = 0.0;
+static void mf_fps_tick(void) {
+    static struct timespec last = {0, 0};
+    static double acc_ms = 0.0;
+    static int    acc_n  = 0;
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    if (last.tv_sec | last.tv_nsec) {
+        acc_ms += (double)(now.tv_sec - last.tv_sec) * 1000.0
+                + (double)(now.tv_nsec - last.tv_nsec) / 1e6;
+        if (++acc_n >= 30) {
+            g_fps_value = acc_ms > 0.0 ? 1000.0 * acc_n / acc_ms : 0.0;
+            acc_ms = 0.0; acc_n = 0;
+        }
+    }
+    last = now;
+}
+
+// [OSD-fps] Whether the OSD "FPS Overlay" toggle is currently on (C_STATUS
+// low32 bit1, a raw status[20] level — see blitter_top's S_WR_STATUS). Oracle
+// build reads the ctrl shadow, which stays 0 unless a test sets it, so the
+// parity goldens are untouched.
+static inline bool mf_fps_overlay_enabled(void) {
+#ifdef MISTER_NATIVE_VIDEO
+    if (!g_dev_ok) return false;
+#endif
+    return (mf_ctrl_rd(MF_C_STATUS) & 0x2u) != 0;
+}
+
+// [OSD-fps] Draw one 7-segment digit (0-9) via blt_fill segment rects.
+// (x,y) = top-left of the digit cell.
+static void mf_emit_fps_digit(int x, int y, int digit) {
+    if (digit < 0 || digit > 9) return;
+    uint8_t segs = FPSOV_SEGMENTS[digit];
+    const int W = FPSOV_DIGIT_W, H = FPSOV_DIGIT_H, T = FPSOV_SEG_T;
+    if (segs & 0x01) blt_fill(&g_e, x + 1,     y,             W - 2, T,       FPSOV_FG); // a
+    if (segs & 0x02) blt_fill(&g_e, x + W - T, y + 1,         T,     H/2 - 1, FPSOV_FG); // b
+    if (segs & 0x04) blt_fill(&g_e, x + W - T, y + H/2,       T,     H/2 - 1, FPSOV_FG); // c
+    if (segs & 0x08) blt_fill(&g_e, x + 1,     y + H - T,     W - 2, T,       FPSOV_FG); // d
+    if (segs & 0x10) blt_fill(&g_e, x,         y + H/2,       T,     H/2 - 1, FPSOV_FG); // e
+    if (segs & 0x20) blt_fill(&g_e, x,         y + 1,         T,     H/2 - 1, FPSOV_FG); // f
+    if (segs & 0x40) blt_fill(&g_e, x + 1,     y + (H-T)/2,   W - 2, T,       FPSOV_FG); // g
+}
+
+// [OSD-fps] Draw the 2-digit FPS readout (00-99) with a background panel,
+// bottom-right corner of the WORK buffer. Called from present() right before
+// mf_frame_end, so it overlays the game's own draws for this frame.
+static void mf_emit_fps_overlay_fills(void) {
+    // The overlay lands on the scanned-out WORK buffer, never the app surface:
+    // restore the target if the frame's last op left it on APPSURF.
+    if (g_cur_target != MF_TARGET_WORK) {
+        blt_set_target(&g_e, MF_TARGET_WORK);
+        g_cur_target = MF_TARGET_WORK;
+    }
+    int fps = fps_overlay_clamp(g_fps_value);
+    int tens = fps / 10, ones = fps % 10;
+    const int total_w = FPSOV_DIGIT_W * 2 + FPSOV_GAP;
+    const int x0 = BLT_FB_WIDTH  - total_w - FPSOV_MARGIN;
+    const int y0 = BLT_FB_HEIGHT - FPSOV_DIGIT_H - FPSOV_MARGIN;
+    blt_fill(&g_e, x0 - FPSOV_BG_PAD, y0 - FPSOV_BG_PAD,
+             total_w + 2 * FPSOV_BG_PAD, FPSOV_DIGIT_H + 2 * FPSOV_BG_PAD, FPSOV_BG);
+    mf_emit_fps_digit(x0, y0, tens);
+    mf_emit_fps_digit(x0 + FPSOV_DIGIT_W + FPSOV_GAP, y0, ones);
+}
+
 static void mf_frame_end(void);   // forward decl: defined below, called from mf_present
 
 // Task 7: production entry point for present() — the frame loop calls
@@ -1952,7 +2035,13 @@ static void mf_frame_end(void);   // forward decl: defined below, called from mf
 // and close the frame so the next clear/draw starts fresh. If no clear/draw
 // happened this "frame" (g_frame_active false), there is nothing to execute.
 static void mf_present(const RSurface *) {
+    mf_fps_tick();   // engine present cadence == the FPS the display shows
     if (g_frame_active) {
+        // [OSD-fps] Emit last, over everything this frame drew. Skipped when the
+        // ring was never rebuilt (g_frame_dropped) or already overflowed — those
+        // frames are dropped by mf_frame_end and must not grow the batch.
+        if (!g_frame_dropped && !g_e.overflow && mf_fps_overlay_enabled())
+            mf_emit_fps_overlay_fills();
         mf_frame_end();
         g_frame_active = false;
     }
