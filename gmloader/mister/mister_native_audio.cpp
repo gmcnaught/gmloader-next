@@ -23,13 +23,20 @@
 
 namespace {
 
-// 500 ms of the sink format: 48000 * 4 * 500 / 1000.
+// MISTER_AUDIO_STAGING_CAP_MS of the sink format.
 const uint32_t kStagingCapBytes =
     (uint32_t)NA_SAMPLE_RATE * NA_BYTES_PER_FRAME * MISTER_AUDIO_STAGING_CAP_MS / 1000u;
 
 // Solarus's constants (mister_native_audio.cpp:56-57,105): keep ~100 ms of
 // audio queued in the ring, and never render more than 16 KiB in one pass.
-const size_t kTargetFillFrames = 4800;
+//
+// Derived from NA_SAMPLE_RATE, not hardcoded: this was 4800, which read as
+// "100 ms" only while the sink was 48 kHz and would have silently become 218 ms
+// at the native rate.
+//
+// LOCKSTEP: gm_audio's TARGET_QW parameter is this in QWORDS (two frames per
+// qword), and its slew loop pulls ring occupancy toward that value.
+const size_t kTargetFillFrames = NA_SAMPLE_RATE / 10;
 const size_t kMaxFramesPerPass = 4096;
 
 int16_t g_mixbuf[kMaxFramesPerPass * NA_CHANNELS];
@@ -129,8 +136,10 @@ bool pump_thread_enabled(void) {
 
 void *pump_main(void *) {
     // Ring-driven: the FPGA drain is the clock. PumpOnce refills TO a fixed
-    // level, so the long-run submit rate equals the 48 kHz drain rate and the
-    // pitch is exact. Sleep only when there is nothing to do.
+    // level, so the long-run submit rate equals the drain rate and the pitch is
+    // exact. gm_audio closes the other half of that loop -- it slews its own
+    // consumption toward kTargetFillFrames of occupancy -- so neither side has
+    // to assume the other's rate. Sleep only when there is nothing to do.
     const struct timespec idle = { 0, 1000 * 1000 };   // 1 ms
     while (g_pump_running.load(std::memory_order_acquire)) {
         if (MisterAudio_PumpOnce() == 0)
@@ -173,7 +182,8 @@ bool MisterAudio_Init(void) {
         }
     }
 
-    fprintf(stderr, "MisterAudio: native audio active (48000 Hz stereo S16)\n");
+    fprintf(stderr, "MisterAudio: native audio active (%d Hz stereo S16)\n",
+            NA_SAMPLE_RATE);
     return true;
 }
 
