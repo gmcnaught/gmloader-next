@@ -1575,6 +1575,15 @@ static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
     return ref;
 }
 
+// [Phase 3 Stage A] GMLOADER_MFGPU_TRACE forward decls: defined next to
+// mf_uvlog_on below (same bring-up-capture neighbourhood), called from
+// mf_emit_group's success path above that definition.
+static int mf_trace_on(void);
+static int mf_trace_in_window(void);
+static void mf_trace_group(const blt_surface_ref_t &tex, int tw, int th,
+                           uint8_t blend_mode, uint16_t colorkey,
+                           uint8_t extra_flags, int nt);
+
 // Emit one BLT_OP_TRILIST for `nt` triangles (`verts` = nt*3 vertices, whose UVs
 // address the `tw`x`th` page `tex`). Converts + pushes the vertices, selects the
 // colorkey-vs-blend mode (has_key + fully-opaque => BLT_BLEND_COLORKEY, exactly
@@ -1641,6 +1650,8 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", nt);
         return;
     }
+    if (mf_trace_on() && mf_trace_in_window())
+        mf_trace_group(tex, tw, th, blend_mode, colorkey, extra_flags, nt);
     // Coverage estimate (Task 4, moved here per review — see the long comment at
     // g_cov_px_accum's declaration): this is the actual point triangles are pushed
     // into the fabric ring, downstream of every silent-discard path in mf_draw
@@ -1655,6 +1666,51 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
             mf_cov_add_triangle(a.x, a.y, b.x, b.y, c.x, c.y);
         }
     }
+}
+
+// ── [Phase 3 Stage A] GMLOADER_MFGPU_TRACE ───────────────────────────────────
+// Draw-stream capture for offline sizing + sim replay. Dumps, at the single
+// point every surviving draw passes (mf_emit_group, after blt_trilist accepts),
+// the exact wire-level data the fabric will read: the resolved blend/colorkey
+// and the converted blt_vtx_t integers — NOT the float BVtx, so the offline
+// consumers replay what the device executed, conversion included.
+static FILE *mf_trace_f = NULL;
+static int mf_trace_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_TRACE");
+        if (e && *e) { mf_trace_f = fopen(e, "w"); v = (mf_trace_f != NULL); }
+        else v = 0;
+    }
+    return v;
+}
+static long mf_trace_env_long(const char *name, long dflt) {
+    const char *e = getenv(name);
+    return (e && *e) ? atol(e) : dflt;
+}
+static int mf_trace_in_window(void) {
+    static long start = -1, frames = -1;
+    if (start < 0) {
+        start  = mf_trace_env_long("GMLOADER_MFGPU_TRACE_START", 0);
+        frames = mf_trace_env_long("GMLOADER_MFGPU_TRACE_FRAMES", 8);
+    }
+    return g_frame_no >= start && g_frame_no < start + frames;
+}
+static void mf_trace_group(const blt_surface_ref_t &tex, int tw, int th,
+                           uint8_t blend_mode, uint16_t colorkey,
+                           uint8_t extra_flags, int nt) {
+    fprintf(mf_trace_f,
+            "MFTRACE G f=%d off=%u stride=%u texw=%d texh=%d fmt=%u "
+            "blend=%u key=%u alpha=255 flags=%u nt=%d\n",
+            g_frame_no, tex.off, (unsigned)tex.stride, tw, th,
+            (unsigned)tex.format, (unsigned)blend_mode, (unsigned)colorkey,
+            (unsigned)extra_flags, nt);
+    for (int i = 0; i < nt * 3; i++)
+        fprintf(mf_trace_f, "MFTRACE V %d %d %d %d %08x\n",
+                (int)g_vtxscratch[i].x, (int)g_vtxscratch[i].y,
+                (int)g_vtxscratch[i].u, (int)g_vtxscratch[i].v,
+                g_vtxscratch[i].rgba);
+    fflush(mf_trace_f);   // engine may be SIGKILLed by the bench teardown
 }
 
 // ── [Y-orientation bring-up capture] GMLOADER_MFGPU_UVLOG ────────────────────
@@ -2291,6 +2347,12 @@ extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba) {
     g_defRGBA = rgba;
 }
 
+// [Phase 3 Stage A] host hook: read g_frame_no as-is rather than mirroring or
+// assuming it — it is a whole-process monotonic counter TestReinit never
+// resets (only mf_frame_begin increments it), so a test that needs to reason
+// about the GMLOADER_MFGPU_TRACE window must read the real value instead of
+// hardcoding 0. Same "read from the backend" rationale as the OVF_* hooks below.
+extern "C" int RasterBackend_MFGPU_TestFrameNo(void) { return g_frame_no; }
 // Task 2 host hooks: count real blt_uploads (cache-hit-vs-miss proof) and force
 // a clean re-init with an optional capped texture-heap size (0 = full MF_TEX_HEAP;
 // nonzero lets the Task 4 eviction test shrink the allocator on purpose).
