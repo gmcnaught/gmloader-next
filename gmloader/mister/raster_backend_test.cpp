@@ -113,6 +113,9 @@ extern "C" uint32_t RasterBackend_MFGPU_TestCrtStripped(void);
 // [Phase 3 Stage A / Task 2] g_frame_no as-is — a whole-process monotonic
 // counter TestReinit never resets. See raster_backend_mfgpu.cpp's hook comment.
 extern "C" int RasterBackend_MFGPU_TestFrameNo(void);
+// [Phase 3 Stage A / Task 2] Force GMLOADER_MFGPU_TRACE's cached getenv()
+// reads to re-resolve. See raster_backend_mfgpu.cpp's hook comment.
+extern "C" void RasterBackend_MFGPU_TestTraceReset(void);
 
 extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
 
@@ -2488,18 +2491,19 @@ static void rbt_end_frame(void) {
 // and the file is untouched outside the window or when the env is unset.
 //
 // mf_trace_on()/mf_trace_in_window() cache their getenv() reads in
-// process-lifetime statics (the same zero-cost idiom as mf_stat_on()), so this
-// case MUST run before any other case's first backend_mfgpu.draw() call —
-// that first call is what permanently resolves the cache. It is registered
-// FIRST in main(), ahead of one_case() (the only earlier candidate, one_case,
-// goes through RasterBackend_Select() which always returns backend_sw here —
-// see raster_backend.h — so it never touches backend_mfgpu). It also reads
-// the frame number the emitter is ALREADY at via TestFrameNo() instead of
-// assuming 0, so the window math stays correct even if that ordering ever
-// changes.
+// process-lifetime statics (the same zero-cost idiom as mf_stat_on()), so
+// without help this case would only work as the very first thing to call
+// backend_mfgpu.draw() in the whole binary. RasterBackend_MFGPU_TestTraceReset()
+// (host-test-only, mirrors TestReinit's "force a clean state" contract) clears
+// those cached values so mf_trace_on()/mf_trace_in_window() re-resolve the
+// environment fresh here, regardless of what already ran earlier in main() —
+// so this case's position in main() is NOT load-bearing. It also reads the
+// frame number the emitter is ALREADY at via TestFrameNo() instead of assuming
+// 0, so the window math stays correct regardless of position too.
 static int case_mfgpu_trace_capture(void) {
     const char *path = "/tmp/rbt_mftrace.txt";
     unlink(path);
+    RasterBackend_MFGPU_TestTraceReset();
     rbt_reinit_mfgpu();
     // mf_frame_begin() increments g_frame_no BEFORE use, so the first frame this
     // case drives is (current + 1), not the current value.
@@ -2521,6 +2525,8 @@ static int case_mfgpu_trace_capture(void) {
     if (!f) {
         printf("  FAIL mfgpu-trace  trace file does not exist\n");
         unsetenv("GMLOADER_MFGPU_TRACE");
+        unsetenv("GMLOADER_MFGPU_TRACE_START");
+        unsetenv("GMLOADER_MFGPU_TRACE_FRAMES");
         return 0;
     }
     int g_lines = 0, v_lines = 0, bad = 0; char ln[256];
@@ -2554,6 +2560,8 @@ static int case_mfgpu_trace_capture(void) {
     }
     fclose(f);
     unsetenv("GMLOADER_MFGPU_TRACE");
+    unsetenv("GMLOADER_MFGPU_TRACE_START");
+    unsetenv("GMLOADER_MFGPU_TRACE_FRAMES");
 
     // Exactly 2 groups (the two in-window frames), each a 2-tri quad -> 6 V lines.
     if (g_lines != 2) {
@@ -2582,10 +2590,6 @@ static int case_mfgpu_trace_capture(void) {
 
 int main(void){
     int ok = 1;
-    // MUST run first — see case_mfgpu_trace_capture's comment on the
-    // process-lifetime getenv cache in mf_trace_on()/mf_trace_in_window().
-    if (!case_mfgpu_trace_capture()) { printf("FAIL mfgpu-trace\n"); ok = 0; }
-    else printf("raster_backend mfgpu-trace OK\n");
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
     else printf("raster_backend sw-equivalence OK\n");
     if (!case_clear_parity()) { printf("FAIL mfgpu-clear-parity\n"); ok = 0; }
@@ -2660,5 +2664,11 @@ int main(void){
     else printf("raster_backend mfgpu-strip-crt OK\n");
     if (!case_strip_crt_mask()) { printf("FAIL mfgpu-strip-mask\n"); ok = 0; }
     else printf("raster_backend mfgpu-strip-mask OK\n");
+    // Deliberately registered LAST, after every other case has already called
+    // backend_mfgpu.draw() many times over: proves RasterBackend_MFGPU_TestTraceReset()
+    // actually makes this case position-independent rather than merely untested at
+    // a later position.
+    if (!case_mfgpu_trace_capture()) { printf("FAIL mfgpu-trace\n"); ok = 0; }
+    else printf("raster_backend mfgpu-trace OK\n");
     return ok ? 0 : 1;
 }

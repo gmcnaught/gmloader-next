@@ -1674,27 +1674,32 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
 // the exact wire-level data the fabric will read: the resolved blend/colorkey
 // and the converted blt_vtx_t integers — NOT the float BVtx, so the offline
 // consumers replay what the device executed, conversion included.
+// Cached getenv() reads: file-scope (not function-local) statics so a
+// host-test-only hook (RasterBackend_MFGPU_TestTraceReset, near the other
+// Test* hooks below) can force them to re-resolve. Production still gets the
+// zero-cost idiom -- nothing here reads getenv() more than once per process
+// unless that hook is called, which only the host test suite does.
 static FILE *mf_trace_f = NULL;
+static int  mf_trace_v = -1;                        // cached mf_trace_on() result
+static long mf_trace_start = -1, mf_trace_frames = -1;  // cached window bounds
 static int mf_trace_on(void) {
-    static int v = -1;
-    if (v < 0) {
+    if (mf_trace_v < 0) {
         const char *e = getenv("GMLOADER_MFGPU_TRACE");
-        if (e && *e) { mf_trace_f = fopen(e, "w"); v = (mf_trace_f != NULL); }
-        else v = 0;
+        if (e && *e) { mf_trace_f = fopen(e, "w"); mf_trace_v = (mf_trace_f != NULL); }
+        else mf_trace_v = 0;
     }
-    return v;
+    return mf_trace_v;
 }
 static long mf_trace_env_long(const char *name, long dflt) {
     const char *e = getenv(name);
     return (e && *e) ? atol(e) : dflt;
 }
 static int mf_trace_in_window(void) {
-    static long start = -1, frames = -1;
-    if (start < 0) {
-        start  = mf_trace_env_long("GMLOADER_MFGPU_TRACE_START", 0);
-        frames = mf_trace_env_long("GMLOADER_MFGPU_TRACE_FRAMES", 8);
+    if (mf_trace_start < 0) {
+        mf_trace_start  = mf_trace_env_long("GMLOADER_MFGPU_TRACE_START", 0);
+        mf_trace_frames = mf_trace_env_long("GMLOADER_MFGPU_TRACE_FRAMES", 8);
     }
-    return g_frame_no >= start && g_frame_no < start + frames;
+    return g_frame_no >= mf_trace_start && g_frame_no < mf_trace_start + mf_trace_frames;
 }
 static void mf_trace_group(const blt_surface_ref_t &tex, int tw, int th,
                            uint8_t blend_mode, uint16_t colorkey,
@@ -2353,6 +2358,22 @@ extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba) {
 // about the GMLOADER_MFGPU_TRACE window must read the real value instead of
 // hardcoding 0. Same "read from the backend" rationale as the OVF_* hooks below.
 extern "C" int RasterBackend_MFGPU_TestFrameNo(void) { return g_frame_no; }
+// [Phase 3 Stage A] host-test-only hook: force GMLOADER_MFGPU_TRACE's cached
+// getenv() reads to re-resolve. mf_trace_on()/mf_trace_in_window() cache in
+// process-lifetime statics on purpose (zero-cost on device, same idiom as
+// mf_stat_on()), which makes them resolve ONCE per process -- fine on device,
+// but it means a host case that sets the env vars mid-run only works if
+// nothing upstream in the same test binary already resolved the cache.
+// Mirrors RasterBackend_MFGPU_TestReinit's "force a clean state" contract:
+// closes any open trace file and clears every cached value, so the next
+// mf_trace_on()/mf_trace_in_window() call reads the environment fresh,
+// regardless of what already ran earlier in the process.
+extern "C" void RasterBackend_MFGPU_TestTraceReset(void) {
+    if (mf_trace_f) { fclose(mf_trace_f); mf_trace_f = NULL; }
+    mf_trace_v = -1;
+    mf_trace_start = -1;
+    mf_trace_frames = -1;
+}
 // Task 2 host hooks: count real blt_uploads (cache-hit-vs-miss proof) and force
 // a clean re-init with an optional capped texture-heap size (0 = full MF_TEX_HEAP;
 // nonzero lets the Task 4 eviction test shrink the allocator on purpose).
