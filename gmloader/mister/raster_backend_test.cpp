@@ -61,6 +61,9 @@ extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void);
 // awaits that ran with no batch in flight — the only way to observe publish/await ORDER on
 // a host build, where both halves are near-no-ops and counters look identical either way.
 extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestLastPublishedSeq(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestLastAwaitedSeq(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestEmitterSeq(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestSeamDepthViolations(void);
 // Control-word write trace for the last publish (see raster_backend_mfgpu.cpp's trace shim).
 extern "C" uint32_t RasterBackend_MFGPU_TestTraceLen(void);
@@ -1391,10 +1394,25 @@ static int case_appsurf_composite_1to1(void) {
 // and its timeout abandons exactly that guarantee, after which the next frame's
 // blt_begin_frame(cmd_count=0, vtx_used=0) plus texture staging lands on top of the live batch.
 // Device-measured 2026-07-24: that is what escalated isolated fabric hiccups into 15s cascades
-// of garbage geometry. The guard drops WHOLE frames while a submit is unacked. This case locks
-// the invariant that a dropped frame touches NOTHING: no emit, no upload, no stage, no cursor
-// reset. It drives the real vtable (clear/draw/present) and asserts via the host oracle that
-// the previously executed frame's pixels survive the dropped frame untouched.
+// of garbage geometry.
+//
+// [Phase 2 host lever] The invariant this case locks CHANGED, deliberately. It used to be
+// "a dropped frame touches NOTHING" — true when the await sat at mf_frame_begin, because the
+// frame was refused before it emitted anything. The await now sits at the publish barrier, so
+// a frame whose arena is free builds in full (emit, upload, stage) and is refused only at the
+// doorbell. That is the whole point of the lever: draw emission, present and capture overlap
+// the fabric's raster window instead of queueing behind it.
+//
+// What must still hold is the property the old invariant was a proxy for: THE DROPPED FRAME
+// MUST NOT DISTURB THE BATCH THE FABRIC IS STILL READING. Asserted directly here:
+//   - the in-flight arena's ring and vertex window are byte-identical across the dropped
+//     frame (the arena flip, B1, is what buys this — blt_begin_frame rewinds the OTHER one);
+//   - nothing was evicted from the texture heap, so no page the live batch references was
+//     freed and reused (pin-for-two-frames, B3, is what buys this under real pressure —
+//     case_lru_2frame and case_pin_insert_2frame lock that side);
+//   - the previously executed frame's pixels survive untouched, i.e. the dropped frame
+//     never reached blt_execute.
+// Frame C then proves the guard releases and normal service resumes.
 static int case_inflight_drop(void) {
     static const uint8_t red[4]  = { 255, 0, 0, 255 };
     static const uint8_t blue[4] = { 0, 0, 255, 255 };
@@ -1417,8 +1435,20 @@ static int case_inflight_drop(void) {
     const uint32_t up_after_A = RasterBackend_MFGPU_TestUploadCount();
     const uint32_t st_after_A = RasterBackend_MFGPU_TestStageCount();
     const uint32_t dr_after_A = RasterBackend_MFGPU_TestDropCount();
+    const uint32_t ev_after_A = RasterBackend_MFGPU_TestEvictAttempts();
+    // [Phase 2 host lever] Snapshot the arena frame A published, i.e. the one the fabric is
+    // now reading. The emitter still points at it here; frame B's mf_frame_begin flips away
+    // before it rewinds anything, so these bytes must not move. SNAP covers far more than
+    // the two commands and three vertices this frame emits, and a rewind writes from offset
+    // zero, so any reuse of this arena lands inside the window.
+    enum { SNAP = 4096 };
+    const uint8_t *ring_A = (const uint8_t *)RasterBackend_MFGPU_TestRingBase();
+    const uint8_t *vtx_A  = (const uint8_t *)RasterBackend_MFGPU_TestVtxBase();
+    static uint8_t ring_snap[SNAP], vtx_snap[SNAP];
+    memcpy(ring_snap, ring_A, SNAP);
+    memcpy(vtx_snap,  vtx_A,  SNAP);
 
-    // frame B: the fabric has not acked -> must be dropped whole
+    // frame B: the fabric has not acked -> must be refused at the publish barrier
     RasterBackend_MFGPU_TestSetFabricBusy(1);
     backend_mfgpu.clear(&s_mf, 0,0,0,255);
     backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, next_key());
@@ -1431,18 +1461,27 @@ static int case_inflight_drop(void) {
                RasterBackend_MFGPU_TestDropCount(), dr_after_A + 1);
         return 0;
     }
-    if (RasterBackend_MFGPU_TestUploadCount() != up_after_A ||
-        RasterBackend_MFGPU_TestStageCount()  != st_after_A) {
-        printf("  FAIL inflight-drop  dropped frame still touched the heap "
-               "(upload %u->%u, stage %u->%u)\n", up_after_A,
-               RasterBackend_MFGPU_TestUploadCount(), st_after_A,
-               RasterBackend_MFGPU_TestStageCount());
+    if (memcmp(ring_snap, ring_A, SNAP) != 0) {
+        printf("  FAIL inflight-drop  dropped frame rewrote the IN-FLIGHT ring "
+               "(arena %u was live)\n", RasterBackend_MFGPU_TestArena() ^ 1u);
+        return 0;
+    }
+    if (memcmp(vtx_snap, vtx_A, SNAP) != 0) {
+        printf("  FAIL inflight-drop  dropped frame rewrote the IN-FLIGHT vertex window\n");
+        return 0;
+    }
+    if (RasterBackend_MFGPU_TestEvictAttempts() != ev_after_A) {
+        printf("  FAIL inflight-drop  dropped frame evicted from the texture heap "
+               "(%u->%u attempts) - a page the live batch reads may have been reused\n",
+               ev_after_A, RasterBackend_MFGPU_TestEvictAttempts());
         return 0;
     }
     if (memcmp(fbA, fbB, sizeof fbA) != 0) {
         printf("  FAIL inflight-drop  dropped frame still executed (framebuffer changed)\n");
         return 0;
     }
+
+    const uint32_t st_dropped = RasterBackend_MFGPU_TestStageCount() - st_after_A;
 
     // frame C: fabric acked -> normal service resumes and the BLUE triangle lands
     RasterBackend_MFGPU_TestSetFabricBusy(0);
@@ -1461,7 +1500,9 @@ static int case_inflight_drop(void) {
         return 0;
     }
     RasterBackend_MFGPU_TestSetFabricBusy(-1);
-    printf("  OK   inflight-drop  1 frame dropped intact, service resumed\n");
+    printf("  OK   inflight-drop  1 frame refused at the barrier (staged %u tex, live arena "
+           "+ heap untouched), service resumed\n",
+           st_dropped);
     return 1;
 }
 
@@ -1573,6 +1614,10 @@ static int case_submit_publish_await_split(void) {
     // Two frames: the await is deferred to the top of the next frame (B2), so one frame
     // alone publishes without ever awaiting. Driving two closes the pair.
     mf_test_drive_one_frame();
+    // [Phase 2 host lever] The seq frame 1's doorbell carried. Frame 2's publish barrier
+    // must await exactly this one, so it has to be captured before frame 2 publishes a
+    // newer one over the witness.
+    const uint32_t pub_seq_1 = RasterBackend_MFGPU_TestLastPublishedSeq();
     mf_test_drive_one_frame();
 
     // Checked BEFORE the raw counts: "a batch was published while another was still in
@@ -1594,6 +1639,30 @@ static int case_submit_publish_await_split(void) {
     }
     if (awa1 != 1) {   // frame 2 awaited frame 1; frame 2's own await is still deferred
         printf("  FAIL submit-split: expected 1 await after 2 frames, got %u\n", awa1);
+        return 0;
+    }
+
+    // [Phase 2 host lever] The await must poll C_DONE for the sequence the DOORBELL
+    // actually carried. Off-device there is no C_DONE, so the pairing is asserted through
+    // the two seam witnesses instead — and it is worth asserting precisely because the
+    // oracle cannot feel the consequence. On device it is fatal: the await polls until
+    // C_DONE equals the awaited seq, so chasing a sequence that was never published can
+    // only end in the 200 ms timeout, every frame. Measured on .62 2026-07-29 with the
+    // await polling g_e.submit_seq from the publish barrier (which blt_end_frame has
+    // already bumped for the frame being built): to=30 of 30 submits, wait_ms avg 205,
+    // C_DONE period 535 ms — 1.9 fps against a fabric reporting 19.29 ms per frame.
+    if (RasterBackend_MFGPU_TestLastAwaitedSeq() != pub_seq_1) {
+        printf("  FAIL submit-split: await polled for seq=%u but the in-flight batch's "
+               "doorbell carried seq=%u (emitter is now at %u) — that wait can never be "
+               "satisfied\n", RasterBackend_MFGPU_TestLastAwaitedSeq(), pub_seq_1,
+               RasterBackend_MFGPU_TestEmitterSeq());
+        return 0;
+    }
+    // Vacuity guard: the two seqs must actually be distinguishable, or the check above
+    // passes for a build where the await chases the emitter's live sequence.
+    if (pub_seq_1 == RasterBackend_MFGPU_TestEmitterSeq()) {
+        printf("  FAIL submit-split: emitter seq did not advance past the in-flight "
+               "batch's (%u) — the awaited-seq check cannot discriminate\n", pub_seq_1);
         return 0;
     }
 
