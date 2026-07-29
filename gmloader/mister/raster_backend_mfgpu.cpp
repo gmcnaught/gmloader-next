@@ -155,6 +155,12 @@ static uint32_t   g_stage_count  = 0;   // BLT_OP_STAGE emits since reinit (FO T
 static uint32_t g_arena            = 0;      // [Phase 1 B1] which arena this frame owns (0/1)
 static bool     g_fabric_pending   = false;  // a submitted batch has not been acked yet
 static uint32_t g_pending_seq      = 0;      // the submit_seq we are waiting on
+// [Phase 2 host lever] Seam witnesses: the seq the last publish rang the doorbell with, and
+// the seq the last await polled C_DONE for. They must be equal — an await chasing any other
+// sequence can never be satisfied. Set on both device and host paths so the oracle can
+// assert it; C_DONE itself does not exist off-device.
+static uint32_t g_last_published_seq = 0;
+static uint32_t g_last_awaited_seq   = 0;
 static bool     g_frame_dropped    = false;  // this frame is being dropped (emit nothing)
 static uint32_t g_drop_count       = 0;      // frames dropped since reinit (test hook)
 static int      g_test_fabric_busy = -1;     // host tests force the predicate (-1 = ask for real)
@@ -952,6 +958,7 @@ static void mf_device_publish(void) {
     }
     mf_ctrl_barrier();                          // data before doorbell (traced)
     mf_ctrl_wr(MF_C_SUBMIT, g_e.submit_seq);    // doorbell LAST
+    g_last_published_seq = g_e.submit_seq;      // [Phase 2 host lever] seam witness
     clock_gettime(CLOCK_MONOTONIC, &g_publish_t0);
     g_publish_count++;
     // Depth, not a bool: a bool is idempotent, so publish(); publish(); await() would look
@@ -969,13 +976,26 @@ static void mf_device_await(void) {
     // [Phase 1 B2] Ordering witness: awaiting with nothing in flight means publish and
     // await ran out of order, or a publish was lost. See g_publish_depth.
     if (g_publish_depth <= 0) g_unpaired_awaits++;
+    // [Phase 2 host lever] Witness: WHICH sequence this await polls for. It must be the
+    // batch that was published (g_pending_seq), never the emitter's live g_e.submit_seq.
+    // Those were the same value while the await sat in mf_frame_begin -- blt_end_frame had
+    // not yet bumped submit_seq for the new frame. At the publish barrier they differ by
+    // one, so polling submit_seq waits for a batch that only exists AFTER the publish this
+    // await is gating: every await then burns the full 200 ms timeout, and the timeout path
+    // used to write that unpublished seq into g_pending_seq, wedging mf_fabric_still_busy()
+    // true forever. Device-measured .62 2026-07-29: to=30 of 30, wait_ms avg 205, period
+    // 535 ms (1.9 fps) against a fabric reporting 19.29 ms.
+    // `want` is used BOTH by the witness and by the poll below, so the witness cannot
+    // drift away from what is actually being waited for.
+    const uint32_t want = g_pending_seq;
+    g_last_awaited_seq  = want;
 #ifdef MISTER_NATIVE_VIDEO
     struct timespec t0 = g_publish_t0;
     if (mf_nowait_on()) { mf_submit_stat(&t0, 0, /*timeout=*/0); return; }  // probe: no poll
     long iters = 0;
     const long poll_us = mf_poll_us();
     for (;;) {
-        if (mf_ctrl_rd(MF_C_DONE) == g_e.submit_seq) {   // fabric consumed it
+        if (mf_ctrl_rd(MF_C_DONE) == want) {   // fabric consumed the PUBLISHED batch
             mf_submit_stat(&t0, iters, /*timeout=*/0);
             return;
         }
@@ -994,14 +1014,17 @@ static void mf_device_await(void) {
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         long ms = (now.tv_sec - t0.tv_sec) * 1000L + (now.tv_nsec - t0.tv_nsec) / 1000000L;
         if (ms >= mf_timeout_ms()) {
-            fprintf(stderr, "backend_mfgpu: fabric submit timeout (submit=%u done=%u status=%u waited=%ldms)\n",
-                    g_e.submit_seq, mf_ctrl_rd(MF_C_DONE), mf_ctrl_rd(MF_C_STATUS), ms);
+            fprintf(stderr, "backend_mfgpu: fabric submit timeout (pending=%u emitter=%u done=%u "
+                    "status=%u waited=%ldms)\n", want, g_e.submit_seq,
+                    mf_ctrl_rd(MF_C_DONE), mf_ctrl_rd(MF_C_STATUS), ms);
             mf_submit_stat(&t0, iters, /*timeout=*/1);
             // [in-flight-batch guard] We are abandoning the wait, NOT the batch: the fabric
-            // is still reading this ring. Remember the sequence so the next frames drop
-            // whole rather than rebuilding the ring underneath it.
+            // is still reading this ring, so the next frames must drop whole rather than
+            // rebuilding it underneath. g_pending_seq already names that batch and is left
+            // ALONE -- overwriting it with the emitter's live seq (which at the publish
+            // barrier is the frame this await is gating, one ahead) is what made
+            // mf_fabric_still_busy() true forever.
             g_fabric_pending = true;
-            g_pending_seq    = g_e.submit_seq;
             // g_publish_depth is NOT decremented on purpose: the batch is still in flight,
             // so a later re-await of it (Task 4 awaits from mf_frame_begin) stays paired.
             return;
@@ -1041,6 +1064,7 @@ static void mf_init_once(void) {
     g_publish_count = 0; g_await_count = 0;   // [Phase 1 B2] submit-seam counters
     g_arena = 0;                                                              // [Phase 1 B1] arena parity
     g_publish_depth = 0; g_unpaired_awaits = 0; g_seam_depth_violations = 0;  // [Phase 1 B2] ordering witness
+    g_last_published_seq = 0; g_last_awaited_seq = 0;   // [Phase 2 host lever] seam witnesses
     g_ctrl_trace_n = 0; g_ctrl_trace_overflow = 0;                             // [Phase 1 B2] control-write trace
     g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
     g_last_draw.valid = false; g_dup_skipped = 0;
@@ -2295,6 +2319,11 @@ extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void)   { return g_await_
 // issued while one was already in flight. Both must always be 0 — counters alone cannot see
 // publish/await order on the oracle (see g_publish_depth).
 extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void) { return g_unpaired_awaits; }
+// [Phase 2 host lever] The seq the last doorbell carried, and the seq the last await polled
+// C_DONE for. Unequal means the await can never be satisfied.
+extern "C" uint32_t RasterBackend_MFGPU_TestLastPublishedSeq(void) { return g_last_published_seq; }
+extern "C" uint32_t RasterBackend_MFGPU_TestLastAwaitedSeq(void)   { return g_last_awaited_seq; }
+extern "C" uint32_t RasterBackend_MFGPU_TestEmitterSeq(void)       { return g_e.submit_seq; }
 extern "C" uint32_t RasterBackend_MFGPU_TestSeamDepthViolations(void) { return g_seam_depth_violations; }
 // [Phase 1 B2] Control-word write trace for the LAST publish: reg index per entry
 // (MF_TRACE_BARRIER == -1 marks the memory barrier), so a test can pin that the doorbell is

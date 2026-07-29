@@ -61,6 +61,9 @@ extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void);
 // awaits that ran with no batch in flight — the only way to observe publish/await ORDER on
 // a host build, where both halves are near-no-ops and counters look identical either way.
 extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestLastPublishedSeq(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestLastAwaitedSeq(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestEmitterSeq(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestSeamDepthViolations(void);
 // Control-word write trace for the last publish (see raster_backend_mfgpu.cpp's trace shim).
 extern "C" uint32_t RasterBackend_MFGPU_TestTraceLen(void);
@@ -1611,6 +1614,10 @@ static int case_submit_publish_await_split(void) {
     // Two frames: the await is deferred to the top of the next frame (B2), so one frame
     // alone publishes without ever awaiting. Driving two closes the pair.
     mf_test_drive_one_frame();
+    // [Phase 2 host lever] The seq frame 1's doorbell carried. Frame 2's publish barrier
+    // must await exactly this one, so it has to be captured before frame 2 publishes a
+    // newer one over the witness.
+    const uint32_t pub_seq_1 = RasterBackend_MFGPU_TestLastPublishedSeq();
     mf_test_drive_one_frame();
 
     // Checked BEFORE the raw counts: "a batch was published while another was still in
@@ -1632,6 +1639,30 @@ static int case_submit_publish_await_split(void) {
     }
     if (awa1 != 1) {   // frame 2 awaited frame 1; frame 2's own await is still deferred
         printf("  FAIL submit-split: expected 1 await after 2 frames, got %u\n", awa1);
+        return 0;
+    }
+
+    // [Phase 2 host lever] The await must poll C_DONE for the sequence the DOORBELL
+    // actually carried. Off-device there is no C_DONE, so the pairing is asserted through
+    // the two seam witnesses instead — and it is worth asserting precisely because the
+    // oracle cannot feel the consequence. On device it is fatal: the await polls until
+    // C_DONE equals the awaited seq, so chasing a sequence that was never published can
+    // only end in the 200 ms timeout, every frame. Measured on .62 2026-07-29 with the
+    // await polling g_e.submit_seq from the publish barrier (which blt_end_frame has
+    // already bumped for the frame being built): to=30 of 30 submits, wait_ms avg 205,
+    // C_DONE period 535 ms — 1.9 fps against a fabric reporting 19.29 ms per frame.
+    if (RasterBackend_MFGPU_TestLastAwaitedSeq() != pub_seq_1) {
+        printf("  FAIL submit-split: await polled for seq=%u but the in-flight batch's "
+               "doorbell carried seq=%u (emitter is now at %u) — that wait can never be "
+               "satisfied\n", RasterBackend_MFGPU_TestLastAwaitedSeq(), pub_seq_1,
+               RasterBackend_MFGPU_TestEmitterSeq());
+        return 0;
+    }
+    // Vacuity guard: the two seqs must actually be distinguishable, or the check above
+    // passes for a build where the await chases the emitter's live sequence.
+    if (pub_seq_1 == RasterBackend_MFGPU_TestEmitterSeq()) {
+        printf("  FAIL submit-split: emitter seq did not advance past the in-flight "
+               "batch's (%u) — the awaited-seq check cannot discriminate\n", pub_seq_1);
         return 0;
     }
 
