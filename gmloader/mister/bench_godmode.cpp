@@ -50,17 +50,23 @@ void patch_bench_godmode(struct so_module *mod)
     if (env == NULL || strcmp(env, "1") != 0)
         return; /* off path: no hooks, bit-identical behavior */
 
-    if (ExecuteIt == NULL || ExecuteIt_flags == NULL) {
-        warning("bench_godmode: ExecuteIt symbols unresolved; not hooking\n");
+    if (ExecuteIt == NULL && ExecuteIt_flags == NULL) {
+        warning("bench_godmode: no ExecuteIt symbol resolved; not hooking\n");
         return;
     }
 
     warning("bench_godmode: enabled (GMLOADER_GODMODE=1)\n");
     /* Same Code_Execute pair the USE_LUA layer hooks (lua.cpp); if USE_LUA is
      * ever compiled into a MiSTer build, whichever patch_* runs last wins the
-     * hook (no chaining). USE_LUA is off in MiSTer builds today. */
-    hook_symbol(mod, "_Z12Code_ExecuteP9CInstanceS0_P5CCodeP6RValue",
-                (uintptr_t)&godmode_code_execute, 1);
-    hook_symbol(mod, "_Z12Code_ExecuteP9CInstanceS0_P5CCodeP6RValuei",
-                (uintptr_t)&godmode_code_execute_flags, 1);
+     * hook (no chaining). USE_LUA is off in MiSTer builds today.
+     * Guard each variant independently: this game's runner resolves only the
+     * 4-arg ExecuteIt (no _flags variant exists in its libyoyo), and requiring
+     * both disabled godmode entirely (device log: 'Symbol "ExecuteIt_flags"
+     * not found'). Hook only what resolved. */
+    if (ExecuteIt != NULL)
+        hook_symbol(mod, "_Z12Code_ExecuteP9CInstanceS0_P5CCodeP6RValue",
+                    (uintptr_t)&godmode_code_execute, 1);
+    if (ExecuteIt_flags != NULL)
+        hook_symbol(mod, "_Z12Code_ExecuteP9CInstanceS0_P5CCodeP6RValuei",
+                    (uintptr_t)&godmode_code_execute_flags, 1);
 }
