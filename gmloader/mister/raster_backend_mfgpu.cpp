@@ -1086,6 +1086,38 @@ static bool mf_fabric_still_busy(void) {
 // THE resolution point for a published batch, and the ONLY one (the reclaim in
 // mf_frame_begin aside). Keeping it single is what stops the exit paths from disagreeing
 // about g_fabric_pending / g_publish_depth -- the property the old frame-start await had.
+// [Phase 2 host lever] One drop, counted once, wherever it is decided. The wedge is now
+// observable from TWO places -- mf_frame_begin (about to rewind the arena the fabric is
+// reading) and mf_publish_barrier (about to rewrite the control block) -- and a wedge
+// settles into dropping at the FIRST of them, which is why the drop-run counter and the
+// reclaim cannot live in the barrier alone: during a real wedge the barrier is never
+// reached again, the run never grows, the limit never trips, and the guard deadlocks
+// forever. case_inflight_drop_limit pins exactly that.
+// Returns true if the batch was RECLAIMED (abandoned; caller proceeds and rebuilds),
+// false if the caller must drop this frame whole.
+static bool mf_drop_or_reclaim(void) {
+    // Give up rather than deadlock, exactly as the old frame-start guard did: a fabric
+    // that NEVER acks (device-observed 2026-07-24: permanent frame-1 wedge, sub=1
+    // done=0) would otherwise drop every frame forever and the game would never render.
+    // After MF_DROP_LIMIT consecutive failures, abandon the batch: one deliberate stomp
+    // as a last resort instead of one per frame.
+    if (++g_drop_run >= mf_drop_limit()) {
+        fprintf(stderr, "backend_mfgpu: fabric never acked seq=%u after %u frames - "
+                "reclaiming the ring\n", g_pending_seq, mf_drop_limit());
+        g_fabric_pending = false;
+        g_publish_depth  = 0;
+        // Reset here, not only on the barrier's success path: after a reclaim the next
+        // publish finds g_fabric_pending false and returns from the barrier's first line,
+        // so a run left at the limit would make the NEXT wedge reclaim on its first frame.
+        g_drop_run       = 0;
+        return true;
+    }
+    if ((g_drop_count++ % 60u) == 0u)
+        fprintf(stderr, "backend_mfgpu: fabric still on seq=%u - frame dropped "
+                "(ring left intact; %u dropped)\n", g_pending_seq, g_drop_count);
+    return false;
+}
+
 static bool mf_publish_barrier(void) {
     if (!g_fabric_pending) return true;
     // Once per PUBLISHED BATCH, not once per publish attempt. drop_run==0 means this is the
@@ -1094,24 +1126,7 @@ static bool mf_publish_barrier(void) {
     // would add a full timeout budget (200 ms) per dropped frame -- ~12 s across a 60-frame
     // drop run, turning a wedge into a far longer freeze than before pipelining.
     if (g_drop_run == 0) mf_device_await();
-    if (mf_fabric_still_busy()) {
-        // Give up rather than deadlock, exactly as the old frame-start guard did: a fabric
-        // that NEVER acks (device-observed 2026-07-24: permanent frame-1 wedge, sub=1
-        // done=0) would otherwise drop every frame forever and the game would never render.
-        // After MF_DROP_LIMIT consecutive failures, abandon the batch: one deliberate stomp
-        // as a last resort instead of one per frame.
-        if (++g_drop_run >= mf_drop_limit()) {
-            fprintf(stderr, "backend_mfgpu: fabric never acked seq=%u after %u frames - "
-                    "reclaiming the ring\n", g_pending_seq, mf_drop_limit());
-            g_fabric_pending = false;
-            g_publish_depth  = 0;
-            return true;
-        }
-        if ((g_drop_count++ % 60u) == 0u)
-            fprintf(stderr, "backend_mfgpu: fabric still on seq=%u - batch dropped "
-                    "(ring left intact; %u dropped)\n", g_pending_seq, g_drop_count);
-        return false;
-    }
+    if (mf_fabric_still_busy()) return mf_drop_or_reclaim();
     g_drop_run       = 0;
     g_fabric_pending = false;
     g_publish_depth  = 0;
@@ -1141,10 +1156,16 @@ static void mf_frame_begin(void) {
         // The ONE case that must still stop here: we are about to flip into (and rewind)
         // the very arena the fabric is still reading. With two arenas that means the fabric
         // is a whole frame behind, because in steady state the barrier resolved this arena's
-        // batch one publish ago. Checked with the CHEAP non-blocking read -- the blocking
-        // wait and the drop-limit reclaim both live in mf_publish_barrier now, so a fabric
-        // that never acks is still bounded, just from the other end.
-        if ((g_arena ^ 1u) == (g_pending_arena & 1u) && mf_fabric_still_busy()) {
+        // batch one publish ago. Checked with the CHEAP non-blocking read; the BLOCKING wait
+        // stays in mf_publish_barrier, which is the only place that needs it.
+        //
+        // A sustained wedge settles here, not at the barrier: frame N+1 builds (its arena is
+        // free) and dies at the barrier, then N+2 onward all want N's arena and die right
+        // here. So this path must do the drop-run accounting and the reclaim too, otherwise
+        // the run freezes at 1 and the limit never trips. Reclaiming falls through and
+        // rebuilds -- one deliberate stomp, the same last resort the barrier takes.
+        if ((g_arena ^ 1u) == (g_pending_arena & 1u) && mf_fabric_still_busy()
+            && !mf_drop_or_reclaim()) {
             g_frame_dropped = true;
             g_frame_active  = true;   // so present() still closes the frame
             return;
@@ -2163,11 +2184,11 @@ static void mf_frame_end(void) {
     else          fprintf(stderr, "backend_mfgpu: device DDR unmapped - frame dropped\n");
 #else
     // Host oracle: software-execute the ring into g_fb565 (parity tests read it back).
-    memset(g_fb565, 0, sizeof g_fb565);
     if (g_e.overflow) {
         fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped %s\n",
                 mf_ovf_cause_str());
-        return;   // nothing safe to execute this frame
+        memset(g_fb565, 0, sizeof g_fb565);   // nothing safe to execute this frame
+        return;
     }
     // [Phase 1 B2] Drive the same submit seam the device path uses, so the publish/await
     // bookkeeping is observable off-device. blt_execute below stands in for the fabric and
@@ -2180,6 +2201,11 @@ static void mf_frame_end(void) {
     // oracle exercises the moved barrier rather than the old frame-start await. The return
     // value is LOAD-BEARING: a failed barrier means the fabric is still reading the ring, so
     // ringing the doorbell would stomp it.
+    // [Phase 2 host lever] And it leaves g_fb565 ALONE. The device has no g_fb565: a frame
+    // that never publishes leaves the fabric scanning out the last batch that did, so the
+    // picture holds. Blanking here would make the oracle report a black frame where the
+    // device reports an unchanged one -- and "did the dropped frame execute anyway?" is
+    // exactly what case_inflight_drop asks by comparing framebuffers.
     if (!mf_publish_barrier()) {
         g_frame_dropped = true;
         return;
@@ -2195,6 +2221,7 @@ static void mf_frame_end(void) {
     // pages above MF_VTX_REGION. blt_execute only reads (and clamps OOB), so
     // passing the full size keeps both offset ranges in-bounds.
     blt_surface_heap_t heap = { g_srcdram, sizeof g_srcdram, nullptr, nullptr };
+    memset(g_fb565, 0, sizeof g_fb565);   // only a frame that actually executes repaints
     blt_execute(g_fb565, &heap, g_cmds, n);
 #endif
 }
