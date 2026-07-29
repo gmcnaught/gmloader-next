@@ -50,7 +50,15 @@ void patch_bench_godmode(struct so_module *mod)
     if (env == NULL || strcmp(env, "1") != 0)
         return; /* off path: no hooks, bit-identical behavior */
 
+    if (ExecuteIt == NULL || ExecuteIt_flags == NULL) {
+        warning("bench_godmode: ExecuteIt symbols unresolved; not hooking\n");
+        return;
+    }
+
     warning("bench_godmode: enabled (GMLOADER_GODMODE=1)\n");
+    /* Same Code_Execute pair the USE_LUA layer hooks (lua.cpp); if USE_LUA is
+     * ever compiled into a MiSTer build, whichever patch_* runs last wins the
+     * hook (no chaining). USE_LUA is off in MiSTer builds today. */
     hook_symbol(mod, "_Z12Code_ExecuteP9CInstanceS0_P5CCodeP6RValue",
                 (uintptr_t)&godmode_code_execute, 1);
     hook_symbol(mod, "_Z12Code_ExecuteP9CInstanceS0_P5CCodeP6RValuei",
