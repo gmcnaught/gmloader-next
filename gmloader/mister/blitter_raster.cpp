@@ -9,6 +9,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stddef.h>   // size_t
+#include <string.h>   // memset / memcpy (Blitter_ClearSurface's word fill)
 #include <pthread.h>
 
 #if defined(__ARM_NEON)
@@ -125,14 +126,36 @@ static inline void blend8_alpha_neon(uint8_t *d /*32 bytes RGBA*/,
 } // namespace
 
 // ---- public: clear ----------------------------------------------------------
+// Fill the surface with one RGBA colour. Was four 8-bit stores per pixel; the
+// surface is tightly packed, so a pixel is really a 32-bit unit and the fill is
+// a word fill. Three tiers, all byte-identical:
+//   * all four channels equal  -> memset (the common clear: black, white, an
+//     opaque grey). libc's memset is already the best fill on this core.
+//   * NEON                     -> 16 pixels (64 bytes) per iteration.
+//   * tail                     -> one 32-bit store per pixel.
+// Covered by blitter_raster_test.cpp's clear tests, which check a colour with
+// four DIFFERENT channels (a memset-with-one-byte fill passes every uniform
+// case and fails that one) and a pixel count that lands in the tail.
 void Blitter_ClearSurface(RSurface *s, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     if (!s || !s->rgba || s->w <= 0 || s->h <= 0) return;
     size_t n = (size_t)s->w * (size_t)s->h;
     uint8_t *p = s->rgba;
-    for (size_t i = 0; i < n; ++i) {
-        p[0] = r; p[1] = g; p[2] = b; p[3] = a;
-        p += 4;
+    if (r == g && g == b && b == a) { memset(p, r, n * 4); return; }
+
+    uint32_t px;                                  // one pixel, memory order R,G,B,A
+    { const uint8_t bytes[4] = { r, g, b, a }; memcpy(&px, bytes, 4); }
+
+    size_t i = 0;
+#if defined(__ARM_NEON)
+    const uint32x4_t v = vdupq_n_u32(px);
+    for (; i + 16 <= n; i += 16, p += 64) {
+        vst1q_u32((uint32_t *)(p +  0), v);
+        vst1q_u32((uint32_t *)(p + 16), v);
+        vst1q_u32((uint32_t *)(p + 32), v);
+        vst1q_u32((uint32_t *)(p + 48), v);
     }
+#endif
+    for (; i < n; ++i, p += 4) memcpy(p, &px, 4);
 }
 
 // Static per-draw state consumed by produce_src.  Attribute *increments* live
