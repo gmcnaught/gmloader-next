@@ -63,6 +63,8 @@ extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void);
 // a host build, where both halves are near-no-ops and counters look identical either way.
 extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestLastPublishedSeq(void);
+// [Phase 4 Stage A] how many complete submit-seam samples have been accumulated.
+extern "C" uint32_t RasterBackend_MFGPU_TestSeamSampleCount(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestLastAwaitedSeq(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestEmitterSeq(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestSeamDepthViolations(void);
@@ -1602,6 +1604,27 @@ static void mf_test_drive_one_frame(void) {
     backend_mfgpu.present(&s);
 }
 
+// [Phase 4 Stage A] The seam accumulator takes exactly one sample per completed
+// frame, and none for the first — a sample spans doorbell N to doorbell N+1, so
+// frame 1 has no previous doorbell to measure from. Off-device the oracle never
+// blocks, so this checks the plumbing (stamps taken, sample closed, counter
+// advanced), not the timings.
+static int case_seam_one_sample_per_frame(void) {
+    RasterBackend_MFGPU_TestReinit(0);
+    if (RasterBackend_MFGPU_TestSeamSampleCount() != 0) {
+        printf("  seam: expected 0 samples after reinit, got %u\n",
+               RasterBackend_MFGPU_TestSeamSampleCount());
+        return 0;
+    }
+    for (int i = 0; i < 4; i++) { mf_test_drive_one_frame(); }
+    const uint32_t got = RasterBackend_MFGPU_TestSeamSampleCount();
+    if (got != 3) {                       // 4 doorbells close 3 periods
+        printf("  seam: expected 3 samples after 4 frames, got %u\n", got);
+        return 0;
+    }
+    return 1;
+}
+
 // [Phase 1 B2] The submit path must be separable into a non-blocking publish and a
 // blocking await, so the host can run Process() for frame N+1 between them. This is
 // the seam the pipelining depends on; without it, deferring the poll means
@@ -2644,6 +2667,8 @@ int main(void){
     else printf("raster_backend mfgpu-inflight-drop-limit OK\n");
     if (!case_submit_publish_await_split()) { printf("FAIL mfgpu-submit-split\n"); ok = 0; }
     else printf("raster_backend mfgpu-submit-split OK\n");
+    if (!case_seam_one_sample_per_frame()) { printf("FAIL mfgpu-seam-sample\n"); ok = 0; }
+    else printf("raster_backend mfgpu-seam-sample OK\n");
     if (!case_cov_derivation()) { printf("FAIL mfgpu-cov-derive\n"); ok = 0; }
     else printf("raster_backend mfgpu-cov-derive OK\n");
     if (!case_await_deferred_one_frame()) { printf("FAIL mfgpu-await-deferred\n"); ok = 0; }
