@@ -58,25 +58,42 @@ extern "C" const uint16_t *RasterBackend_MFGPU_GetFB565(int *w, int *h);
 // the loop body is ~18.09 ms against a 16.6882 ms scanout period, so a classic
 // "block until the next scanout frame" would miss every window and land on the
 // following one — 33.38 ms, ~30 fps, far worse than the 50.5 fps it replaces.
-// The gate is therefore "has the scanout counter advanced AT LEAST ONCE since
-// this game frame began?":
-//   • body shorter than a scanout period → wait out the remainder → paced to
-//     the true 59.9228 Hz (the cap does its job)
-//   • body at or beyond a scanout period → the counter has ALREADY advanced →
-//     ZERO wait, i.e. exactly the `GMLOADER_FPS=0` behaviour
-// `last_scan` is reloaded with the count observed at release, never
-// `last + 1`, so a late frame carries no debt into the next one.
+// The gate is a LEAKY BUCKET over the scanout counter, not a per-frame test.
+// Scanout boundaries are banked as credit (bucket depth FCAP_BURST_DEFAULT
+// frames), each game frame spends one, and a frame waits only when the bucket
+// is empty:
+//   • loop faster than scanout → the bucket drains, every frame waits, the
+//     long-run rate is pinned at the true 59.9228 Hz (the cap does its job)
+//   • loop at or slower than scanout → boundaries arrive faster than they are
+//     spent → ZERO wait, i.e. exactly the `GMLOADER_FPS=0` behaviour
+// A game frame can never get more than FCAP_BURST_DEFAULT frames ahead of the
+// display, so this caps the RATE while staying immune to the loop's shape.
+//
+// The bucket is why this is not the simpler "has the counter advanced since
+// this frame began?" test. That test was built first and measured on .62: even
+// at the steady quiet pose it waited on 37 % of frames for a mean 6.6-7.7 ms,
+// delivering 19.05 ms/frame — better than the 19.79 ms it replaced but well
+// short of the 18.09 ms the loop runs at uncapped. The cause is the Phase 2
+// host lever: with the C_DONE await moved to the publish site the loop is
+// PIPELINED, so frame times alternate short/long around an 18.09 ms mean. A
+// per-frame test pads every short frame while the long ones stay long, so it
+// raises the mean it was supposed to leave alone. Banking the extra boundary a
+// long frame crossed and spending it on the short frame that follows removes
+// that penalty without loosening the long-run cap.
 //
 // GMLOADER_FPS: 0 disables the cap entirely (unchanged — the benches rely on
 // it); an explicit positive N keeps the old wall-clock cap at N fps (a numeric
 // fps is a wall-clock request); unset/default = this scanout cap, with the old
 // 16 ms wall-clock cap as the fallback if the instrument is unavailable or
 // stops advancing. A hang here bricks the game loop, so every wait is bounded.
+// GMLOADER_FCAP_BURST overrides the bucket depth (1 = the strict per-frame test
+// above; larger allows a longer burst before the cap bites).
 enum {
-    FCAP_STALL_MS   = 50,      // give up on ONE frame's wait after this (≈3 periods)
-    FCAP_STALL_MAX  = 20,      // consecutive stalled frames before permanent demotion
-    FCAP_CYC_MIN    = 492187,  // sane scan_period_cyc band: 5 ms …
-    FCAP_CYC_MAX    = 4921875, // … 50 ms at clk_sys 98.4375 MHz
+    FCAP_STALL_MS       = 50,      // give up on ONE frame's wait after this (≈3 periods)
+    FCAP_STALL_MAX      = 20,      // consecutive stalled frames before permanent demotion
+    FCAP_CYC_MIN        = 492187,  // sane scan_period_cyc band: 5 ms …
+    FCAP_CYC_MAX        = 4921875, // … 50 ms at clk_sys 98.4375 MHz
+    FCAP_BURST_DEFAULT  = 2,       // bucket depth, in scanout frames (see above)
 };
 static const double FCAP_CLK_SYS_HZ = 98437500.0;   // clk_sys — the counter's clock
 
@@ -87,6 +104,8 @@ static float     g_fcap_refresh   = 0.0f;   // measured scanout Hz; 0 = not reso
 static uint32_t  g_fcap_last_scan = 0;
 static bool      g_fcap_have_last = false;
 static int       g_fcap_stall_run = 0;
+static int32_t   g_fcap_credit    = 0;      // banked scanout boundaries (leaky bucket)
+static int32_t   g_fcap_burst     = FCAP_BURST_DEFAULT;
 // Instrument (GMLOADER_FCAP_STAT=1): proves the cap engages rather than idling.
 static int       g_fcap_stat      = -1;
 static uint32_t  g_fcap_frames    = 0, g_fcap_waits = 0;
@@ -170,12 +189,15 @@ static void fcap_resolve(void) {
     if (!fcap_period_sane(cyc)) return;       // stale/garbage register — retry
     g_fcap_refresh = (float)(FCAP_CLK_SYS_HZ / (double)cyc);
     if (g_fcap_mode == FCAP_UNSET) {
+        const char *b = getenv("GMLOADER_FCAP_BURST");
+        if (b && *b) { long v = atol(b); if (v >= 1 && v <= 16) g_fcap_burst = (int32_t)v; }
         g_fcap_mode = FCAP_SCANOUT;
         g_fcap_last_scan = cnt;
+        g_fcap_credit = 0;
         g_fcap_have_last = true;
     }
-    warning("frame-cap: scanout period %u cyc = %.4f ms (%.4f Hz); mode=%s\n",
-            (unsigned)cyc, 1000.0 / g_fcap_refresh, (double)g_fcap_refresh,
+    warning("frame-cap: scanout period %u cyc = %.4f ms (%.4f Hz); burst=%d; mode=%s\n",
+            (unsigned)cyc, 1000.0 / g_fcap_refresh, (double)g_fcap_refresh, (int)g_fcap_burst,
             g_fcap_mode == FCAP_SCANOUT ? "scanout" :
             g_fcap_mode == FCAP_TICKS   ? "wall-clock" : "off");
 }
@@ -198,6 +220,18 @@ static void fcap_wait_ticks(void) {
     if (now < next_ms) SDL_Delay(next_ms - now);
 }
 
+// Fold the boundaries observed since the last read into the credit bucket.
+// The difference is taken in uint32 so the counter's 2^32 wrap is transparent;
+// a NEGATIVE delta can only mean the counter restarted (core reload) or the
+// read was garbage, so it re-bases instead of banking a huge or negative debt.
+static void fcap_credit_add(uint32_t cnt) {
+    int32_t d = (int32_t)(cnt - g_fcap_last_scan);
+    g_fcap_last_scan = cnt;
+    if (d < 0) return;
+    g_fcap_credit += d;
+    if (g_fcap_credit > g_fcap_burst) g_fcap_credit = g_fcap_burst;
+}
+
 static void fcap_demote(const char *why) {
     g_fcap_mode = g_fcap_frame_ms ? FCAP_TICKS : FCAP_OFF;
     warning("frame-cap: scanout counter %s — falling back to the %u ms wall-clock cap\n",
@@ -213,28 +247,32 @@ static void fcap_wait(void) {
             fcap_demote("became unreadable");
         } else if (!g_fcap_have_last) {
             g_fcap_last_scan = cnt; g_fcap_have_last = true;
-        } else if (cnt != g_fcap_last_scan) {
-            g_fcap_last_scan = cnt;   // already late — ZERO wait, no debt carried
-            g_fcap_stall_run = 0;
         } else {
-            const Uint32 t0 = SDL_GetTicks();
-            const Uint32 deadline = t0 + (Uint32)FCAP_STALL_MS;
-            const long   poll_us = fcap_poll_us();
-            bool stalled = false;
-            while (cnt == g_fcap_last_scan) {
-                if (poll_us) usleep((useconds_t)poll_us);
-                if (!fcap_scanout_read(&cnt, NULL)) { fcap_demote("became unreadable"); break; }
-                if (cnt == g_fcap_last_scan && SDL_GetTicks() > deadline) { stalled = true; break; }
-            }
-            g_fcap_last_scan = cnt;
-            if (g_fcap_stat) { g_fcap_waits++; g_fcap_wait_ms += (double)(SDL_GetTicks() - t0); }
-            if (stalled) {
-                // Bounded, never a hang: this frame proceeds regardless. Only a
-                // RUN of stalls (a wedged / non-scanning core) demotes for good.
-                if (++g_fcap_stall_run >= FCAP_STALL_MAX)
-                    fcap_demote("stopped advancing");
+            fcap_credit_add(cnt);
+            g_fcap_credit -= 1;             // this game frame consumes one boundary
+            if (g_fcap_credit >= 0) {
+                g_fcap_stall_run = 0;       // already late/in credit — ZERO wait
             } else {
-                g_fcap_stall_run = 0;
+                const Uint32 t0 = SDL_GetTicks();
+                const Uint32 deadline = t0 + (Uint32)FCAP_STALL_MS;
+                const long   poll_us = fcap_poll_us();
+                bool stalled = false;
+                while (g_fcap_credit < 0) {
+                    if (poll_us) usleep((useconds_t)poll_us);
+                    if (!fcap_scanout_read(&cnt, NULL)) { fcap_demote("became unreadable"); break; }
+                    fcap_credit_add(cnt);
+                    if (g_fcap_credit < 0 && SDL_GetTicks() > deadline) { stalled = true; break; }
+                }
+                if (g_fcap_stat) { g_fcap_waits++; g_fcap_wait_ms += (double)(SDL_GetTicks() - t0); }
+                if (stalled) {
+                    // Bounded, never a hang: this frame proceeds regardless. Only a
+                    // RUN of stalls (a wedged / non-scanning core) demotes for good.
+                    g_fcap_credit = 0;
+                    if (++g_fcap_stall_run >= FCAP_STALL_MAX)
+                        fcap_demote("stopped advancing");
+                } else {
+                    g_fcap_stall_run = 0;
+                }
             }
         }
         if (g_fcap_mode == FCAP_SCANOUT) {
