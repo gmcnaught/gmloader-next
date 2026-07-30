@@ -240,6 +240,15 @@ mf-seam-stat-test:
 	  gmloader/mister/mf_seam_stat_test.cpp \
 	  -lm -o /tmp/mfss && /tmp/mfss
 
+.PHONY: mf-pending-clear-test
+# TDD host test for the Phase 4 Stage B deferred full-screen clear
+# (mf_pending_clear.h). Like mf-seam-stat-test the header is dependency-free,
+# so this needs no other translation unit and no MFGPU sources.
+mf-pending-clear-test:
+	c++ -std=c++17 -Igmloader/mister \
+	  gmloader/mister/mf_pending_clear_test.cpp \
+	  -lm -o /tmp/mfpc && /tmp/mfpc
+
 .PHONY: blitter-appsurf-test
 blitter-appsurf-test:
 	c++ -std=c++17 -DMISTER_NATIVE_VIDEO=1 -Igmloader/mister -Igmloader -I. \
