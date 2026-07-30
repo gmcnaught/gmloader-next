@@ -65,6 +65,7 @@
 #include "raster_backend.h"
 #include "raster_backend_convert.h"
 #include "fps_overlay.h"   // [OSD-fps] clamp + 7-seg digit table (Solarus port)
+#include "mf_seam_stat.h"   // [Phase 4 Stage A] submit-seam decomposition
 extern "C" {
 #include "blt_emitter.h"
 #include "blt_wire.h"
@@ -546,8 +547,21 @@ static double mf_clip_tri_area(float x0, float y0, float x1, float y1,
 // mf_stat_on() itself lives here for the same reason (mf_emit_group's guard
 // on it is unconditional too); the perf-counter instrumentation this gates on
 // device (C_DONE busy-wait characterization, min≈max over a 30-submit window)
-// is documented at its device-only call site in mf_submit_stat below. Enable
-// with GMLOADER_MFSUBMIT_STAT=1. Zero cost when unset.
+// is documented at its device-only call site in mf_submit_stat below, which itself
+// checks mf_stat_on() first and is genuinely zero cost when GMLOADER_MFSUBMIT_STAT is
+// unset. [Phase 4 Stage A review] That does NOT extend to the submit-seam stamps
+// (g_seam_be/g_seam_ar in mf_publish_barrier, g_publish_t0 and the mf_seam_add call in
+// mf_device_publish): the two clock_gettime stamps and the mf_seam_add call run every
+// frame, in BOTH builds (device and host-oracle) -- not gated on mf_stat_on() at all.
+// With the stat knob OFF, mf_submit_stat's own early return (`if (!mf_stat_on()) return;`
+// below) means g_seam_frame_ms and g_seam_blocked are never written for the life of the
+// process: g_seam_frame_ms stays 0.0 and g_seam_blocked stays permanently false, so the
+// accumulator's `blocked`/`notice` split in mf_seam_add accrues as if nothing ever
+// blocked. That is harmless TODAY only because the sole reader of the accumulator is the
+// print in mf_submit_stat, gated on this same knob -- a future consumer that read g_seam
+// without also checking mf_stat_on() would silently see zeros. The unconditional
+// stamping itself is cheap regardless of the knob: even a clock_gettime call that misses
+// the vDSO and pays a full ~2 us syscall is 0.012% of the 16.6882 ms scanout period.
 static int mf_stat_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("GMLOADER_MFSUBMIT_STAT"); v = (e && *e) ? 1 : 0; }
@@ -656,6 +670,45 @@ static inline void mf_trace_reset(void) {
 #ifndef MISTER_NATIVE_VIDEO
     g_ctrl_trace_n = 0;   // overflow is deliberately NOT cleared: it is sticky
 #endif
+}
+
+// [Phase 4 Stage A] Submit-seam stamps. g_publish_t0 (declared further below, with the
+// rest of the publish/await bookkeeping) IS the doorbell stamp — it is taken immediately
+// after the doorbell write in mf_device_publish — so the seam adds only two: barrier entry
+// and barrier exit. A sample spans doorbell N to doorbell N+1, so it can only be closed by
+// the NEXT publish; g_seam_prev_db carries the opening stamp across the frame boundary.
+//
+// Declared here, OUTSIDE #ifdef MISTER_NATIVE_VIDEO and ahead of both use sites, because the
+// two sites straddle the device-only transport block below: mf_submit_stat (inside it) is
+// the first writer of g_seam_frame_ms/g_seam_blocked, while mf_device_publish and the test
+// hooks (outside it, compiled in both builds) read g_seam itself. A declaration placed
+// between the two would compile on whichever build reaches it first and silently fail to
+// compile on the other.
+static mf_seam_acc_t   g_seam;
+static struct timespec g_seam_be, g_seam_ar, g_seam_prev_db;
+static bool            g_seam_have_prev = false;
+// The fabric's own compute counter for the batch the current `block` waited on,
+// stashed by mf_submit_stat so the pairing survives the deferred await.
+static double          g_seam_frame_ms = 0.0;
+// Did the host ACTUALLY wait this frame? mf_device_await returns on its first poll
+// when C_DONE already matches, so a frame that never waited still spends the few
+// microseconds of one uncached read inside it — block_ms is never exactly zero and
+// cannot answer this. The await's own `iters` can: it is 0 if and only if the first
+// read already matched. Cleared at barrier entry so a frame that skips the await
+// (drop run) cannot inherit the previous frame's answer.
+static bool            g_seam_blocked = false;
+// [Phase 4 Stage A review] Samples the barrier could not legitimately close: the two
+// non-success `return true` paths in mf_publish_barrier (the !g_fabric_pending early-out
+// and a reclaiming mf_drop_or_reclaim()) reach mf_device_publish without ever re-stamping
+// g_seam_ar, so closing a sample there would pair a fresh g_seam_be against a g_seam_ar
+// left over from the last successful barrier -- an entire drop run earlier. Both paths set
+// g_seam_have_prev = false instead, so that frame contributes no sample; this counts how
+// many were skipped. Windowed like g_seam itself: reset alongside mf_seam_reset() below.
+static uint32_t         g_seam_incomplete = 0;
+
+static inline double mf_seam_ms(const struct timespec *a, const struct timespec *b) {
+    return (double)(b->tv_sec - a->tv_sec) * 1e3 +
+           (double)(b->tv_nsec - a->tv_nsec) / 1e6;
 }
 
 #ifdef MISTER_NATIVE_VIDEO
@@ -794,6 +847,12 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     //   tri     = C_SRCSEL.hi perf_tri_cyc     (all S_TRI_* states)
     // Derived: dpath = tri-texwait (rasterizer datapath), ovhd = frame-tri (ring/clear/setup).
     double frame_ms = (double)mf_ctrl_rd_hi(MF_C_DONE)   / (MF_CLK_SYS_MHZ * 1000.0);
+    g_seam_frame_ms = frame_ms;        // [Phase 4 Stage A] pair with this frame's block
+    // Did the host really wait? `iters > 0` means the first C_DONE read did not match.
+    // A TIMED-OUT await is excluded: it waited on the full abandoned budget, so its
+    // interval measures the timeout, not the fabric's doorbell->done latency, and
+    // folding it into `notice` would report one as the other.
+    g_seam_blocked  = (iters > 0) && !timeout;
     double texw_ms  = (double)mf_ctrl_rd_hi(MF_C_STATUS) / (MF_CLK_SYS_MHZ * 1000.0);
     double tri_ms   = (double)mf_ctrl_rd_hi(MF_C_SRCSEL) / (MF_CLK_SYS_MHZ * 1000.0);
     // [Phase 1 A4] EXACT covered-pixel count from the fabric, replacing cov_px_est as the
@@ -965,6 +1024,39 @@ static void mf_device_publish(void) {
     mf_ctrl_wr(MF_C_SUBMIT, g_e.submit_seq);    // doorbell LAST
     g_last_published_seq = g_e.submit_seq;      // [Phase 2 host lever] seam witness
     clock_gettime(CLOCK_MONOTONIC, &g_publish_t0);
+    // [Phase 4 Stage A] Close the previous frame's seam sample. g_publish_t0 is
+    // this frame's doorbell, which is the previous sample's closing edge.
+    if (g_seam_have_prev) {
+        mf_seam_add(&g_seam,
+                    mf_seam_ms(&g_seam_prev_db, &g_seam_be),   // host
+                    mf_seam_ms(&g_seam_be,      &g_seam_ar),   // block
+                    mf_seam_ms(&g_seam_ar,      &g_publish_t0),// pub
+                    mf_seam_ms(&g_seam_prev_db, &g_publish_t0),// period
+                    g_seam_frame_ms,
+                    g_seam_blocked ? 1 : 0);
+#ifdef MISTER_NATIVE_VIDEO
+        if (mf_stat_on() && mf_seam_ready(&g_seam)) {
+            mf_seam_out_t o; mf_seam_derive(&g_seam, &o);
+            fprintf(stderr,
+                    "MFSEAM n=%u period=%.2f host=%.2f block=%.2f pub=%.2f "
+                    "notice=%.2f blocked=%.0f%% suspect=%u incomplete=%u "
+                    "host_hist=%u/%u/%u/%u/%u/%u/%u/%u "
+                    "pub_hist=%u/%u/%u/%u/%u/%u/%u/%u\n",
+                    g_seam.n, o.period_ms, o.host_ms, o.block_ms, o.pub_ms,
+                    o.notice_ms, 100.0 * o.blocked_frac, o.suspect, g_seam_incomplete,
+                    g_seam.host_hist[0], g_seam.host_hist[1], g_seam.host_hist[2],
+                    g_seam.host_hist[3], g_seam.host_hist[4], g_seam.host_hist[5],
+                    g_seam.host_hist[6], g_seam.host_hist[7],
+                    g_seam.pub_hist[0], g_seam.pub_hist[1], g_seam.pub_hist[2],
+                    g_seam.pub_hist[3], g_seam.pub_hist[4], g_seam.pub_hist[5],
+                    g_seam.pub_hist[6], g_seam.pub_hist[7]);
+            mf_seam_reset(&g_seam);
+            g_seam_incomplete = 0;   // [Finding 1] windowed like g_seam itself
+        }
+#endif
+    }
+    g_seam_prev_db   = g_publish_t0;
+    g_seam_have_prev = true;
     g_publish_count++;
     // Depth, not a bool: a bool is idempotent, so publish(); publish(); await() would look
     // perfectly paired while the doorbell had been rung twice for one frame — on device a
@@ -1148,17 +1240,69 @@ static bool mf_drop_or_reclaim(void) {
 }
 
 static bool mf_publish_barrier(void) {
-    if (!g_fabric_pending) return true;
+    clock_gettime(CLOCK_MONOTONIC, &g_seam_be);
+    g_seam_blocked = false;   // a frame that skips the await never blocked
+    if (!g_fabric_pending) {
+        // [Finding 1] Reachable right after mf_frame_begin's own mf_drop_or_reclaim()
+        // already resolved the batch (see the in-flight-batch guard there): this barrier
+        // does no work and g_seam_ar is NOT re-stamped. If mf_device_publish (called next,
+        // unconditionally, by the caller) were to close a sample here, it would pair a
+        // fresh g_seam_be (just stamped above) against whatever g_seam_ar the LAST
+        // successful barrier left behind -- stale by however long the wedge ran. Skip
+        // that sample instead of manufacturing a corrupt one; only counts as skipped if a
+        // sample was actually pending (have_prev already false means nothing to lose, e.g.
+        // the very first frame after reinit).
+        if (g_seam_have_prev) g_seam_incomplete++;
+        g_seam_have_prev = false;
+        return true;
+    }
     // Once per PUBLISHED BATCH, not once per publish attempt. drop_run==0 means this is the
     // first attempt against this batch. During a drop run the cheap non-blocking read below
     // is what discovers the fabric finishing; re-entering the blocking poll every attempt
     // would add a full timeout budget (200 ms) per dropped frame -- ~12 s across a 60-frame
     // drop run, turning a wedge into a far longer freeze than before pipelining.
+    //
+    // [Finding 3] Skipping the await also leaves g_seam_frame_ms/g_seam_blocked exactly as
+    // mf_submit_stat last set them -- for the batch whose read TIMED OUT, not this one. That
+    // staleness is harmless ONLY because g_seam_blocked was just reset to false above and
+    // mf_submit_stat does not run again on this path to re-set it true, so a sample closed
+    // from this frame (see mf_device_publish) can never fold the stale frame_ms into
+    // notice_sum (mf_seam_add guards notice_sum on `blocked`). Load-bearing and easy to
+    // break: any future change that calls mf_submit_stat or sets g_seam_blocked=true on a
+    // skipped-await path would silently attribute an old batch's fabric time to this one.
     if (g_drop_run == 0) mf_device_await();
-    if (mf_fabric_still_busy()) return mf_drop_or_reclaim();
+    if (mf_fabric_still_busy()) {
+        bool reclaimed = mf_drop_or_reclaim();
+        if (reclaimed) {
+            // [Finding 1] The ring was abandoned after MF_DROP_LIMIT consecutive drops.
+            // Same corruption as the !g_fabric_pending path above: g_seam_ar was never
+            // re-stamped across the whole drop run, so the sample mf_device_publish would
+            // otherwise close pairs a fresh g_seam_be against a g_seam_ar left over from
+            // the last successful barrier -- an entire drop run earlier (device-observed:
+            // ~60 frames x ~16.7 ms folded into one sample). Skip it.
+            //
+            // Coverage note: this branch is NOT exercised by
+            // case_seam_reclaim_no_corrupt_sample. That test's forced-busy walk always
+            // reclaims one level up, inside mf_frame_begin's own drop_or_reclaim call --
+            // a wedge settles at the FIRST place that observes it (see the comment above
+            // mf_drop_or_reclaim), which clears g_fabric_pending before the barrier is
+            // reached again, so the barrier takes its !g_fabric_pending early-out instead
+            // of ever calling mf_fabric_still_busy() here. Mutation-verified: forcing this
+            // `if (reclaimed)` to never trigger leaves the whole suite green. The guard is
+            // still correct -- the corruption it prevents is real -- it is just harder to
+            // reach than the early-out above under the harness's default drop limit.
+            if (g_seam_have_prev) g_seam_incomplete++;
+            g_seam_have_prev = false;
+        }
+        // A false return (still dropping, not yet reclaimed) leaves g_seam_have_prev alone:
+        // the caller does not call mf_device_publish this frame at all (no doorbell rung),
+        // so no sample closes and there is nothing to skip.
+        return reclaimed;
+    }
     g_drop_run       = 0;
     g_fabric_pending = false;
     g_publish_depth  = 0;
+    clock_gettime(CLOCK_MONOTONIC, &g_seam_ar);
     return true;
 }
 
@@ -2440,6 +2584,13 @@ extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void) { return g_unpa
 // [Phase 2 host lever] The seq the last doorbell carried, and the seq the last await polled
 // C_DONE for. Unequal means the await can never be satisfied.
 extern "C" uint32_t RasterBackend_MFGPU_TestLastPublishedSeq(void) { return g_last_published_seq; }
+// [Phase 4 Stage A] Complete seam samples since reinit. Off-device nothing prints,
+// so the accumulator is never reset and this counts frames directly.
+extern "C" uint32_t RasterBackend_MFGPU_TestSeamSampleCount(void) { return g_seam.n; }
+// [Finding 1 regression] Samples skipped because the barrier returned true without
+// re-stamping g_seam_ar (the !g_fabric_pending early-out or a reclaim) -- see
+// mf_publish_barrier. Windowed like g_seam.n, but read here before either resets.
+extern "C" uint32_t RasterBackend_MFGPU_TestSeamIncomplete(void) { return g_seam_incomplete; }
 extern "C" uint32_t RasterBackend_MFGPU_TestLastAwaitedSeq(void)   { return g_last_awaited_seq; }
 extern "C" uint32_t RasterBackend_MFGPU_TestEmitterSeq(void)       { return g_e.submit_seq; }
 extern "C" uint32_t RasterBackend_MFGPU_TestSeamDepthViolations(void) { return g_seam_depth_violations; }
@@ -2516,6 +2667,11 @@ extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     mf_init_once();                    // re-wires emitter, clears cache + counter
     g_lru_frame_floor = 0;             // start clean: nothing pinned before frame 1
     g_lru_evict_floor = 0;             // [Phase 1 B3] ...and nothing pinned from before that
+    mf_seam_reset(&g_seam);            // [Phase 4 Stage A] reinit means "no history"
+    g_seam_have_prev = false;          // ...so the next publish opens a sample, not closes one
+    g_seam_blocked   = false;
+    g_seam_frame_ms  = 0.0;            // [Finding 2] stale fabric-ms from a prior run
+    g_seam_incomplete = 0;             // [Finding 2] stale skipped-sample count from a prior run
 }
 
 // Free the cached entry for GL texture `id` so the next draw re-stages it. Called

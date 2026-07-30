@@ -231,6 +231,15 @@ mf-cov-clip-test:
 	  $(MFGPU_SRC) \
 	  -lm -o /tmp/mcct && /tmp/mcct
 
+.PHONY: mf-seam-stat-test
+# TDD host test for the Phase 4 Stage A submit-seam accumulator (mf_seam_stat.h).
+# The header is deliberately dependency-free, so unlike raster-backend-test this
+# needs no other translation unit and no MFGPU sources.
+mf-seam-stat-test:
+	c++ -std=c++17 -Igmloader/mister \
+	  gmloader/mister/mf_seam_stat_test.cpp \
+	  -lm -o /tmp/mfss && /tmp/mfss
+
 .PHONY: blitter-appsurf-test
 blitter-appsurf-test:
 	c++ -std=c++17 -DMISTER_NATIVE_VIDEO=1 -Igmloader/mister -Igmloader -I. \

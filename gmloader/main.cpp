@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <time.h>
 
 #include "platform.h"
 #include "so_util.h"
@@ -122,6 +123,12 @@ static int32_t   g_fcap_burst     = FCAP_BURST_DEFAULT;
 static int       g_fcap_stat      = -1;
 static uint32_t  g_fcap_frames    = 0, g_fcap_waits = 0;
 static double    g_fcap_wait_ms   = 0.0;
+// [Phase 4 Stage A] Windowed twins of the lifetime counters. The lifetime pair
+// stays for the `n=` label; every ratio is reported over the last 300 frames,
+// because at a locked 59.9228 fps the waited fraction is EXPECTED to move to
+// ~100 % and a since-boot average would hide exactly that transition.
+static uint32_t  g_fcap_win_frames = 0, g_fcap_win_waits = 0;
+static double    g_fcap_win_wait_ms = 0.0;
 
 // Poll interval inside the wait, in microseconds (GMLOADER_FCAP_POLL_US;
 // 0 = pure spin, the default). Same shape and same reasoning as the backend's
@@ -287,6 +294,7 @@ static void fcap_wait(void) {
                 g_fcap_stall_run = 0;       // already late/in credit — ZERO wait
             } else {
                 const Uint32 t0 = SDL_GetTicks();
+                struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
                 const Uint32 deadline = t0 + (Uint32)FCAP_STALL_MS;
                 const long   poll_us = fcap_poll_us();
                 bool stalled = false;
@@ -302,7 +310,13 @@ static void fcap_wait(void) {
                         stalled = true; break;
                     }
                 }
-                if (g_fcap_stat) { g_fcap_waits++; g_fcap_wait_ms += (double)(SDL_GetTicks() - t0); }
+                if (g_fcap_stat) {
+                    struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1);
+                    const double ms = (double)(ts1.tv_sec - ts0.tv_sec) * 1e3 +
+                                      (double)(ts1.tv_nsec - ts0.tv_nsec) / 1e6;
+                    g_fcap_waits++;      g_fcap_wait_ms     += ms;
+                    g_fcap_win_waits++;  g_fcap_win_wait_ms += ms;
+                }
                 if (stalled) {
                     // Bounded, never a hang: this frame proceeds regardless. Only a
                     // RUN of stalls (a wedged / non-scanning core) demotes for good.
@@ -315,11 +329,22 @@ static void fcap_wait(void) {
             }
         }
         if (g_fcap_mode == FCAP_SCANOUT) {
-            if (g_fcap_stat && ++g_fcap_frames % 300 == 0)
-                warning("FCAP n=%u waited=%u (%.1f%%) wait_ms_avg=%.2f mode=scanout\n",
-                        (unsigned)g_fcap_frames, (unsigned)g_fcap_waits,
-                        100.0 * g_fcap_waits / g_fcap_frames,
-                        g_fcap_waits ? g_fcap_wait_ms / g_fcap_waits : 0.0);
+            g_fcap_frames++;
+            if (g_fcap_stat && ++g_fcap_win_frames >= 300) {
+                // waited% must be read WITH wait_ms_avg: high waited% with a small
+                // average is a LOCKED frame rate (the success signature at 59.9228
+                // Hz), while a low waited% with a multi-millisecond average is
+                // frames MISSING their scanout boundary. Reading waited% alone as
+                // waste optimises in exactly the wrong direction.
+                warning("FCAP n=%u win=%u waited=%u (%.1f%%) wait_ms_avg=%.3f "
+                        "starved=%llu mode=scanout\n",
+                        (unsigned)g_fcap_frames, (unsigned)g_fcap_win_frames,
+                        (unsigned)g_fcap_win_waits,
+                        100.0 * g_fcap_win_waits / g_fcap_win_frames,
+                        g_fcap_win_waits ? g_fcap_win_wait_ms / g_fcap_win_waits : 0.0,
+                        (unsigned long long)MisterAudio_StarvedFrames());
+                g_fcap_win_frames = 0; g_fcap_win_waits = 0; g_fcap_win_wait_ms = 0.0;
+            }
             return;
         }
         // demoted this frame — fall through to the wall clock below
