@@ -74,6 +74,9 @@ extern "C" {
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   // getenv (GMLOADER_MFGPU_HEAPLOG diagnostic, Task 9 bring-up)
+#if defined(__ARM_NEON)
+#include <arm_neon.h>   // mf_stage_texels' vector body (see its definition)
+#endif
 #include <time.h>     // [Phase 1 B2] clock_gettime for the publish timestamp, which is
                       // recorded in BOTH builds (mf_device_publish is not device-only)
 
@@ -1622,6 +1625,117 @@ static inline bool mf_texel_is_dark(uint16_t px) {
     return ((r * 77 + g * 151 + b * 28) >> 8) <= MF_DARK_MAX;  // Rec.601 luma
 }
 
+#if defined(__ARM_NEON)
+// Horizontal reductions over a 0x0000/0xFFFF lane mask. Written with the
+// ARMv7-A subset (pairwise fold + 32-bit lane reads) rather than vmaxvq/vminvq,
+// which are AArch64-only -- this file must compile for the armhf device AND for
+// the arm64 dev host that runs the unit test.
+static inline bool mf_neon_any_set_u16(uint16x8_t v) {
+    uint32x2_t t = vreinterpret_u32_u16(vorr_u16(vget_low_u16(v), vget_high_u16(v)));
+    return (vget_lane_u32(t, 0) | vget_lane_u32(t, 1)) != 0u;
+}
+static inline bool mf_neon_all_set_u16(uint16x8_t v) {
+    uint32x2_t t = vreinterpret_u32_u16(vand_u16(vget_low_u16(v), vget_high_u16(v)));
+    return (vget_lane_u32(t, 0) & vget_lane_u32(t, 1)) == 0xFFFFFFFFu;
+}
+
+// Eight RGBA8888 texels -> eight RGB565, reproducing mf_texel565 + MF_COLORKEY +
+// mf_texel_is_dark lane-for-lane. `acc_key` accumulates the transparent-lane
+// masks (OR) and `acc_dark` the dark-lane masks (AND); the caller folds them.
+//
+// Two details this must not get wrong, both pinned by the unit test:
+//  * the colorkey collision nudge applies to the PACKED value before the hole
+//    select, so a genuinely transparent lane still emits the key untouched;
+//  * mf_texel_is_dark re-derives r/g/b from the PACKED 565, not from the source
+//    bytes, so the luma below uses the re-expanded channels. The worst-case sum
+//    248*77 + 252*151 + 248*28 = 64,092 stays inside 16 bits, so no widening.
+static inline void mf_stage8_rgba8888(const uint8_t *src, uint16_t *dst,
+                                      uint16x8_t *acc_key, uint16x8_t *acc_dark) {
+    uint8x8x4_t p = vld4_u8(src);                         // r, g, b, a
+    uint16x8_t keym = vcltq_u16(vmovl_u8(p.val[3]), vdupq_n_u16(128));
+
+    // (r & 0xF8) << 8  |  (g & 0xFC) << 3  |  b >> 3
+    uint16x8_t r16 = vandq_u16(vshll_n_u8(p.val[0], 8), vdupq_n_u16(0xF800));
+    uint16x8_t g16 = vandq_u16(vshll_n_u8(p.val[1], 3), vdupq_n_u16(0x07E0));
+    uint16x8_t b16 = vmovl_u8(vshr_n_u8(p.val[2], 3));
+    uint16x8_t px  = vorrq_u16(vorrq_u16(r16, g16), b16);
+
+    uint16x8_t key = vdupq_n_u16(MF_COLORKEY);
+    px = veorq_u16(px, vandq_u16(vceqq_u16(px, key), vdupq_n_u16(0x0020)));
+    px = vbslq_u16(keym, key, px);
+    vst1q_u16(dst, px);
+
+    uint16x8_t rr = vandq_u16(vshrq_n_u16(px, 8), vdupq_n_u16(0x00F8));
+    uint16x8_t gg = vandq_u16(vshrq_n_u16(px, 3), vdupq_n_u16(0x00FC));
+    uint16x8_t bb = vandq_u16(vshlq_n_u16(px, 3), vdupq_n_u16(0x00F8));
+    uint16x8_t luma = vmulq_u16(rr, vdupq_n_u16(77));
+    luma = vmlaq_u16(luma, gg, vdupq_n_u16(151));
+    luma = vmlaq_u16(luma, bb, vdupq_n_u16(28));
+    luma = vshrq_n_u16(luma, 8);
+    uint16x8_t dark = vorrq_u16(vcleq_u16(luma, vdupq_n_u16((uint16_t)MF_DARK_MAX)),
+                                vceqq_u16(px, key));
+
+    *acc_key  = vorrq_u16(*acc_key,  keym);
+    *acc_dark = vandq_u16(*acc_dark, dark);
+}
+#endif // __ARM_NEON
+
+// Convert the rw x rh sub-rect of `t` rooted at (rx,ry) into a tightly-packed
+// rw*rh RGB565 page at `out` (source strided by t->w, destination by rw), and
+// report the two page-level properties the caller caches alongside it:
+//   *out_has_key   : some texel was transparent, so a colorkey draw has holes
+//   *out_mask_only : EVERY texel is dark, so this page can only ever darken
+// Whole-page staging is just the rect (0,0,t->w,t->h); `t` must be textured
+// (valid pixels), which both callers establish before getting here.
+//
+// This is the per-texel pass that runs on every texture-cache miss, so it is
+// vectorized below. Host-tested against an independent oracle including the
+// vector tail and both texel formats (mf_stage_texels_test.cpp, reachable via
+// RasterBackend_MFGPU_TestStageTexels near the bottom of this file).
+static void mf_stage_texels(const RTexture *t, int rx, int ry, int rw, int rh,
+                            uint16_t *out, bool *out_has_key, bool *out_mask_only) {
+    bool has_key = false;
+    bool mask_only = true;
+#if defined(__ARM_NEON)
+    // RGBA8888 only. RGBA4444 (the g_tex16 memory toggle, off by default) keeps
+    // the scalar path below -- vld4_u8 assumes 4 bytes/texel, and the same
+    // carve-out already exists in blitter_raster.cpp's blit_span.
+    if (t->format != RTEX_RGBA4444) {
+        uint16x8_t acc_key  = vdupq_n_u16(0);        // OR of the per-lane hole masks
+        uint16x8_t acc_dark = vdupq_n_u16(0xFFFF);   // AND of the per-lane dark masks
+        for (int y = 0; y < rh; y++) {
+            const uint8_t *src = t->rgba + ((size_t)(ry + y) * t->w + rx) * 4;
+            uint16_t *dst = out + (size_t)y * rw;
+            int x = 0;
+            for (; x + 8 <= rw; x += 8, src += 8 * 4, dst += 8)
+                mf_stage8_rgba8888(src, dst, &acc_key, &acc_dark);
+            for (; x < rw; x++, dst++) {             // tail: the scalar path verbatim
+                uint16_t px = mf_texel565(t, rx + x, ry + y, &has_key);
+                *dst = px;
+                if (!mf_texel_is_dark(px)) mask_only = false;
+            }
+        }
+        // Fold the vector accumulators in ONCE, after every row: has_key is a
+        // pure OR and mask_only a pure AND, so order does not matter. Rows
+        // narrower than 8 lanes never enter the body and leave both identities
+        // (0 / all-ones) untouched.
+        if (mf_neon_any_set_u16(acc_key))   has_key = true;
+        if (!mf_neon_all_set_u16(acc_dark)) mask_only = false;
+        *out_has_key   = has_key;
+        *out_mask_only = mask_only;
+        return;
+    }
+#endif
+    for (int y = 0; y < rh; y++)
+        for (int x = 0; x < rw; x++) {
+            uint16_t px = mf_texel565(t, rx + x, ry + y, &has_key);
+            out[(size_t)y * rw + x] = px;
+            if (!mf_texel_is_dark(px)) mask_only = false;
+        }
+    *out_has_key = has_key;
+    *out_mask_only = mask_only;
+}
+
 static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *out_has_key) {
     // Whole-page entry: rect (0,0,tw,th). Untextured => 1x1 opaque-white page.
     int tw, th; bool textured = (t && t->valid && t->rgba);
@@ -1642,12 +1756,7 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
     // sub-region path for why a black+transparent-only page is interesting.
     bool mask_only = textured;
     if (textured) {
-        for (int y = 0; y < th; y++)
-            for (int x = 0; x < tw; x++) {
-                uint16_t px = mf_texel565(t, x, y, &has_key);
-                g_texscratch[(size_t)y * tw + x] = px;
-                if (!mf_texel_is_dark(px)) mask_only = false;
-            }
+        mf_stage_texels(t, 0, 0, tw, th, g_texscratch, &has_key, &mask_only);
     } else {
         g_texscratch[0] = 0xFFFF;   // 1x1 opaque white
     }
@@ -1712,12 +1821,7 @@ static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
     // dumps of its frames measure 100% black+colorkey with the black fraction ANIMATING
     // (4.7% -> 27.1% -> 38.2% -> 47.8%), i.e. a tube iris opening and closing over the image.
     bool mask_only = true;
-    for (int y = 0; y < rh; y++)
-        for (int x = 0; x < rw; x++) {
-            uint16_t px = mf_texel565(t, rx + x, ry + y, &has_key);
-            g_texscratch[(size_t)y * rw + x] = px;
-            if (!mf_texel_is_dark(px)) mask_only = false;
-        }
+    mf_stage_texels(t, rx, ry, rw, rh, g_texscratch, &has_key, &mask_only);
     blt_surface_ref_t ref = mf_upload_and_cache(key, rw, rh, rx, ry, has_key, mask_only, "region");
     *out_has_key = ref.valid ? has_key : false;
     if (out_mask_only) *out_mask_only = ref.valid ? mask_only : false;
@@ -2522,6 +2626,20 @@ extern "C" void RasterBackend_MFGPU_TestCopyFB565(int w, int h, uint16_t *out) {
 extern "C" double RasterBackend_MFGPU_TestClipTriArea(float x0, float y0, float x1, float y1,
                                                        float x2, float y2) {
     return mf_clip_tri_area(x0, y0, x1, y1, x2, y2);
+}
+
+// Host test hook (TDD; see gmloader/mister/mf_stage_texels_test.cpp): stage a
+// rect straight into a caller-supplied buffer, bypassing g_texscratch, the
+// texture cache and the emitter, so the per-texel conversion can be diffed
+// against an independent oracle. Writes exactly rw*rh uint16s. The bool outputs
+// are int* so the test can print them without a bool/int mismatch.
+extern "C" void RasterBackend_MFGPU_TestStageTexels(const RTexture *t, int rx, int ry,
+                                                    int rw, int rh, uint16_t *out,
+                                                    int *out_has_key, int *out_mask_only) {
+    bool has_key = false, mask_only = true;
+    mf_stage_texels(t, rx, ry, rw, rh, out, &has_key, &mask_only);
+    if (out_has_key)   *out_has_key   = has_key   ? 1 : 0;
+    if (out_mask_only) *out_mask_only = mask_only ? 1 : 0;
 }
 
 // Host/Task-6 hook: tell the backend which surface pixels are the default fb, so

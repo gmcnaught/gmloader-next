@@ -255,6 +255,32 @@ mf-cov-clip-test:
 	  $(MFGPU_SRC) \
 	  -lm -o /tmp/mcct && /tmp/mcct
 
+.PHONY: blitter-raster-test
+# Host test for the GL-free software rasterizer + surface clear
+# (blitter_raster.cpp). The file predates this target and was unreachable from
+# make until the clear was vectorized and needed a harness. Needs no other
+# translation unit -- the rasterizer is deliberately dependency-free.
+blitter-raster-test:
+	c++ -std=c++17 -O2 -g -Igmloader/mister \
+	  gmloader/mister/blitter_raster_test.cpp \
+	  gmloader/mister/blitter_raster.cpp \
+	  -lm -o /tmp/brt && /tmp/brt
+
+.PHONY: mf-stage-texels-test
+# TDD host test for the texture-staging texel loop (mf_stage_texels in
+# raster_backend_mfgpu.cpp) — the RGBA->RGB565 + colorkey + mask_only pass that
+# runs on every texture-cache miss. Same link set as mf-cov-clip-test.
+# The dev host is arm64, where __ARM_NEON is defined unconditionally, so this
+# target exercises the SAME vector path the armhf device build takes.
+mf-stage-texels-test:
+	c++ -std=c++17 -Igmloader/mister $(MFGPU_INC) \
+	  gmloader/mister/mf_stage_texels_test.cpp \
+	  gmloader/mister/raster_backend_sw.cpp \
+	  gmloader/mister/raster_backend_mfgpu.cpp \
+	  gmloader/mister/blitter_raster.cpp \
+	  $(MFGPU_SRC) \
+	  -lm -o /tmp/mstt && /tmp/mstt
+
 .PHONY: mf-seam-stat-test
 # TDD host test for the Phase 4 Stage A submit-seam accumulator (mf_seam_stat.h).
 # The header is deliberately dependency-free, so unlike raster-backend-test this

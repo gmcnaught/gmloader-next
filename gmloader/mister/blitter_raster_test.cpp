@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <vector>
 
 // ---- tiny test harness ------------------------------------------------------
 static int g_pass = 0;
@@ -243,7 +244,72 @@ static void test_opaque_fastpath_equiv() {
     report("opaque fast-path: RB_ALPHA opaque source == RB_NONE", ok);
 }
 
+// ---- Blitter_ClearSurface ---------------------------------------------------
+// The clear is used as a fixture by every test above, which means a bug in it
+// would show up as a confusing failure somewhere else rather than here. These
+// pin it directly, in the shapes a vectorized fill can get wrong:
+//   * a colour whose four channels DIFFER (a memset-with-one-byte fill passes
+//     every uniform-colour check and corrupts this one);
+//   * a pixel count that is not a multiple of any plausible vector width, so the
+//     scalar tail is exercised and cannot be silently skipped;
+//   * out-of-bounds guards: writes must stop exactly at w*h*4.
+static void test_clear_surface_distinct_channels() {
+    const int W = 13, H = 7;                        // 91 px: prime-ish, hits the tail
+    const size_t N = (size_t)W * H * 4;
+    std::vector<uint8_t> buf(N + 8, 0xCD);          // 8 canary bytes past the end
+    RSurface s{}; s.rgba = buf.data(); s.w = W; s.h = H;
+
+    Blitter_ClearSurface(&s, 0x12, 0x34, 0x56, 0x78);
+
+    bool ok = true;
+    for (size_t i = 0; i < N; i += 4) {
+        if (buf[i + 0] != 0x12 || buf[i + 1] != 0x34 ||
+            buf[i + 2] != 0x56 || buf[i + 3] != 0x78) { ok = false; break; }
+    }
+    report("clear: distinct RGBA channels", ok);
+
+    bool canary_ok = true;
+    for (size_t i = N; i < N + 8; i++) if (buf[i] != 0xCD) canary_ok = false;
+    report("clear: no write past the surface", canary_ok);
+}
+
+static void test_clear_surface_uniform_and_sizes() {
+    // A uniform colour is the case a memset fast path would take; it must still
+    // be byte-exact, and must agree with the general path.
+    bool ok = true;
+    for (int W = 1; W <= 40 && ok; W++) {
+        const int H = 1 + (W % 3);
+        const size_t N = (size_t)W * H * 4;
+        std::vector<uint8_t> buf(N + 4, 0xAB);
+        RSurface s{}; s.rgba = buf.data(); s.w = W; s.h = H;
+
+        const uint8_t v = (uint8_t)(W * 7);
+        Blitter_ClearSurface(&s, v, v, v, v);
+        for (size_t i = 0; i < N; i++) if (buf[i] != v) { ok = false; break; }
+        for (size_t i = N; i < N + 4; i++) if (buf[i] != 0xAB) { ok = false; break; }
+    }
+    report("clear: uniform colour, widths 1..40", ok);
+}
+
+// Degenerate inputs must be no-ops, not crashes -- the production guard already
+// rejects them and a rewrite must keep doing so.
+static void test_clear_surface_rejects_degenerate() {
+    uint8_t one[4] = { 1, 2, 3, 4 };
+    RSurface z{}; z.rgba = one; z.w = 0; z.h = 5;
+    Blitter_ClearSurface(&z, 9, 9, 9, 9);
+    RSurface z2{}; z2.rgba = one; z2.w = 5; z2.h = 0;
+    Blitter_ClearSurface(&z2, 9, 9, 9, 9);
+    RSurface z3{}; z3.rgba = nullptr; z3.w = 4; z3.h = 4;
+    Blitter_ClearSurface(&z3, 9, 9, 9, 9);
+    Blitter_ClearSurface(nullptr, 9, 9, 9, 9);
+    report("clear: degenerate inputs are no-ops",
+           one[0] == 1 && one[1] == 2 && one[2] == 3 && one[3] == 4);
+}
+
 int main() {
+    test_clear_surface_distinct_channels();
+    test_clear_surface_uniform_and_sizes();
+    test_clear_surface_rejects_degenerate();
     test_textured_quad();
     test_textured_quad_rgba4444();
     test_alpha_blend();
