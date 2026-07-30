@@ -65,6 +65,7 @@ extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestLastPublishedSeq(void);
 // [Phase 4 Stage A] how many complete submit-seam samples have been accumulated.
 extern "C" uint32_t RasterBackend_MFGPU_TestSeamSampleCount(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestSeamIncomplete(void);   // [Finding 1 regression]
 extern "C" uint32_t RasterBackend_MFGPU_TestLastAwaitedSeq(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestEmitterSeq(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestSeamDepthViolations(void);
@@ -1625,6 +1626,73 @@ static int case_seam_one_sample_per_frame(void) {
     return 1;
 }
 
+// [Finding 1 regression] A reclaim must NOT close a corrupt seam sample. Before the fix,
+// mf_publish_barrier's reclaiming `return true` reached mf_device_publish with g_seam_ar
+// stale from the last successful barrier (an entire drop run earlier) and a fresh
+// g_seam_be, so the closed sample's `block` came out negative by roughly the drop run's
+// wall-clock length -- and `suspect` could not catch it because `pub` absorbed the same
+// magnitude (host+block+pub still summed to period). This drives exactly that scenario
+// (mirroring case_inflight_drop_limit's forced-busy walk to the reclaim boundary) and
+// asserts the accumulator gains NO sample at the reclaiming frame, only an `incomplete`
+// count. Run against the pre-fix code, this fails because TestSeamSampleCount() advances
+// at the reclaim frame.
+static int case_seam_reclaim_no_corrupt_sample(void) {
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+
+    // Frame 1: opens the first sample (no previous doorbell to close). Frame 2: closes it
+    // via a REAL barrier success, so g_seam_ar holds a legitimate, freshly-stamped value.
+    mf_test_drive_one_frame();
+    mf_test_drive_one_frame();
+    const uint32_t n_pre  = RasterBackend_MFGPU_TestSeamSampleCount();
+    const uint32_t inc_pre = RasterBackend_MFGPU_TestSeamIncomplete();
+    if (n_pre != 1) {
+        printf("  FAIL seam-reclaim-no-corrupt  setup: expected 1 sample after 2 frames, got %u\n",
+               n_pre);
+        return 0;
+    }
+
+    // The fabric never acks -- hold "busy" for far longer than the drop limit, exactly as
+    // case_inflight_drop_limit does, so mf_drop_or_reclaim() eventually reclaims the ring.
+    RasterBackend_MFGPU_TestSetFabricBusy(1);
+    static const uint8_t blue[4] = { 0, 0, 255, 255 };
+    RTexture t_blue = { blue, 1, 1, 1, 1, 0, 1 };
+    BVtx v[3] = { {1,1,0,0,1,1,1,1}, {60,1,1,0,1,1,1,1}, {1,60,0,1,1,1,1,1} };
+    static uint8_t rgba_mf[BW*BH*4];
+    RSurface s_mf = { rgba_mf, BW, BH };
+    RasterBackend_MFGPU_SetDefaultSurface(rgba_mf);
+    const uint32_t pub_pre = RasterBackend_MFGPU_TestPublishCount();
+    int reclaimed_at = -1;
+    for (int f = 0; f < 200; f++) {
+        backend_mfgpu.clear(&s_mf, 0,0,0,255);
+        backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, next_key());
+        backend_mfgpu.present(&s_mf);
+        if (RasterBackend_MFGPU_TestPublishCount() != pub_pre) { reclaimed_at = f; break; }
+    }
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);
+    if (reclaimed_at < 0) {
+        printf("  FAIL seam-reclaim-no-corrupt  guard deadlocked: 200 frames dropped, no reclaim\n");
+        return 0;
+    }
+
+    const uint32_t n_post  = RasterBackend_MFGPU_TestSeamSampleCount();
+    const uint32_t inc_post = RasterBackend_MFGPU_TestSeamIncomplete();
+    if (n_post != n_pre) {
+        printf("  FAIL seam-reclaim-no-corrupt  reclaim at frame %d added a sample "
+               "(n %u -> %u); expected the corrupt sample to be skipped, not recorded\n",
+               reclaimed_at, n_pre, n_post);
+        return 0;
+    }
+    if (inc_post != inc_pre + 1) {
+        printf("  FAIL seam-reclaim-no-corrupt  expected incomplete to advance by exactly 1 "
+               "at the reclaim (got %u -> %u)\n", inc_pre, inc_post);
+        return 0;
+    }
+    printf("  OK   seam-reclaim-no-corrupt  reclaim at frame %d added 0 samples "
+           "(incomplete %u -> %u)\n", reclaimed_at, inc_pre, inc_post);
+    return 1;
+}
+
 // [Phase 1 B2] The submit path must be separable into a non-blocking publish and a
 // blocking await, so the host can run Process() for frame N+1 between them. This is
 // the seam the pipelining depends on; without it, deferring the poll means
@@ -2669,6 +2737,8 @@ int main(void){
     else printf("raster_backend mfgpu-submit-split OK\n");
     if (!case_seam_one_sample_per_frame()) { printf("FAIL mfgpu-seam-sample\n"); ok = 0; }
     else printf("raster_backend mfgpu-seam-sample OK\n");
+    if (!case_seam_reclaim_no_corrupt_sample()) { printf("FAIL mfgpu-seam-reclaim-no-corrupt\n"); ok = 0; }
+    else printf("raster_backend mfgpu-seam-reclaim-no-corrupt OK\n");
     if (!case_cov_derivation()) { printf("FAIL mfgpu-cov-derive\n"); ok = 0; }
     else printf("raster_backend mfgpu-cov-derive OK\n");
     if (!case_await_deferred_one_frame()) { printf("FAIL mfgpu-await-deferred\n"); ok = 0; }
