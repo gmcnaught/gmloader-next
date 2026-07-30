@@ -24,7 +24,7 @@
 typedef struct {
     unsigned n;
     unsigned suspect;            /* frames whose parts did not sum to their period */
-    unsigned blocked;            /* frames where the host actually waited (block > 0) */
+    unsigned blocked;            /* frames where the host actually waited on the fabric */
     double   host_sum, block_sum, pub_sum, period_sum;
     double   notice_sum;         /* summed over blocked frames only */
 } mf_seam_acc_t;
@@ -39,10 +39,13 @@ typedef struct {
 static inline void mf_seam_reset(mf_seam_acc_t *a) { memset(a, 0, sizeof *a); }
 
 /* frame_ms is the fabric's own compute counter (C_DONE.hi) for the batch this
-   frame's `block` waited on. Unused until Task 2 introduces `notice`; taken now
-   so the call sites written in Task 4 never have to change signature. */
+   frame's `block` waited on. `blocked` is the CALLER's answer to "did the host
+   actually wait?" — it cannot be derived from block_ms, because a frame that
+   never waited still spends the few microseconds of one uncached C_DONE read
+   inside the await, so block_ms is never exactly zero on device. */
 static inline void mf_seam_add(mf_seam_acc_t *a, double host_ms, double block_ms,
-                               double pub_ms, double period_ms, double frame_ms) {
+                               double pub_ms, double period_ms, double frame_ms,
+                               int blocked) {
     a->n++;
     a->host_sum   += host_ms;
     a->block_sum  += block_ms;
@@ -55,8 +58,8 @@ static inline void mf_seam_add(mf_seam_acc_t *a, double host_ms, double block_ms
 
     /* Only a frame that actually blocked measures the fabric's doorbell->done
        latency; on a frame that arrived late, host+block is the host's own
-       lateness and would understate nothing and overstate `notice` by all of it. */
-    if (block_ms > 0.0) {
+       lateness and would overstate `notice` by all of it. */
+    if (blocked) {
         a->blocked++;
         a->notice_sum += (host_ms + block_ms) - frame_ms;
     }
