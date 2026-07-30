@@ -120,6 +120,16 @@ static void case_second_record_supersedes_the_first(void) {
     CHECK(p.emitted == 1);
 }
 
+// Two triangles that share an EDGE pair rather than a diagonal pair hit all
+// four corners between them but do NOT tile the rect: TL,TR,BL and TL,TR,BR
+// both contain the top edge, and (0.5W, 0.9H) lies in neither. A corner-union
+// test alone accepts this; it must be rejected.
+static void case_two_halves_sharing_an_edge_are_not_a_cover(void) {
+    const float xs[6] = { 0, (float)W, 0,        0, (float)W, (float)W };
+    const float ys[6] = { 0, 0,        (float)H, 0, 0,        (float)H };
+    CHECK(mf_pc_is_cover(1, 2, xs, ys, W, H) == 0);
+}
+
 // An out-of-range target index must be inert, never a memory error.
 static void case_out_of_range_target_is_inert(void) {
     mf_pc_t p; mf_pc_reset(&p);
@@ -141,6 +151,7 @@ int main(void) {
     case_record_take_and_drop_bookkeeping();
     case_targets_are_independent();
     case_second_record_supersedes_the_first();
+    case_two_halves_sharing_an_edge_are_not_a_cover();
     case_out_of_range_target_is_inert();
     if (g_fail) { printf("mf_pending_clear: FAILURES\n"); return 1; }
     printf("mf_pending_clear: all tests passed\n");

@@ -132,7 +132,26 @@ static inline int mf_pc_is_cover(int blend_copy, int nt,
         }
         if (mf_pc_popcount4(mask[t]) != 3) return 0;   /* degenerate half */
     }
-    return (mask[0] | mask[1]) == 0xF;
+    if ((mask[0] | mask[1]) != 0xF) return 0;
+
+    /* Corner-union alone is NOT sufficient: the two halves of a rect meet
+       along a DIAGONAL, not an edge. Two triangles can each hold three
+       distinct corners and union to all four while still sharing an EDGE
+       pair, leaving a wedge unpainted. Concrete counterexample (W x H rect):
+         A = (0,0),(W,0),(0,H)  -> corners TL,TR,BL -> mask 0b0111
+         B = (0,0),(W,0),(W,H)  -> corners TL,TR,BR -> mask 0b1011
+         union = 0b1111 (all four corners hit) but both A and B contain the
+         TOP EDGE, and the point (0.5*W, 0.9*H) lies in neither: for A the
+         interior test is x/W + y/H <= 1 -> 0.5 + 0.9 = 1.4 > 1 (outside);
+         for B it is y/H <= x/W -> 0.9 <= 0.5, false (outside). A real pixel
+         goes unpainted, so a clear discharged on union alone would strand a
+         stale pixel on screen -- exactly the failure this module exists to
+         prevent.
+       The two valid tilings share a DIAGONAL pair: TL|BR = 0x9 or TR|BL =
+       0x6 (corner numbering: 0=TL,1=TR,2=BL,3=BR). Do not simplify this
+       back down to the union check alone -- it is not equivalent. */
+    int shared = mask[0] & mask[1];
+    return (shared == 0x9 || shared == 0x6);
 }
 
 #endif /* MF_PENDING_CLEAR_H */
