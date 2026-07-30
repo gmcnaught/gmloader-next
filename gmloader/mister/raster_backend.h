@@ -38,6 +38,16 @@ void RasterBackend_SW_SetThreads(int n);
 /* mfgpu back-end only: drop the cached staging of GL texture `id` (on GL
  * re-upload/delete). No-op when backend_sw is selected or nothing is cached. */
 void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
+
+/* mfgpu back-end only [Phase 3 Stage B]: read the fabric's scanout instrument
+ * (openbor_video_reader.sv, byte 0x3BFB0018) out of the back-end's existing DDR
+ * mapping. *frame_cnt = monotonic scanout frame count (+1 per displayed frame
+ * boundary, wraps at 2^32); *period_cyc = clk_sys (98.4375 MHz) cycles between
+ * the last two boundaries. Either pointer may be NULL.
+ * Returns 1 when the instrument is readable, 0 otherwise (host build, no
+ * /dev/mem, or the mapping not yet established) — 0 leaves the outputs
+ * untouched and obliges the caller to fall back rather than wait on it. */
+int RasterBackend_MFGPU_ScanoutRead(uint32_t *frame_cnt, uint32_t *period_cyc);
 #ifdef __cplusplus
 }
 #endif

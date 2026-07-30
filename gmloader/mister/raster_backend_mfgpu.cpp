@@ -688,6 +688,11 @@ enum {
     MF_DEV_RING_B_OFF= 0x00040000u,   // ring B
     MF_DEV_SRC_OFF   = 0x00080000u,   // SRC_QW = 0x3B080000 (DDR3 source heap) -- UNCHANGED
     MF_DEV_TLBUF_OFF = 0x00F40000u,   // bounds the usable SRC heap (~14.8 MiB)
+    // [Phase 3 Stage B] openbor_video_reader.sv SCANFRM_ADDR = byte 0x3BFB0018,
+    // i.e. offset 0x00FB0018 in this same 16 MiB mapping (above the SRC heap, in
+    // the reader's sentinel-clean tail). Read-only here — see
+    // RasterBackend_MFGPU_ScanoutRead below.
+    MF_DEV_SCANFRM_OFF = 0x00FB0018u,
     MF_DEV_RING_CAP  = MF_DEV_RING_B_OFF - MF_DEV_RING_OFF,   // 256 KiB, ~8190 commands
     MF_DEV_SRC_CAP   = MF_DEV_TLBUF_OFF - MF_DEV_SRC_OFF,
     MF_DEV_DONE_TIMEOUT_MS = 200,
@@ -2321,6 +2326,36 @@ extern "C" const uint16_t *RasterBackend_MFGPU_GetFB565(int *w, int *h) {
     if (w) *w = BLT_FB_WIDTH;
     if (h) *h = BLT_FB_HEIGHT;
     return g_fb565;
+}
+
+// [Phase 3 Stage B] Scanout instrument readout — the DISPLAY's frame boundary,
+// which C_DONE (a fabric-completion count) is not. openbor_video_reader.sv
+// publishes both words in ONE 64-bit DDR beat at SCANFRM_ADDR = byte 0x3BFB0018:
+//   +0x00  scan_frame_cnt   monotonic, +1 per scanout frame boundary, wraps 2^32
+//   +0x04  scan_period_cyc  clk_sys (98.4375 MHz) cycles between the last two
+//                           boundaries; measured 1,642,740 = 16.6882 ms = 59.9228 Hz
+// That address is offset 0x00FB0018 inside the 16 MiB region this back-end already
+// mmaps, so the per-frame read the main loop's frame cap needs is a plain uncached
+// load — no `devmem` process spawn. Read-only: the reader owns these words.
+// Returns 1 when the mapping is live (device + /dev/mem + fabric back-end), else 0
+// with the outputs untouched — callers MUST treat 0 as "no instrument" and fall back.
+extern "C" int RasterBackend_MFGPU_ScanoutRead(uint32_t *frame_cnt, uint32_t *period_cyc) {
+#ifdef MISTER_NATIVE_VIDEO
+    if (!g_dev_ok || !g_dev_base) return 0;
+    const volatile uint32_t *p =
+        (const volatile uint32_t *)(g_dev_base + (size_t)MF_DEV_SCANFRM_OFF);
+    // Count first: the two 32-bit loads are not mutually atomic, and a stale
+    // period merely describes the previous interval (harmless), whereas a stale
+    // count would mis-order the cap's advance test.
+    uint32_t c = p[0];
+    uint32_t t = p[1];
+    if (frame_cnt)  *frame_cnt  = c;
+    if (period_cyc) *period_cyc = t;
+    return 1;
+#else
+    (void)frame_cnt; (void)period_cyc;
+    return 0;   // host oracle build: no fabric, no scanout
+#endif
 }
 
 // ---- Host validation only — NOT part of the RasterBackend vtable ----------
