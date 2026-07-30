@@ -24,11 +24,15 @@
 typedef struct {
     unsigned n;
     unsigned suspect;            /* frames whose parts did not sum to their period */
+    unsigned blocked;            /* frames where the host actually waited (block > 0) */
     double   host_sum, block_sum, pub_sum, period_sum;
+    double   notice_sum;         /* summed over blocked frames only */
 } mf_seam_acc_t;
 
 typedef struct {
     double   host_ms, block_ms, pub_ms, period_ms;
+    double   notice_ms;          /* mean over BLOCKED frames; 0 when none blocked */
+    double   blocked_frac;       /* read notice_ms together with this, never alone */
     unsigned suspect;
 } mf_seam_out_t;
 
@@ -39,7 +43,6 @@ static inline void mf_seam_reset(mf_seam_acc_t *a) { memset(a, 0, sizeof *a); }
    so the call sites written in Task 4 never have to change signature. */
 static inline void mf_seam_add(mf_seam_acc_t *a, double host_ms, double block_ms,
                                double pub_ms, double period_ms, double frame_ms) {
-    (void)frame_ms;
     a->n++;
     a->host_sum   += host_ms;
     a->block_sum  += block_ms;
@@ -49,6 +52,14 @@ static inline void mf_seam_add(mf_seam_acc_t *a, double host_ms, double block_ms
     double d = (host_ms + block_ms + pub_ms) - period_ms;
     if (d < 0.0) d = -d;
     if (d >= MF_SEAM_TOL_MS) a->suspect++;
+
+    /* Only a frame that actually blocked measures the fabric's doorbell->done
+       latency; on a frame that arrived late, host+block is the host's own
+       lateness and would understate nothing and overstate `notice` by all of it. */
+    if (block_ms > 0.0) {
+        a->blocked++;
+        a->notice_sum += (host_ms + block_ms) - frame_ms;
+    }
 }
 
 static inline int mf_seam_ready(const mf_seam_acc_t *a) {
@@ -62,6 +73,8 @@ static inline void mf_seam_derive(const mf_seam_acc_t *a, mf_seam_out_t *o) {
     o->pub_ms    = a->pub_sum    / n;
     o->period_ms = a->period_sum / n;
     o->suspect   = a->suspect;
+    o->notice_ms    = a->blocked ? a->notice_sum / (double)a->blocked : 0.0;
+    o->blocked_frac = a->blocked / n;
 }
 
 #endif /* MF_SEAM_STAT_H */

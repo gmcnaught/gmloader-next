@@ -66,12 +66,48 @@ static void case_reset_clears(void) {
     CHECK(NEAR(o.host_ms, 0.0) && NEAR(o.period_ms, 0.0));   // no divide by zero
 }
 
+// notice = (host + block) - frame, and ONLY over frames where the host really
+// waited. A frame with block == 0 arrived late; its wait_ms bounds the fabric's
+// latency from above rather than measuring it.
+static void case_notice_only_over_blocked(void) {
+    mf_seam_acc_t a; mf_seam_reset(&a);
+    mf_seam_add(&a, 18.0, 0.0, 0.5, 18.5, 16.20);   // never blocked — excluded
+    mf_seam_add(&a, 14.0, 3.0, 0.5, 17.5, 16.20);   // blocked — notice = 17.0 - 16.20
+    mf_seam_out_t o; mf_seam_derive(&a, &o);
+    CHECK(a.blocked == 1);
+    CHECK(NEAR(o.blocked_frac, 0.5));
+    CHECK(NEAR(o.notice_ms, 0.80));
+}
+
+static void case_notice_zero_when_never_blocked(void) {
+    mf_seam_acc_t a; mf_seam_reset(&a);
+    mf_seam_add(&a, 18.0, 0.0, 0.5, 18.5, 16.20);
+    mf_seam_add(&a, 19.0, 0.0, 0.5, 19.5, 16.20);
+    mf_seam_out_t o; mf_seam_derive(&a, &o);
+    CHECK(a.blocked == 0);
+    CHECK(NEAR(o.blocked_frac, 0.0));
+    CHECK(NEAR(o.notice_ms, 0.0));      // reported as 0, never as a divide by zero
+}
+
+static void case_notice_averages_over_blocked_only(void) {
+    mf_seam_acc_t a; mf_seam_reset(&a);
+    mf_seam_add(&a, 14.0, 3.0, 0.5, 17.5, 16.20);   // notice 0.80
+    mf_seam_add(&a, 14.0, 4.0, 0.5, 18.5, 16.20);   // notice 1.80
+    mf_seam_add(&a, 20.0, 0.0, 0.5, 20.5, 16.20);   // excluded
+    mf_seam_out_t o; mf_seam_derive(&a, &o);
+    CHECK(a.blocked == 2);
+    CHECK(NEAR(o.notice_ms, 1.30));                 // (0.80 + 1.80) / 2, not / 3
+}
+
 int main(void) {
     case_means_and_identity_closes();
     case_identity_fires_on_gap();
     case_identity_tolerance_edge();
     case_ready_at_window();
     case_reset_clears();
+    case_notice_only_over_blocked();
+    case_notice_zero_when_never_blocked();
+    case_notice_averages_over_blocked_only();
     printf(g_fail ? "mf-seam-stat FAIL\n" : "mf-seam-stat PASS\n");
     return g_fail;
 }
