@@ -62,10 +62,34 @@ CXXFLAGS += $(ASAN_FLAGS)
 # appended AFTER that assignment (see the second ASAN block) — appending here
 # would be silently wiped.
 endif
-# Enable NEON only for the software blitter's rasterizer, so its vectorized inner
-# loop is active without changing the ISA for the rest of the tree (loader
-# trampolines / thunks).
-build/${ARCH}/gmloader/mister/blitter_raster.cpp.o: CXXFLAGS += -march=armv7-a -mfpu=neon-vfpv3
+# Enable NEON across the MiSTer port code (gmloader/mister/), not just the
+# rasterizer. The Debian arm-linux-gnueabihf default is -mfpu=vfpv3-d16, which
+# leaves __ARM_NEON UNDEFINED — so an `#if defined(__ARM_NEON)` block in any
+# gmloader/mister/ file other than blitter_raster.cpp silently compiled out.
+# That was the case for every pixel/audio loop in the port (RGBA->RGB565
+# present conversion, texture opacity scan + 4444 pack, the fabric back-end's
+# per-texel staging convert, the surface clear, the audio mix).
+#
+# Scope is deliberately still NOT tree-wide: loader/ and thunks/ keep the
+# default ISA, because they carry the hand-written trampolines and the ABI
+# bridge into the guest's Android .so.
+#
+# What this does and does not change:
+#   * -march=armv7-a is the armhf default already; stated explicitly, no-op.
+#   * -mfpu=neon-vfpv3 = VFPv3 + NEON. Scalar float/double codegen is
+#     unchanged (NEON has no double, and GCC keeps scalar float in VFP); it
+#     only PERMITS NEON instructions and the d16-d31 register file, which is
+#     caller-saved under AAPCS and therefore safe across the guest ABI bridge.
+#   * No -ftree-vectorize / -O3 / -ffast-math. The A9's NEON single-precision
+#     is not IEEE-clean, and the rasterizer paths are bit-exact against the
+#     refmodel oracle. Vectorization here is explicit intrinsics only.
+# Split by source language on purpose: the .cpp recipe (below) passes
+# $(CXXFLAGS) $(BSD_FLAGS) $(MD_FLAGS), and BSD_FLAGS/MD_FLAGS are recursive
+# variables that each expand $(CFLAGS) — so adding to CFLAGS here would repeat
+# the flags three times on every C++ object.
+NEON_ISA := -march=armv7-a -mfpu=neon-vfpv3
+build/${ARCH}/gmloader/mister/%.cpp.o: CXXFLAGS += $(NEON_ISA)
+build/${ARCH}/gmloader/mister/%.c.o:   CFLAGS   += $(NEON_ISA)
 endif
 LDFLAGS:=${OPTM} -Wl,--gc-sections -Wl,--defsym,BUILD_DATE_$(BUILD_DATE)=0 -Wl,--defsym,GIT_HASH_$(GITHUB_SHA)=0 -Wl,--defsym,GIT_BRANCH_$(GIT_BRANCH_FRIENDLY)=0
 # ASAN link flags — must come after the := above (see the ASAN block near the
