@@ -132,14 +132,28 @@ int AudioTrack::write(JNIEnv *env, jobject obj, jclass clazz, jbyteArray audioDa
 
     if (writeMode == WRITE_BLOCKING) {
 #ifdef MISTER_NATIVE_VIDEO
-        // Waits on STAGING only -- audio already moved into the DDR ring counts
-        // as consumed, so the ring stays the latency cushion and the runner
-        // paces against the real 48 kHz drain.
-        do {
-            SDL_Delay(0);
-        } while (track->nativeTrack
-                    ? MisterAudio_QueuedBytes(track->nativeTrack)
-                    : SDL_GetQueuedAudioSize(track->deviceId));
+        // Android's WRITE_BLOCKING blocks until the data has been ACCEPTED into
+        // the track's buffer, not until it has played, so the wait ends at that
+        // buffer's worth of staging -- not at zero.
+        //
+        // Waiting for zero is what a producer in a mix->write loop cannot
+        // survive: it returns from write with NO slack banked, spends the next
+        // few ms mixing, and the pump has nothing to submit for exactly that
+        // long, once per chunk. Leaving one buffer staged gives the producer
+        // its mixing time back.
+        if (track->nativeTrack) {
+            const uint32_t high_water =
+                MisterAudio_StagingHighWater(track->nativeTrack);
+            // SDL_Delay(1), not SDL_Delay(0): this thread shares a core with a
+            // main loop that spins on the fabric, so yielding in a tight loop
+            // costs the very CPU the mix needs.
+            while (MisterAudio_QueuedBytes(track->nativeTrack) > high_water)
+                SDL_Delay(1);
+        } else {
+            do {
+                SDL_Delay(0);
+            } while (SDL_GetQueuedAudioSize(track->deviceId));
+        }
 #else
         do {
             SDL_Delay(0);
