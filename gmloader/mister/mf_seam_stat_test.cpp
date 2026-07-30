@@ -103,6 +103,41 @@ static void case_notice_averages_over_blocked_only(void) {
     CHECK(NEAR(o.notice_ms, 1.30));                 // (0.80 + 1.80) / 2, not / 3
 }
 
+// Edges are lower-inclusive: bucket i holds [EDGES[i-1], EDGES[i]).
+// Sub-ms resolution below 1 ms is deliberate — that is where `pub` has to land
+// for a 16.6882 ms period with a 16.20 ms fabric.
+static void case_bucket_edges(void) {
+    CHECK(mf_seam_bucket(0.0)     == 0);
+    CHECK(mf_seam_bucket(0.24)    == 0);
+    CHECK(mf_seam_bucket(0.25)    == 1);
+    CHECK(mf_seam_bucket(0.99)    == 2);
+    CHECK(mf_seam_bucket(1.0)     == 3);
+    CHECK(mf_seam_bucket(5.0)     == 5);
+    CHECK(mf_seam_bucket(16.6881) == 6);
+    CHECK(mf_seam_bucket(16.6882) == 7);   // at or beyond the scanout period
+    CHECK(mf_seam_bucket(1000.0)  == 7);
+}
+
+static void case_hist_counts(void) {
+    mf_seam_acc_t a; mf_seam_reset(&a);
+    mf_seam_add(&a, 5.0, 10.0, 0.10, 15.10, 16.20, 1);   // pub -> bucket 0
+    mf_seam_add(&a, 5.0, 10.0, 0.30, 15.30, 16.20, 1);   // pub -> bucket 1
+    mf_seam_add(&a, 5.0, 10.0, 0.30, 15.30, 16.20, 1);   // pub -> bucket 1
+    CHECK(a.pub_hist[0] == 1);
+    CHECK(a.pub_hist[1] == 2);
+    CHECK(a.host_hist[5] == 3);                        // host 5.0 ms -> [4.0, 8.0)
+    CHECK(a.suspect == 0);                             // all three identities close
+}
+
+static void case_hist_cleared_by_reset(void) {
+    mf_seam_acc_t a; mf_seam_reset(&a);
+    mf_seam_add(&a, 5.0, 10.0, 0.10, 15.10, 16.20, 1);
+    CHECK(a.pub_hist[0] == 1);
+    mf_seam_reset(&a);
+    CHECK(a.pub_hist[0] == 0);
+    CHECK(a.host_hist[5] == 0);
+}
+
 int main(void) {
     case_means_and_identity_closes();
     case_identity_fires_on_gap();
@@ -112,6 +147,9 @@ int main(void) {
     case_notice_only_over_blocked();
     case_notice_zero_when_never_blocked();
     case_notice_averages_over_blocked_only();
+    case_bucket_edges();
+    case_hist_counts();
+    case_hist_cleared_by_reset();
     printf(g_fail ? "mf-seam-stat FAIL\n" : "mf-seam-stat PASS\n");
     return g_fail;
 }

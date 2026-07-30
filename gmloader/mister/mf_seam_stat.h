@@ -20,6 +20,21 @@
 
 #define MF_SEAM_WINDOW   30      /* frames per report; matches MFSUBMIT's window */
 #define MF_SEAM_TOL_MS   0.05    /* identity slack for the timestamp reads themselves */
+#define MF_SEAM_BUCKETS  8
+
+/* Upper edges in ms, lower-inclusive. Fine below 1 ms because that is where
+   `pub` must land for a 16.6882 ms period against a 16.20 ms fabric; the last
+   edge IS the scanout period, so the top bucket means "this frame could not have
+   locked". */
+static const double MF_SEAM_EDGES[MF_SEAM_BUCKETS - 1] = {
+    0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.6882
+};
+
+static inline int mf_seam_bucket(double ms) {
+    for (int i = 0; i < MF_SEAM_BUCKETS - 1; i++)
+        if (ms < MF_SEAM_EDGES[i]) return i;
+    return MF_SEAM_BUCKETS - 1;
+}
 
 typedef struct {
     unsigned n;
@@ -27,6 +42,8 @@ typedef struct {
     unsigned blocked;            /* frames where the host actually waited on the fabric */
     double   host_sum, block_sum, pub_sum, period_sum;
     double   notice_sum;         /* summed over blocked frames only */
+    uint32_t host_hist[MF_SEAM_BUCKETS];
+    uint32_t pub_hist[MF_SEAM_BUCKETS];
 } mf_seam_acc_t;
 
 typedef struct {
@@ -63,6 +80,9 @@ static inline void mf_seam_add(mf_seam_acc_t *a, double host_ms, double block_ms
         a->blocked++;
         a->notice_sum += (host_ms + block_ms) - frame_ms;
     }
+
+    a->host_hist[mf_seam_bucket(host_ms)]++;
+    a->pub_hist[mf_seam_bucket(pub_ms)]++;
 }
 
 static inline int mf_seam_ready(const mf_seam_acc_t *a) {
