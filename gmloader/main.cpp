@@ -88,12 +88,24 @@ extern "C" const uint16_t *RasterBackend_MFGPU_GetFB565(int *w, int *h);
 // stops advancing. A hang here bricks the game loop, so every wait is bounded.
 // GMLOADER_FCAP_BURST overrides the bucket depth (1 = the strict per-frame test
 // above; larger allows a longer burst before the cap bites).
+//
+// Note that the GM refresh rate is resolved independently of which cap is in
+// force: `GMLOADER_FPS=0` and `GMLOADER_FPS=N` still hand GM the measured
+// 59.9228 Hz when the instrument reads sanely. Only the PACING differs.
+//
+// The bucket discards surplus credit (it clamps at `burst`), so the cap is
+// one-sided by construction: a loop that runs fast but is punctuated by hitches
+// cannot spend the boundaries those hitches crossed beyond the bucket's depth,
+// and so settles slightly BELOW 59.9228 Hz rather than averaging up to it. That
+// is the intended direction — a rate cap must never let a stall license a later
+// overshoot — and `GMLOADER_FCAP_BURST` is the knob if a scene wants more slack.
 enum {
     FCAP_STALL_MS       = 50,      // give up on ONE frame's wait after this (≈3 periods)
     FCAP_STALL_MAX      = 20,      // consecutive stalled frames before permanent demotion
     FCAP_CYC_MIN        = 492187,  // sane scan_period_cyc band: 5 ms …
     FCAP_CYC_MAX        = 4921875, // … 50 ms at clk_sys 98.4375 MHz
     FCAP_BURST_DEFAULT  = 2,       // bucket depth, in scanout frames (see above)
+    FCAP_RESOLVE_ATTEMPTS = 240,   // resolve retries before giving up (~120 frames)
 };
 static const double FCAP_CLK_SYS_HZ = 98437500.0;   // clk_sys — the counter's clock
 
@@ -171,22 +183,37 @@ static void fcap_resolve(void) {
     if (g_fcap_mode != FCAP_UNSET && g_fcap_refresh != 0.0f) return;
 
     uint32_t cnt = 0, cyc = 0;
-    if (!fcap_scanout_read(&cnt, &cyc)) {
-        // Not readable YET (mapping not built) or not at all (sw back-end / no
-        // /dev/mem). Retrying is two uncached loads; give up after ~2 s of frames
-        // and take the wall clock so the mode is never left unresolved.
-        static uint32_t tries = 0;
-        if (++tries > 120 && g_fcap_refresh == 0.0f) {
+    const bool readable = fcap_scanout_read(&cnt, &cyc);
+    if (!readable || !fcap_period_sane(cyc)) {
+        // Three cases, one shared budget:
+        //   • not readable YET — the fabric back-end only mmaps /dev/mem on its
+        //     first use, inside frame 1's Process, so the first calls legitimately
+        //     fail;
+        //   • not readable at all — sw back-end, or no /dev/mem;
+        //   • readable but reporting a period outside 5–50 ms — these words are
+        //     not the instrument (mismatched/older RBF), not a slow display.
+        // The third case used to retry forever with no log line, which is a silent
+        // undiagnosable stall in resolution; it now gives up and says so, like the
+        // other two. Retrying costs two uncached loads.
+        //
+        // This counts resolve ATTEMPTS, not frames: fcap_resolve() runs twice per
+        // frame (fcap_refresh_hz() at the top of the loop, fcap_wait() at the
+        // bottom), so the budget is ~half as many frames. Reported as attempts
+        // rather than converted, because that ratio is an implementation detail.
+        static uint32_t attempts = 0;
+        if (++attempts > (uint32_t)FCAP_RESOLVE_ATTEMPTS && g_fcap_refresh == 0.0f) {
             if (g_fcap_mode == FCAP_UNSET)
                 g_fcap_mode = g_fcap_frame_ms ? FCAP_TICKS : FCAP_OFF;
             g_fcap_refresh = 60.0f;
-            warning("frame-cap: scanout counter unavailable after %u frames — "
-                    "wall-clock cap at %u ms, GM refresh 60.00 Hz\n",
-                    (unsigned)tries, (unsigned)g_fcap_frame_ms);
+            warning("frame-cap: scanout counter %s after %u attempts — %s, "
+                    "GM refresh 60.00 Hz\n",
+                    readable ? "reporting an implausible period" : "unavailable",
+                    (unsigned)attempts,
+                    g_fcap_frame_ms ? "falling back to the wall-clock cap"
+                                    : "no cap in force");
         }
         return;
     }
-    if (!fcap_period_sane(cyc)) return;       // stale/garbage register — retry
     g_fcap_refresh = (float)(FCAP_CLK_SYS_HZ / (double)cyc);
     if (g_fcap_mode == FCAP_UNSET) {
         const char *b = getenv("GMLOADER_FCAP_BURST");
@@ -234,8 +261,14 @@ static void fcap_credit_add(uint32_t cnt) {
 
 static void fcap_demote(const char *why) {
     g_fcap_mode = g_fcap_frame_ms ? FCAP_TICKS : FCAP_OFF;
-    warning("frame-cap: scanout counter %s — falling back to the %u ms wall-clock cap\n",
-            why, (unsigned)g_fcap_frame_ms);
+    // Drop the measured refresh too. Demotion means the instrument is not
+    // trustworthy, and `scan_period_cyc` can be wrong while still landing inside
+    // the 5–50 ms sane band — a mismatched or older RBF where 0x3BFB0018 is not
+    // this counter would otherwise keep feeding GM that bogus rate forever, long
+    // after the cap itself stopped believing the same register.
+    g_fcap_refresh = 60.0f;
+    warning("frame-cap: scanout counter %s — falling back to the %u ms wall-clock "
+            "cap, GM refresh 60.00 Hz\n", why, (unsigned)g_fcap_frame_ms);
 }
 
 static void fcap_wait(void) {
@@ -261,7 +294,13 @@ static void fcap_wait(void) {
                     if (poll_us) usleep((useconds_t)poll_us);
                     if (!fcap_scanout_read(&cnt, NULL)) { fcap_demote("became unreadable"); break; }
                     fcap_credit_add(cnt);
-                    if (g_fcap_credit < 0 && SDL_GetTicks() > deadline) { stalled = true; break; }
+                    // Wrap-safe: SDL_GetTicks() wraps at ~49.7 days, and a plain
+                    // `> deadline` on a wrapped clock never becomes true, so a
+                    // frozen counter after that point would spin here forever.
+                    // The signed difference stays correct across the wrap.
+                    if (g_fcap_credit < 0 && (Sint32)(SDL_GetTicks() - deadline) > 0) {
+                        stalled = true; break;
+                    }
                 }
                 if (g_fcap_stat) { g_fcap_waits++; g_fcap_wait_ms += (double)(SDL_GetTicks() - t0); }
                 if (stalled) {
