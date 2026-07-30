@@ -1,8 +1,8 @@
 //
 //  Native Audio DDR3 Writer -- gmloader MiSTer
 //
-//  Pushes 48 kHz stereo S16 PCM into a DDR3 ring buffer drained by the FPGA
-//  (openbor_video_reader's audio FSM). No ALSA, no Linux sound kernel.
+//  Pushes NA_SAMPLE_RATE stereo S16 PCM into a DDR3 ring buffer drained by the
+//  FPGA (gm_audio, on its own ddr_svc channel). No ALSA, no Linux sound kernel.
 //
 //  Memory map (must match openbor_video_reader.sv):
 //    0x3A000030  audio_wr_ptr  (32-bit byte offset into ring; ARM writes)
@@ -23,7 +23,13 @@
 extern "C" {
 #endif
 
-#define NA_SAMPLE_RATE      48000
+// The ring carries the game's NATIVE rate. The FPGA (fpga/rtl/gm_audio.sv in
+// maldita.castilla-mister) resamples 22.05k -> 48k with a fractional phase
+// accumulator, so nothing upsamples on the A9 any more.
+//
+// LOCKSTEP: gm_audio's SRC_RATE parameter must equal this. They are two copies
+// of one constant in two repos; changing one alone detunes the resampler.
+#define NA_SAMPLE_RATE      22050
 #define NA_CHANNELS         2
 #define NA_BYTES_PER_FRAME  4   /* 2 ch * int16 */
 

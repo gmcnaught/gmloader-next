@@ -52,20 +52,23 @@ int main(void) {
     // A push track at the sink's own format opens and echoes its spec back.
     SDL_AudioSpec want, got;
     SDL_zero(want);
-    want.freq = 48000;
+    want.freq = NA_SAMPLE_RATE;
     want.format = AUDIO_S16SYS;
     want.channels = 2;
     want.samples = 1024;
     want.callback = NULL;
     MisterAudioTrack t = MisterAudio_Open(&want, &got);
     CHECK(t != 0);
-    CHECK(got.freq == 48000 && got.format == AUDIO_S16SYS && got.channels == 2);
+    CHECK(got.freq == NA_SAMPLE_RATE && got.format == AUDIO_S16SYS &&
+          got.channels == 2);
     CHECK(got.samples == 1024);           // caller's arithmetic is preserved
 
     // Queued bytes reflect staging only, and start empty.
     CHECK(MisterAudio_QueuedBytes(t) == 0);
 
-    // 480 frames in == 1920 bytes staged (no conversion at 48k stereo S16).
+    // 480 frames in == 1920 bytes staged: a track at the sink's own rate is an
+    // identity copy, which is the whole point of carrying the native rate in the
+    // ring -- no resampler runs on the A9 for the game's own audio.
     static int16_t pcm[480 * 2];
     for (int i = 0; i < 480 * 2; ++i) pcm[i] = (int16_t)(i & 0x7FFF);
     CHECK(MisterAudio_Queue(t, pcm, sizeof(pcm)) == 0);
@@ -75,20 +78,21 @@ int main(void) {
     MisterAudio_Clear(t);
     CHECK(MisterAudio_QueuedBytes(t) == 0);
 
-    // A 44.1 kHz mono track is resampled and upmixed. Naively, 441 frames in
-    // (10 ms) should stage ~480 frames (10 ms) of 48 kHz stereo -- but SDL's
-    // resampler (SDL2 2.32.10, measured on this host) withholds a *fixed*
-    // ~558-output-frame (~11.6 ms) FIR filter delay from the very first put,
-    // independent of how much is queued. A single 441-frame put therefore
-    // legitimately stages 0 bytes here -- that isn't conversion being broken,
-    // it is the filter delay exceeding the block. To get a measurable,
-    // non-vacuous signal in one call, queue 10x as much (4410 frames, 100 ms)
-    // so the fixed delay is a small fraction of the block: measured staged
-    // bytes are a deterministic, repeatable 16968 (verified across 3 runs).
-    // The band below is tight around that real value, and comfortably
-    // excludes both a stuck/broken track (0 bytes) and a bug that skips
-    // conversion entirely and passes the raw mono bytes through untouched
-    // (4410 * 2 = 8820 bytes, well under the lower bound).
+    // A 44.1 kHz mono track is resampled and upmixed -- now DOWN to the sink's
+    // 22.05 kHz rather than up to 48 kHz. Naively, 4410 frames in (100 ms)
+    // should stage 2205 frames (100 ms) of 22.05 kHz stereo == 8820 bytes. SDL's
+    // resampler (SDL2 2.32.10, measured on this host) withholds a fixed ~11.6 ms
+    // FIR filter delay from the very first put, which at 22.05 kHz is ~512
+    // frames == 2048 bytes, so the measured value is a deterministic 6772.
+    // (At 48 kHz the same 11.6 ms was ~558 frames and the value was 16968; the
+    // delay is constant in TIME, so it rescales with the sink rate.)
+    //
+    // The band below is tight around the real value and excludes both failure
+    // directions: a stuck/broken track (0 bytes) below, and a bug that skips
+    // conversion and passes the raw mono bytes through untouched (4410 * 2 =
+    // 8820 bytes) above. Note the passthrough value now sits ABOVE the correct
+    // one -- downsampling produces FEWER bytes than the input, where upsampling
+    // produced more -- so the upper bound is doing real work here.
     SDL_AudioSpec want44;
     SDL_zero(want44);
     want44.freq = 44100;
@@ -101,10 +105,10 @@ int main(void) {
     memset(mono, 0, sizeof(mono));
     CHECK(MisterAudio_Queue(t44, mono, sizeof(mono)) == 0);
     const uint32_t staged = MisterAudio_QueuedBytes(t44);
-    CHECK(staged > 16000u && staged < 18000u);
+    CHECK(staged > 6000u && staged < 8000u);
 
     // Staging cap: flooding a track past 500 ms is refused, not buffered.
-    static int16_t flood[48000 * 2];
+    static int16_t flood[NA_SAMPLE_RATE * 2];
     memset(flood, 0, sizeof(flood));
     int refusals = 0;
     for (int i = 0; i < 4; ++i)
@@ -151,17 +155,21 @@ int main(void) {
     CHECK(MisterAudio_PumpOnce() > 0);
     CHECK(NativeAudioWriter_FreeFrames() < NativeAudioWriter_CapacityFrames());
 
-    // Reaching TARGET_FILL (4800) takes more than one pass because each is
-    // capped at MAX_FRAMES (4096). Pump until topped up, then a further pass
-    // must be a no-op.
+    // Pump until topped up to kTargetFillFrames, then a further pass must be a
+    // no-op. (At 48 kHz the target exceeded the 4096-frame per-pass cap and this
+    // needed several passes; at the native rate it may top up in one. Either way
+    // the invariant under test is the same: it converges, then stops.)
     for (int i = 0; i < 8 && MisterAudio_PumpOnce() > 0; ++i) {}
     CHECK(MisterAudio_PumpOnce() == 0);
 
     // Unpause and stage a known full-scale ramp; the pump must consume it.
     drain_ring();
     MisterAudio_Pause(t, 0);
-    static int16_t tone[2400 * 2];
-    for (int i = 0; i < 2400 * 2; ++i) tone[i] = 1000;
+    // 50 ms, comfortably under kTargetFillFrames (100 ms) so a single pass
+    // drains it. Hardcoding 2400 encoded "half the 48 kHz target" implicitly.
+    static const int kToneFrames = NA_SAMPLE_RATE / 20;
+    static int16_t tone[(NA_SAMPLE_RATE / 20) * 2];
+    for (int i = 0; i < kToneFrames * 2; ++i) tone[i] = 1000;
     CHECK(MisterAudio_Queue(t, tone, sizeof(tone)) == 0);
     CHECK(MisterAudio_QueuedBytes(t) == sizeof(tone));
     CHECK(MisterAudio_PumpOnce() > 0);
@@ -173,7 +181,7 @@ int main(void) {
     MisterAudio_Pause(t44, 0);
     SDL_AudioSpec want2;
     SDL_zero(want2);
-    want2.freq = 48000; want2.format = AUDIO_S16SYS; want2.channels = 2;
+    want2.freq = NA_SAMPLE_RATE; want2.format = AUDIO_S16SYS; want2.channels = 2;
     want2.samples = 1024;
     MisterAudioTrack tb = MisterAudio_Open(&want2, NULL);
     CHECK(tb != 0);

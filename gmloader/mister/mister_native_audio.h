@@ -6,8 +6,13 @@
 //  into the DDR3 ring the FPGA drains. SDL is still used for rate/format
 //  conversion via SDL_AudioStream -- only the device is replaced.
 //
-//  Callers see their own requested spec back verbatim; the 48 kHz stereo S16
-//  sink format is never negotiated outward.
+//  The sink runs at NA_SAMPLE_RATE, the game's NATIVE rate, so a track opened
+//  at that rate converts as an identity copy instead of being resampled to
+//  48 kHz on the A9. Producers at other rates (ffmpeg cutscene audio) still
+//  convert, which is correct and rare.
+//
+//  Callers see their own requested spec back verbatim; the sink format is
+//  never negotiated outward.
 //
 //  Copyright (C) 2026 -- GPL-3.0
 //
@@ -52,7 +57,7 @@ void MisterAudio_Close(MisterAudioTrack t);
 /// because staging is already at MISTER_AUDIO_STAGING_CAP_MS.
 int MisterAudio_Queue(MisterAudioTrack t, const void *data, uint32_t len);
 
-/// Bytes still staged for this track, in 48 kHz stereo S16 bytes. Reports
+/// Bytes still staged for this track, in sink-format stereo S16 bytes. Reports
 /// ONLY staging -- audio already moved into the ring counts as consumed, so
 /// the ring keeps acting as the latency cushion.
 uint32_t MisterAudio_QueuedBytes(MisterAudioTrack t);
