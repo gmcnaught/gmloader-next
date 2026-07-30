@@ -551,11 +551,17 @@ static double mf_clip_tri_area(float x0, float y0, float x1, float y1,
 // checks mf_stat_on() first and is genuinely zero cost when GMLOADER_MFSUBMIT_STAT is
 // unset. [Phase 4 Stage A review] That does NOT extend to the submit-seam stamps
 // (g_seam_be/g_seam_ar in mf_publish_barrier, g_publish_t0 and the mf_seam_add call in
-// mf_device_publish): those run every frame in the device build regardless of this knob,
-// on purpose, so the seam measures the same seam whether or not stat printing is on
-// rather than perturbing the two modes differently. The cost (two clock_gettime calls
-// plus one struct-copy accumulate) is ~100 ns against a 16.7 ms frame budget --
-// immaterial, but not zero, and not gated here.
+// mf_device_publish): the two clock_gettime stamps and the mf_seam_add call run every
+// frame, in BOTH builds (device and host-oracle) -- not gated on mf_stat_on() at all.
+// With the stat knob OFF, mf_submit_stat's own early return (`if (!mf_stat_on()) return;`
+// below) means g_seam_frame_ms and g_seam_blocked are never written for the life of the
+// process: g_seam_frame_ms stays 0.0 and g_seam_blocked stays permanently false, so the
+// accumulator's `blocked`/`notice` split in mf_seam_add accrues as if nothing ever
+// blocked. That is harmless TODAY only because the sole reader of the accumulator is the
+// print in mf_submit_stat, gated on this same knob -- a future consumer that read g_seam
+// without also checking mf_stat_on() would silently see zeros. The unconditional
+// stamping itself is cheap regardless of the knob: even a clock_gettime call that misses
+// the vDSO and pays a full ~2 us syscall is 0.012% of the 16.6882 ms scanout period.
 static int mf_stat_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("GMLOADER_MFSUBMIT_STAT"); v = (e && *e) ? 1 : 0; }
@@ -1274,6 +1280,17 @@ static bool mf_publish_barrier(void) {
             // otherwise close pairs a fresh g_seam_be against a g_seam_ar left over from
             // the last successful barrier -- an entire drop run earlier (device-observed:
             // ~60 frames x ~16.7 ms folded into one sample). Skip it.
+            //
+            // Coverage note: this branch is NOT exercised by
+            // case_seam_reclaim_no_corrupt_sample. That test's forced-busy walk always
+            // reclaims one level up, inside mf_frame_begin's own drop_or_reclaim call --
+            // a wedge settles at the FIRST place that observes it (see the comment above
+            // mf_drop_or_reclaim), which clears g_fabric_pending before the barrier is
+            // reached again, so the barrier takes its !g_fabric_pending early-out instead
+            // of ever calling mf_fabric_still_busy() here. Mutation-verified: forcing this
+            // `if (reclaimed)` to never trigger leaves the whole suite green. The guard is
+            // still correct -- the corruption it prevents is real -- it is just harder to
+            // reach than the early-out above under the harness's default drop limit.
             if (g_seam_have_prev) g_seam_incomplete++;
             g_seam_have_prev = false;
         }

@@ -1612,6 +1612,7 @@ static void mf_test_drive_one_frame(void) {
 // advanced), not the timings.
 static int case_seam_one_sample_per_frame(void) {
     RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetFabricBusy(-1);   // ask for the real predicate
     if (RasterBackend_MFGPU_TestSeamSampleCount() != 0) {
         printf("  seam: expected 0 samples after reinit, got %u\n",
                RasterBackend_MFGPU_TestSeamSampleCount());
@@ -1636,6 +1637,19 @@ static int case_seam_one_sample_per_frame(void) {
 // asserts the accumulator gains NO sample at the reclaiming frame, only an `incomplete`
 // count. Run against the pre-fix code, this fails because TestSeamSampleCount() advances
 // at the reclaim frame.
+//
+// Coverage note: mf_publish_barrier has TWO non-success `return true` paths that skip
+// re-stamping g_seam_ar -- the !g_fabric_pending early-out, and the barrier's own
+// mf_fabric_still_busy() + mf_drop_or_reclaim() path further down. This test exercises
+// only the FIRST. The forced-busy walk below reaches MF_DROP_LIMIT inside
+// mf_frame_begin's own drop_or_reclaim call (a wedge always settles there first -- see
+// the comment above mf_drop_or_reclaim in raster_backend_mfgpu.cpp), which clears
+// g_fabric_pending before the barrier runs again; the barrier then takes its
+// !g_fabric_pending early-out, never its own busy-check-and-reclaim branch.
+// Mutation-verified: replacing the barrier's own reclaim guard condition with `false`
+// leaves this whole suite green. Reaching that branch would need a non-default drop
+// limit (or some other way to keep g_fabric_pending true going into the barrier while
+// the fabric is still busy), which this harness does not currently produce.
 static int case_seam_reclaim_no_corrupt_sample(void) {
     RasterBackend_MFGPU_TestReinit(0);
     RasterBackend_MFGPU_TestSetFabricBusy(-1);
