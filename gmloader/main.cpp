@@ -43,6 +43,289 @@ void* g_gles_handle = nullptr;
 // below).
 extern "C" const RasterBackend backend_mfgpu;
 extern "C" const uint16_t *RasterBackend_MFGPU_GetFB565(int *w, int *h);
+
+// ── [Phase 3 Stage B] Display-derived frame CAP ──────────────────────────────
+// The cap exists because the blitter can run the GM VM far above the display
+// rate, which races the game's logic/intro and triggers relaunch loops. What it
+// replaced was a wall-clock `SDL_Delay` cap on a 1 ms grid at frame_ms =
+// 1000/60 = 16 (integer truncation → it actually targeted 62.5 fps, against a
+// real scanout period of 16.6882 ms), and whose catch-up branch is followed by
+// an unconditional `next_ms += frame_ms`, so tripping it produced a FULL
+// frame_ms sleep rather than none. Measured cost on .62: 19.79 ms capped vs
+// 18.09 ms with `GMLOADER_FPS=0`, fabric identical — ~1.7 ms/frame.
+//
+// This is a CAP, NOT a vsync SYNC, and the distinction is the whole design:
+// the loop body is ~18.09 ms against a 16.6882 ms scanout period, so a classic
+// "block until the next scanout frame" would miss every window and land on the
+// following one — 33.38 ms, ~30 fps, far worse than the 50.5 fps it replaces.
+// The gate is a LEAKY BUCKET over the scanout counter, not a per-frame test.
+// Scanout boundaries are banked as credit (bucket depth FCAP_BURST_DEFAULT
+// frames), each game frame spends one, and a frame waits only when the bucket
+// is empty:
+//   • loop faster than scanout → the bucket drains, every frame waits, the
+//     long-run rate is pinned at the true 59.9228 Hz (the cap does its job)
+//   • loop at or slower than scanout → boundaries arrive faster than they are
+//     spent → ZERO wait, i.e. exactly the `GMLOADER_FPS=0` behaviour
+// A game frame can never get more than FCAP_BURST_DEFAULT frames ahead of the
+// display, so this caps the RATE while staying immune to the loop's shape.
+//
+// The bucket is why this is not the simpler "has the counter advanced since
+// this frame began?" test. That test was built first and measured on .62: even
+// at the steady quiet pose it waited on 37 % of frames for a mean 6.6-7.7 ms,
+// delivering 19.05 ms/frame — better than the 19.79 ms it replaced but well
+// short of the 18.09 ms the loop runs at uncapped. The cause is the Phase 2
+// host lever: with the C_DONE await moved to the publish site the loop is
+// PIPELINED, so frame times alternate short/long around an 18.09 ms mean. A
+// per-frame test pads every short frame while the long ones stay long, so it
+// raises the mean it was supposed to leave alone. Banking the extra boundary a
+// long frame crossed and spending it on the short frame that follows removes
+// that penalty without loosening the long-run cap.
+//
+// GMLOADER_FPS: 0 disables the cap entirely (unchanged — the benches rely on
+// it); an explicit positive N keeps the old wall-clock cap at N fps (a numeric
+// fps is a wall-clock request); unset/default = this scanout cap, with the old
+// 16 ms wall-clock cap as the fallback if the instrument is unavailable or
+// stops advancing. A hang here bricks the game loop, so every wait is bounded.
+// GMLOADER_FCAP_BURST overrides the bucket depth (1 = the strict per-frame test
+// above; larger allows a longer burst before the cap bites).
+//
+// Note that the GM refresh rate is resolved independently of which cap is in
+// force: `GMLOADER_FPS=0` and `GMLOADER_FPS=N` still hand GM the measured
+// 59.9228 Hz when the instrument reads sanely. Only the PACING differs.
+//
+// The bucket discards surplus credit (it clamps at `burst`), so the cap is
+// one-sided by construction: a loop that runs fast but is punctuated by hitches
+// cannot spend the boundaries those hitches crossed beyond the bucket's depth,
+// and so settles slightly BELOW 59.9228 Hz rather than averaging up to it. That
+// is the intended direction — a rate cap must never let a stall license a later
+// overshoot — and `GMLOADER_FCAP_BURST` is the knob if a scene wants more slack.
+enum {
+    FCAP_STALL_MS       = 50,      // give up on ONE frame's wait after this (≈3 periods)
+    FCAP_STALL_MAX      = 20,      // consecutive stalled frames before permanent demotion
+    FCAP_CYC_MIN        = 492187,  // sane scan_period_cyc band: 5 ms …
+    FCAP_CYC_MAX        = 4921875, // … 50 ms at clk_sys 98.4375 MHz
+    FCAP_BURST_DEFAULT  = 2,       // bucket depth, in scanout frames (see above)
+    FCAP_RESOLVE_ATTEMPTS = 240,   // resolve retries before giving up (~120 frames)
+};
+static const double FCAP_CLK_SYS_HZ = 98437500.0;   // clk_sys — the counter's clock
+
+enum FCapMode { FCAP_UNSET = 0, FCAP_OFF, FCAP_SCANOUT, FCAP_TICKS };
+static FCapMode  g_fcap_mode      = FCAP_UNSET;
+static Uint32    g_fcap_frame_ms  = 0;      // wall-clock fallback period (0 = no cap)
+static float     g_fcap_refresh   = 0.0f;   // measured scanout Hz; 0 = not resolved yet
+static uint32_t  g_fcap_last_scan = 0;
+static bool      g_fcap_have_last = false;
+static int       g_fcap_stall_run = 0;
+static int32_t   g_fcap_credit    = 0;      // banked scanout boundaries (leaky bucket)
+static int32_t   g_fcap_burst     = FCAP_BURST_DEFAULT;
+// Instrument (GMLOADER_FCAP_STAT=1): proves the cap engages rather than idling.
+static int       g_fcap_stat      = -1;
+static uint32_t  g_fcap_frames    = 0, g_fcap_waits = 0;
+static double    g_fcap_wait_ms   = 0.0;
+
+// Poll interval inside the wait, in microseconds (GMLOADER_FCAP_POLL_US;
+// 0 = pure spin, the default). Same shape and same reasoning as the backend's
+// GMLOADER_MFGPU_POLL_US: one uncached control-word read costs ~1.2 us, so a
+// spin releases within ~1 us of the scanout boundary, whereas even a 100 us
+// usleep is rounded up by the kernel's timer slack and would systematically
+// overshoot the 16.6882 ms period by ~1 %. Poll traffic at that rate was
+// already A/B'd on device against the fabric and is not what it waits on.
+static long fcap_poll_us(void) {
+    static long v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_FCAP_POLL_US"); v = (e && *e) ? atol(e) : 0; if (v < 0) v = 0; }
+    return v;
+}
+
+static bool fcap_period_sane(uint32_t cyc) {
+    return cyc >= (uint32_t)FCAP_CYC_MIN && cyc <= (uint32_t)FCAP_CYC_MAX;
+}
+static bool fcap_scanout_read(uint32_t *cnt, uint32_t *cyc) {
+    if (RasterBackend_Select() != &backend_mfgpu) return false;
+    if (!RasterBackend_MFGPU_ScanoutRead(cnt, cyc)) return false;
+    // Fault injection for the fallback path (GMLOADER_FCAP_FREEZE=<ms>): from
+    // that many ms of SDL uptime on, pin the reported count, so "the counter
+    // stopped advancing" can be exercised on real hardware without wedging one.
+    // Unset (the default) costs one comparison. Diagnostic only.
+    static long freeze = -2; static uint32_t frozen = 0;
+    if (freeze == -2) { const char *e = getenv("GMLOADER_FCAP_FREEZE"); freeze = (e && *e) ? atol(e) : -1; }
+    if (freeze >= 0 && cnt && (long)SDL_GetTicks() >= freeze) {
+        if (!frozen) frozen = *cnt ? *cnt : 1u;
+        *cnt = frozen;
+    }
+    return true;
+}
+
+// Idempotent, cheap, and safe to call before the mapping exists: the fabric
+// back-end only mmaps /dev/mem on its first use (inside frame 1's Process), so
+// the first call or two legitimately fail and simply retry next frame.
+static void fcap_resolve(void) {
+    if (g_fcap_stat < 0) {
+        const char *s = getenv("GMLOADER_FCAP_STAT");
+        g_fcap_stat = (s && *s && *s != '0') ? 1 : 0;
+    }
+    if (g_fcap_mode == FCAP_UNSET) {
+        const char *fe = getenv("GMLOADER_FPS");
+        int fps = fe ? atoi(fe) : 60;
+        if (fps <= 0) {                       // GMLOADER_FPS=0 — no cap at all
+            g_fcap_frame_ms = 0;
+            g_fcap_mode = FCAP_OFF;
+            warning("frame-cap: disabled (GMLOADER_FPS=0)\n");
+            return;
+        }
+        g_fcap_frame_ms = (Uint32)(1000 / fps);
+        if (fe && *fe) {                      // explicit fps = explicit wall clock
+            g_fcap_mode = g_fcap_frame_ms ? FCAP_TICKS : FCAP_OFF;
+            warning("frame-cap: wall-clock cap at %d fps (%u ms) — GMLOADER_FPS set explicitly\n",
+                    fps, (unsigned)g_fcap_frame_ms);
+            return;
+        }
+    }
+    if (g_fcap_mode != FCAP_UNSET && g_fcap_refresh != 0.0f) return;
+
+    uint32_t cnt = 0, cyc = 0;
+    const bool readable = fcap_scanout_read(&cnt, &cyc);
+    if (!readable || !fcap_period_sane(cyc)) {
+        // Three cases, one shared budget:
+        //   • not readable YET — the fabric back-end only mmaps /dev/mem on its
+        //     first use, inside frame 1's Process, so the first calls legitimately
+        //     fail;
+        //   • not readable at all — sw back-end, or no /dev/mem;
+        //   • readable but reporting a period outside 5–50 ms — these words are
+        //     not the instrument (mismatched/older RBF), not a slow display.
+        // The third case used to retry forever with no log line, which is a silent
+        // undiagnosable stall in resolution; it now gives up and says so, like the
+        // other two. Retrying costs two uncached loads.
+        //
+        // This counts resolve ATTEMPTS, not frames: fcap_resolve() runs twice per
+        // frame (fcap_refresh_hz() at the top of the loop, fcap_wait() at the
+        // bottom), so the budget is ~half as many frames. Reported as attempts
+        // rather than converted, because that ratio is an implementation detail.
+        static uint32_t attempts = 0;
+        if (++attempts > (uint32_t)FCAP_RESOLVE_ATTEMPTS && g_fcap_refresh == 0.0f) {
+            if (g_fcap_mode == FCAP_UNSET)
+                g_fcap_mode = g_fcap_frame_ms ? FCAP_TICKS : FCAP_OFF;
+            g_fcap_refresh = 60.0f;
+            warning("frame-cap: scanout counter %s after %u attempts — %s, "
+                    "GM refresh 60.00 Hz\n",
+                    readable ? "reporting an implausible period" : "unavailable",
+                    (unsigned)attempts,
+                    g_fcap_frame_ms ? "falling back to the wall-clock cap"
+                                    : "no cap in force");
+        }
+        return;
+    }
+    g_fcap_refresh = (float)(FCAP_CLK_SYS_HZ / (double)cyc);
+    if (g_fcap_mode == FCAP_UNSET) {
+        const char *b = getenv("GMLOADER_FCAP_BURST");
+        if (b && *b) { long v = atol(b); if (v >= 1 && v <= 16) g_fcap_burst = (int32_t)v; }
+        g_fcap_mode = FCAP_SCANOUT;
+        g_fcap_last_scan = cnt;
+        g_fcap_credit = 0;
+        g_fcap_have_last = true;
+    }
+    warning("frame-cap: scanout period %u cyc = %.4f ms (%.4f Hz); burst=%d; mode=%s\n",
+            (unsigned)cyc, 1000.0 / g_fcap_refresh, (double)g_fcap_refresh, (int)g_fcap_burst,
+            g_fcap_mode == FCAP_SCANOUT ? "scanout" :
+            g_fcap_mode == FCAP_TICKS   ? "wall-clock" : "off");
+}
+
+// Refresh rate handed to RunnerJNILib::Process. GM's delta/pacing math is
+// display-gated by design; feeding it the measured 59.9228 Hz instead of a
+// hardcoded 60 stops its internal clock drifting ~0.13 % against the display.
+static float fcap_refresh_hz(void) {
+    fcap_resolve();
+    return g_fcap_refresh != 0.0f ? g_fcap_refresh : 60.0f;
+}
+
+// The pre-existing wall-clock cap, byte-for-byte, kept as the fallback.
+static void fcap_wait_ticks(void) {
+    static Uint32 next_ms = 0;
+    if (!g_fcap_frame_ms) return;
+    Uint32 now = SDL_GetTicks();
+    if (next_ms == 0 || now > next_ms + g_fcap_frame_ms) next_ms = now;
+    next_ms += g_fcap_frame_ms;
+    if (now < next_ms) SDL_Delay(next_ms - now);
+}
+
+// Fold the boundaries observed since the last read into the credit bucket.
+// The difference is taken in uint32 so the counter's 2^32 wrap is transparent;
+// a NEGATIVE delta can only mean the counter restarted (core reload) or the
+// read was garbage, so it re-bases instead of banking a huge or negative debt.
+static void fcap_credit_add(uint32_t cnt) {
+    int32_t d = (int32_t)(cnt - g_fcap_last_scan);
+    g_fcap_last_scan = cnt;
+    if (d < 0) return;
+    g_fcap_credit += d;
+    if (g_fcap_credit > g_fcap_burst) g_fcap_credit = g_fcap_burst;
+}
+
+static void fcap_demote(const char *why) {
+    g_fcap_mode = g_fcap_frame_ms ? FCAP_TICKS : FCAP_OFF;
+    // Drop the measured refresh too. Demotion means the instrument is not
+    // trustworthy, and `scan_period_cyc` can be wrong while still landing inside
+    // the 5–50 ms sane band — a mismatched or older RBF where 0x3BFB0018 is not
+    // this counter would otherwise keep feeding GM that bogus rate forever, long
+    // after the cap itself stopped believing the same register.
+    g_fcap_refresh = 60.0f;
+    warning("frame-cap: scanout counter %s — falling back to the %u ms wall-clock "
+            "cap, GM refresh 60.00 Hz\n", why, (unsigned)g_fcap_frame_ms);
+}
+
+static void fcap_wait(void) {
+    fcap_resolve();
+    if (g_fcap_mode == FCAP_OFF) return;
+    if (g_fcap_mode == FCAP_SCANOUT) {
+        uint32_t cnt = 0;
+        if (!fcap_scanout_read(&cnt, NULL)) {
+            fcap_demote("became unreadable");
+        } else if (!g_fcap_have_last) {
+            g_fcap_last_scan = cnt; g_fcap_have_last = true;
+        } else {
+            fcap_credit_add(cnt);
+            g_fcap_credit -= 1;             // this game frame consumes one boundary
+            if (g_fcap_credit >= 0) {
+                g_fcap_stall_run = 0;       // already late/in credit — ZERO wait
+            } else {
+                const Uint32 t0 = SDL_GetTicks();
+                const Uint32 deadline = t0 + (Uint32)FCAP_STALL_MS;
+                const long   poll_us = fcap_poll_us();
+                bool stalled = false;
+                while (g_fcap_credit < 0) {
+                    if (poll_us) usleep((useconds_t)poll_us);
+                    if (!fcap_scanout_read(&cnt, NULL)) { fcap_demote("became unreadable"); break; }
+                    fcap_credit_add(cnt);
+                    // Wrap-safe: SDL_GetTicks() wraps at ~49.7 days, and a plain
+                    // `> deadline` on a wrapped clock never becomes true, so a
+                    // frozen counter after that point would spin here forever.
+                    // The signed difference stays correct across the wrap.
+                    if (g_fcap_credit < 0 && (Sint32)(SDL_GetTicks() - deadline) > 0) {
+                        stalled = true; break;
+                    }
+                }
+                if (g_fcap_stat) { g_fcap_waits++; g_fcap_wait_ms += (double)(SDL_GetTicks() - t0); }
+                if (stalled) {
+                    // Bounded, never a hang: this frame proceeds regardless. Only a
+                    // RUN of stalls (a wedged / non-scanning core) demotes for good.
+                    g_fcap_credit = 0;
+                    if (++g_fcap_stall_run >= FCAP_STALL_MAX)
+                        fcap_demote("stopped advancing");
+                } else {
+                    g_fcap_stall_run = 0;
+                }
+            }
+        }
+        if (g_fcap_mode == FCAP_SCANOUT) {
+            if (g_fcap_stat && ++g_fcap_frames % 300 == 0)
+                warning("FCAP n=%u waited=%u (%.1f%%) wait_ms_avg=%.2f mode=scanout\n",
+                        (unsigned)g_fcap_frames, (unsigned)g_fcap_waits,
+                        100.0 * g_fcap_waits / g_fcap_frames,
+                        g_fcap_waits ? g_fcap_wait_ms / g_fcap_waits : 0.0);
+            return;
+        }
+        // demoted this frame — fall through to the wall clock below
+    }
+    fcap_wait_ticks();
+}
 #endif
 
 
@@ -777,7 +1060,8 @@ int main(int argc, char *argv[])
         SDL_GetWindowSize(sdl_win, &w, &h);
 #ifdef MISTER_NATIVE_VIDEO
         uint64_t _dt_p0 = DrawTrace_NowNs();
-        cont = RunnerJNILib::Process(env, 0, Blitter_RenderW(), Blitter_RenderH(), 0, 0, 0, 0, 0, 60);
+        cont = RunnerJNILib::Process(env, 0, Blitter_RenderW(), Blitter_RenderH(), 0, 0, 0, 0, 0,
+                                     fcap_refresh_hz());
         uint64_t _dt_p1 = DrawTrace_NowNs();
         if (RunnerJNILib::canFlip(env, 0)) {
           const uint8_t* _blit = Blitter_PresentDefault();
@@ -829,24 +1113,10 @@ int main(int argc, char *argv[])
         }
         DrawTrace_FrameEnd(_dt_p1 - _dt_p0, DrawTrace_NowNs() - _dt_p1);
         Blitter_ProfFrameEnd(_dt_p1 - _dt_p0);
-        // Frame-rate cap: the blitter can run the game far above 60Hz, which
-        // races the game's logic/intro and triggers relaunch loops. Pace the
-        // loop (and therefore the runner's game logic) to ~60fps. Override with
-        // GMLOADER_FPS; 0 disables the cap.
-        {
-            static Uint32 frame_ms = 0xFFFFFFFF, next_ms = 0;
-            if (frame_ms == 0xFFFFFFFF) {
-                const char *fe = getenv("GMLOADER_FPS");
-                int fps = fe ? atoi(fe) : 60;
-                frame_ms = (fps > 0) ? (Uint32)(1000 / fps) : 0;
-            }
-            if (frame_ms) {
-                Uint32 now = SDL_GetTicks();
-                if (next_ms == 0 || now > next_ms + frame_ms) next_ms = now;
-                next_ms += frame_ms;
-                if (now < next_ms) SDL_Delay(next_ms - now);
-            }
-        }
+        // Frame-rate cap paced by the fabric's scanout counter, not the wall
+        // clock. Design, fallbacks and GMLOADER_FPS semantics: see the
+        // [Phase 3 Stage B] block near the top of this file.
+        fcap_wait();
 #else
         cont = RunnerJNILib::Process(env, 0, w, h, 0, 0, 0, 0, 0, 60);
         if (RunnerJNILib::canFlip(env, 0))

@@ -688,6 +688,11 @@ enum {
     MF_DEV_RING_B_OFF= 0x00040000u,   // ring B
     MF_DEV_SRC_OFF   = 0x00080000u,   // SRC_QW = 0x3B080000 (DDR3 source heap) -- UNCHANGED
     MF_DEV_TLBUF_OFF = 0x00F40000u,   // bounds the usable SRC heap (~14.8 MiB)
+    // [Phase 3 Stage B] openbor_video_reader.sv SCANFRM_ADDR = byte 0x3BFB0018,
+    // i.e. offset 0x00FB0018 in this same 16 MiB mapping (above the SRC heap, in
+    // the reader's sentinel-clean tail). Read-only here — see
+    // RasterBackend_MFGPU_ScanoutRead below.
+    MF_DEV_SCANFRM_OFF = 0x00FB0018u,
     MF_DEV_RING_CAP  = MF_DEV_RING_B_OFF - MF_DEV_RING_OFF,   // 256 KiB, ~8190 commands
     MF_DEV_SRC_CAP   = MF_DEV_TLBUF_OFF - MF_DEV_SRC_OFF,
     MF_DEV_DONE_TIMEOUT_MS = 200,
@@ -1575,6 +1580,15 @@ static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
     return ref;
 }
 
+// [Phase 3 Stage A] GMLOADER_MFGPU_TRACE forward decls: defined next to
+// mf_uvlog_on below (same bring-up-capture neighbourhood), called from
+// mf_emit_group's success path above that definition.
+static int mf_trace_on(void);
+static int mf_trace_in_window(void);
+static void mf_trace_group(const blt_surface_ref_t &tex, int tw, int th,
+                           uint8_t blend_mode, uint16_t colorkey,
+                           uint8_t extra_flags, int nt);
+
 // Emit one BLT_OP_TRILIST for `nt` triangles (`verts` = nt*3 vertices, whose UVs
 // address the `tw`x`th` page `tex`). Converts + pushes the vertices, selects the
 // colorkey-vs-blend mode (has_key + fully-opaque => BLT_BLEND_COLORKEY, exactly
@@ -1641,6 +1655,8 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", nt);
         return;
     }
+    if (mf_trace_on() && mf_trace_in_window())
+        mf_trace_group(tex, tw, th, blend_mode, colorkey, extra_flags, nt);
     // Coverage estimate (Task 4, moved here per review — see the long comment at
     // g_cov_px_accum's declaration): this is the actual point triangles are pushed
     // into the fabric ring, downstream of every silent-discard path in mf_draw
@@ -1655,6 +1671,56 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
             mf_cov_add_triangle(a.x, a.y, b.x, b.y, c.x, c.y);
         }
     }
+}
+
+// ── [Phase 3 Stage A] GMLOADER_MFGPU_TRACE ───────────────────────────────────
+// Draw-stream capture for offline sizing + sim replay. Dumps, at the single
+// point every surviving draw passes (mf_emit_group, after blt_trilist accepts),
+// the exact wire-level data the fabric will read: the resolved blend/colorkey
+// and the converted blt_vtx_t integers — NOT the float BVtx, so the offline
+// consumers replay what the device executed, conversion included.
+// Cached getenv() reads: file-scope (not function-local) statics so a
+// host-test-only hook (RasterBackend_MFGPU_TestTraceReset, near the other
+// Test* hooks below) can force them to re-resolve. Production still gets the
+// zero-cost idiom -- nothing here reads getenv() more than once per process
+// unless that hook is called, which only the host test suite does.
+static FILE *mf_trace_f = NULL;
+static int  mf_trace_v = -1;                        // cached mf_trace_on() result
+static long mf_trace_start = -1, mf_trace_frames = -1;  // cached window bounds
+static int mf_trace_on(void) {
+    if (mf_trace_v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_TRACE");
+        if (e && *e) { mf_trace_f = fopen(e, "w"); mf_trace_v = (mf_trace_f != NULL); }
+        else mf_trace_v = 0;
+    }
+    return mf_trace_v;
+}
+static long mf_trace_env_long(const char *name, long dflt) {
+    const char *e = getenv(name);
+    return (e && *e) ? atol(e) : dflt;
+}
+static int mf_trace_in_window(void) {
+    if (mf_trace_start < 0) {
+        mf_trace_start  = mf_trace_env_long("GMLOADER_MFGPU_TRACE_START", 0);
+        mf_trace_frames = mf_trace_env_long("GMLOADER_MFGPU_TRACE_FRAMES", 8);
+    }
+    return g_frame_no >= mf_trace_start && g_frame_no < mf_trace_start + mf_trace_frames;
+}
+static void mf_trace_group(const blt_surface_ref_t &tex, int tw, int th,
+                           uint8_t blend_mode, uint16_t colorkey,
+                           uint8_t extra_flags, int nt) {
+    fprintf(mf_trace_f,
+            "MFTRACE G f=%d off=%u stride=%u texw=%d texh=%d fmt=%u "
+            "blend=%u key=%u alpha=255 flags=%u nt=%d\n",
+            g_frame_no, tex.off, (unsigned)tex.stride, tw, th,
+            (unsigned)tex.format, (unsigned)blend_mode, (unsigned)colorkey,
+            (unsigned)extra_flags, nt);
+    for (int i = 0; i < nt * 3; i++)
+        fprintf(mf_trace_f, "MFTRACE V %d %d %d %d %08x\n",
+                (int)g_vtxscratch[i].x, (int)g_vtxscratch[i].y,
+                (int)g_vtxscratch[i].u, (int)g_vtxscratch[i].v,
+                g_vtxscratch[i].rgba);
+    fflush(mf_trace_f);   // engine may be SIGKILLed by the bench teardown
 }
 
 // ── [Y-orientation bring-up capture] GMLOADER_MFGPU_UVLOG ────────────────────
@@ -2262,6 +2328,36 @@ extern "C" const uint16_t *RasterBackend_MFGPU_GetFB565(int *w, int *h) {
     return g_fb565;
 }
 
+// [Phase 3 Stage B] Scanout instrument readout — the DISPLAY's frame boundary,
+// which C_DONE (a fabric-completion count) is not. openbor_video_reader.sv
+// publishes both words in ONE 64-bit DDR beat at SCANFRM_ADDR = byte 0x3BFB0018:
+//   +0x00  scan_frame_cnt   monotonic, +1 per scanout frame boundary, wraps 2^32
+//   +0x04  scan_period_cyc  clk_sys (98.4375 MHz) cycles between the last two
+//                           boundaries; measured 1,642,740 = 16.6882 ms = 59.9228 Hz
+// That address is offset 0x00FB0018 inside the 16 MiB region this back-end already
+// mmaps, so the per-frame read the main loop's frame cap needs is a plain uncached
+// load — no `devmem` process spawn. Read-only: the reader owns these words.
+// Returns 1 when the mapping is live (device + /dev/mem + fabric back-end), else 0
+// with the outputs untouched — callers MUST treat 0 as "no instrument" and fall back.
+extern "C" int RasterBackend_MFGPU_ScanoutRead(uint32_t *frame_cnt, uint32_t *period_cyc) {
+#ifdef MISTER_NATIVE_VIDEO
+    if (!g_dev_ok || !g_dev_base) return 0;
+    const volatile uint32_t *p =
+        (const volatile uint32_t *)(g_dev_base + (size_t)MF_DEV_SCANFRM_OFF);
+    // Count first: the two 32-bit loads are not mutually atomic, and a stale
+    // period merely describes the previous interval (harmless), whereas a stale
+    // count would mis-order the cap's advance test.
+    uint32_t c = p[0];
+    uint32_t t = p[1];
+    if (frame_cnt)  *frame_cnt  = c;
+    if (period_cyc) *period_cyc = t;
+    return 1;
+#else
+    (void)frame_cnt; (void)period_cyc;
+    return 0;   // host oracle build: no fabric, no scanout
+#endif
+}
+
 // ---- Host validation only — NOT part of the RasterBackend vtable ----------
 // Copies a tightly-packed w x h (<= BLT_FB_WIDTH x BLT_FB_HEIGHT) region of the
 // last blt_execute'd RGB565 target out for the host parity tests to diff against
@@ -2291,6 +2387,28 @@ extern "C" void RasterBackend_MFGPU_SetDefaultSurface(const uint8_t *rgba) {
     g_defRGBA = rgba;
 }
 
+// [Phase 3 Stage A] host hook: read g_frame_no as-is rather than mirroring or
+// assuming it — it is a whole-process monotonic counter TestReinit never
+// resets (only mf_frame_begin increments it), so a test that needs to reason
+// about the GMLOADER_MFGPU_TRACE window must read the real value instead of
+// hardcoding 0. Same "read from the backend" rationale as the OVF_* hooks below.
+extern "C" int RasterBackend_MFGPU_TestFrameNo(void) { return g_frame_no; }
+// [Phase 3 Stage A] host-test-only hook: force GMLOADER_MFGPU_TRACE's cached
+// getenv() reads to re-resolve. mf_trace_on()/mf_trace_in_window() cache in
+// process-lifetime statics on purpose (zero-cost on device, same idiom as
+// mf_stat_on()), which makes them resolve ONCE per process -- fine on device,
+// but it means a host case that sets the env vars mid-run only works if
+// nothing upstream in the same test binary already resolved the cache.
+// Mirrors RasterBackend_MFGPU_TestReinit's "force a clean state" contract:
+// closes any open trace file and clears every cached value, so the next
+// mf_trace_on()/mf_trace_in_window() call reads the environment fresh,
+// regardless of what already ran earlier in the process.
+extern "C" void RasterBackend_MFGPU_TestTraceReset(void) {
+    if (mf_trace_f) { fclose(mf_trace_f); mf_trace_f = NULL; }
+    mf_trace_v = -1;
+    mf_trace_start = -1;
+    mf_trace_frames = -1;
+}
 // Task 2 host hooks: count real blt_uploads (cache-hit-vs-miss proof) and force
 // a clean re-init with an optional capped texture-heap size (0 = full MF_TEX_HEAP;
 // nonzero lets the Task 4 eviction test shrink the allocator on purpose).

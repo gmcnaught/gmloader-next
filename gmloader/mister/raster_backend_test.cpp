@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <unistd.h>   // unlink (Task 2: GMLOADER_MFGPU_TRACE capture case)
 
 // Fabric-offload Task 2: exercise the refmodel's BLT_OP_STAGE handling directly
 // (not via the vtable). blt_emitter.h pulls in blitter_ref.h (blt_cmd_t/blt_vtx_t/
@@ -109,6 +110,12 @@ extern "C" uint32_t RasterBackend_MFGPU_TestTexCacheSlots(void);
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestCrtStripped(void);
+// [Phase 3 Stage A / Task 2] g_frame_no as-is — a whole-process monotonic
+// counter TestReinit never resets. See raster_backend_mfgpu.cpp's hook comment.
+extern "C" int RasterBackend_MFGPU_TestFrameNo(void);
+// [Phase 3 Stage A / Task 2] Force GMLOADER_MFGPU_TRACE's cached getenv()
+// reads to re-resolve. See raster_backend_mfgpu.cpp's hook comment.
+extern "C" void RasterBackend_MFGPU_TestTraceReset(void);
 
 extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
 
@@ -2445,6 +2452,142 @@ static int case_strip_crt_mask(void) {
     return 1;
 }
 
+// ── [Phase 3 Stage A] GMLOADER_MFGPU_TRACE draw-stream capture (Task 2) ──────
+// Local plumbing named to match the task brief's helper names, built from
+// this file's existing reinit/draw/end-frame idiom (case_cache_hit /
+// mf_test_drive_one_frame): TestReinit + SetDefaultSurface for a clean state,
+// backend_mfgpu.draw() for one textured sprite-quad, backend_mfgpu.present()
+// to close the frame (production never calls frame_end() directly, see
+// mf_present's comment).
+static uint8_t  s_mftrace_rgba[BW*BH*4];
+static RSurface s_mftrace_surf = { s_mftrace_rgba, BW, BH };
+
+static void rbt_reinit_mfgpu(void) {
+    RasterBackend_MFGPU_SetDefaultSurface(s_mftrace_rgba);
+    RasterBackend_MFGPU_TestReinit(0);
+}
+
+// One textured sprite-quad (2 tris / 6 verts). A 1x1 opaque texel covering the
+// full [0,1]x[0,1] UV trips mf_draw's near-full-page fallback (cropped rect >=
+// 90% of the page), so this is exactly ONE mf_emit_group call with nt=2 ->
+// one MFTRACE G line, 6 MFTRACE V lines.
+static void rbt_draw_textured_quad(float x, float y, float w, float h) {
+    static const uint8_t px[4] = { 200, 100, 50, 255 };
+    RTexture t = { px, 1, 1, 1, 1, /*RTEX_RGBA8888*/0, 1 };
+    BVtx v[6] = {
+        { x,   y,   0,0, 1,1,1,1 }, { x+w, y,   1,0, 1,1,1,1 }, { x+w, y+h, 1,1, 1,1,1,1 },
+        { x,   y,   0,0, 1,1,1,1 }, { x+w, y+h, 1,1, 1,1,1,1 }, { x,   y+h, 0,1, 1,1,1,1 },
+    };
+    backend_mfgpu.clear(&s_mftrace_surf, 0, 0, 0, 255);
+    backend_mfgpu.draw(&s_mftrace_surf, v, 2, &t, RB_NONE, 0.f, next_key());
+}
+
+static void rbt_end_frame(void) {
+    backend_mfgpu.present(&s_mftrace_surf);   // closes the frame; mirrors production
+}
+
+// GMLOADER_MFGPU_TRACE: emitted groups within the frame window are dumped as
+// parseable G/V records of the exact wire data (blt_vtx_t ints, resolved blend),
+// and the file is untouched outside the window or when the env is unset.
+//
+// mf_trace_on()/mf_trace_in_window() cache their getenv() reads in
+// process-lifetime statics (the same zero-cost idiom as mf_stat_on()), so
+// without help this case would only work as the very first thing to call
+// backend_mfgpu.draw() in the whole binary. RasterBackend_MFGPU_TestTraceReset()
+// (host-test-only, mirrors TestReinit's "force a clean state" contract) clears
+// those cached values so mf_trace_on()/mf_trace_in_window() re-resolve the
+// environment fresh here, regardless of what already ran earlier in main() —
+// so this case's position in main() is NOT load-bearing. It also reads the
+// frame number the emitter is ALREADY at via TestFrameNo() instead of assuming
+// 0, so the window math stays correct regardless of position too.
+static int case_mfgpu_trace_capture(void) {
+    const char *path = "/tmp/rbt_mftrace.txt";
+    unlink(path);
+    RasterBackend_MFGPU_TestTraceReset();
+    rbt_reinit_mfgpu();
+    // mf_frame_begin() increments g_frame_no BEFORE use, so the first frame this
+    // case drives is (current + 1), not the current value.
+    long base = (long)RasterBackend_MFGPU_TestFrameNo() + 1;
+    char startbuf[32];
+    snprintf(startbuf, sizeof startbuf, "%ld", base);
+    setenv("GMLOADER_MFGPU_TRACE", path, 1);
+    setenv("GMLOADER_MFGPU_TRACE_START", startbuf, 1);
+    setenv("GMLOADER_MFGPU_TRACE_FRAMES", "2", 1);
+
+    rbt_draw_textured_quad(10, 10, 32, 16);
+    rbt_end_frame();                       // frame base   -> in window
+    rbt_draw_textured_quad(10, 10, 32, 16);
+    rbt_end_frame();                       // frame base+1 -> in window
+    rbt_draw_textured_quad(10, 10, 32, 16);
+    rbt_end_frame();                       // frame base+2 -> OUT of window
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        printf("  FAIL mfgpu-trace  trace file does not exist\n");
+        unsetenv("GMLOADER_MFGPU_TRACE");
+        unsetenv("GMLOADER_MFGPU_TRACE_START");
+        unsetenv("GMLOADER_MFGPU_TRACE_FRAMES");
+        return 0;
+    }
+    int g_lines = 0, v_lines = 0, bad = 0; char ln[256];
+    long frame_max = -1;
+    while (fgets(ln, sizeof ln, f)) {
+        if (!strncmp(ln, "MFTRACE G ", 10)) {
+            g_lines++;
+            long fr;
+            if (sscanf(ln, "MFTRACE G f=%ld", &fr) != 1) {
+                printf("  FAIL mfgpu-trace  G line does not parse: %s", ln);
+                bad++;
+                continue;
+            }
+            if (fr > frame_max) frame_max = fr;
+            if (!strstr(ln, " blend=") || !strstr(ln, " nt=") || !strstr(ln, " off=")) {
+                printf("  FAIL mfgpu-trace  G line missing a header field: %s", ln);
+                bad++;
+            }
+        } else if (!strncmp(ln, "MFTRACE V ", 10)) {
+            int x, y, u, v; unsigned rgba;
+            if (sscanf(ln, "MFTRACE V %d %d %d %d %x", &x, &y, &u, &v, &rgba) != 5) {
+                printf("  FAIL mfgpu-trace  V line does not parse as ints: %s", ln);
+                bad++;
+                continue;
+            }
+            v_lines++;
+        } else {
+            printf("  FAIL mfgpu-trace  stray line: %s", ln);
+            bad++;
+        }
+    }
+    fclose(f);
+    unsetenv("GMLOADER_MFGPU_TRACE");
+    unsetenv("GMLOADER_MFGPU_TRACE_START");
+    unsetenv("GMLOADER_MFGPU_TRACE_FRAMES");
+
+    // Exactly 2 groups (the two in-window frames), each a 2-tri quad -> 6 V lines.
+    if (g_lines != 2) {
+        printf("  FAIL mfgpu-trace  expected 2 G records (one per in-window frame), got %d\n",
+               g_lines);
+        return 0;
+    }
+    if (v_lines != 12) {
+        printf("  FAIL mfgpu-trace  expected 12 V lines (2 groups x 2 tris x 3), got %d\n",
+               v_lines);
+        return 0;
+    }
+    if (frame_max > base + 1) {
+        printf("  FAIL mfgpu-trace  frame %ld captured outside the window [%ld,%ld)\n",
+               frame_max, base, base + 2);
+        return 0;
+    }
+    if (bad != 0) {
+        printf("  FAIL mfgpu-trace  %d malformed/stray line(s)\n", bad);
+        return 0;
+    }
+    printf("  OK   mfgpu-trace  2 G / 12 V records captured, window [%ld,%ld) respected\n",
+           base, base + 2);
+    return 1;
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -2521,5 +2664,11 @@ int main(void){
     else printf("raster_backend mfgpu-strip-crt OK\n");
     if (!case_strip_crt_mask()) { printf("FAIL mfgpu-strip-mask\n"); ok = 0; }
     else printf("raster_backend mfgpu-strip-mask OK\n");
+    // Deliberately registered LAST, after every other case has already called
+    // backend_mfgpu.draw() many times over: proves RasterBackend_MFGPU_TestTraceReset()
+    // actually makes this case position-independent rather than merely untested at
+    // a later position.
+    if (!case_mfgpu_trace_capture()) { printf("FAIL mfgpu-trace\n"); ok = 0; }
+    else printf("raster_backend mfgpu-trace OK\n");
     return ok ? 0 : 1;
 }
