@@ -39,6 +39,23 @@ const uint32_t kStagingCapBytes =
 const size_t kTargetFillFrames = NA_SAMPLE_RATE / 10;
 const size_t kMaxFramesPerPass = 4096;
 
+// Backlog below which the pump pads a short pass with silence even though a
+// track is playing. Above it the ring covers the producer's jitter; below it
+// the FPGA FIFO is close enough to running dry that a held-DC artifact is the
+// worse of the two, so silence wins.
+//
+// 25 ms of the 100 ms target: it absorbs a ~75 ms producer stall without a
+// single spliced sample, and the resulting occupancy dip is what gm_audio's
+// slew loop is FOR -- it reads ring occupancy as its rate signal and answers
+// with at most +/-0.21% of pitch, which is inaudible where a gap is not.
+const size_t kStarveFloorFrames = NA_SAMPLE_RATE / 40;
+
+// Smallest staging allowance handed to a blocking writer, whatever buffer it
+// asked for: a caller that opened a tiny AudioTrack still needs enough slack
+// to mix its next chunk without the pump going dry behind it.
+const uint32_t kMinHighWaterBytes =
+    (uint32_t)(NA_SAMPLE_RATE / 50) * NA_BYTES_PER_FRAME;
+
 int16_t g_mixbuf[kMaxFramesPerPass * NA_CHANNELS];
 int16_t g_tmpbuf[kMaxFramesPerPass * NA_CHANNELS];
 // Scratch for pull tracks, in the TRACK's format. Sized for the worst case
@@ -63,6 +80,12 @@ struct Track {
 Track     g_tracks[MISTER_AUDIO_MAX_TRACKS];
 bool      g_active = false;
 uint64_t  g_dropped = 0;
+uint64_t  g_starved = 0;
+
+// Diagnostic escape hatch: restores the unconditional silence pad so the two
+// behaviours can be compared on one device build. Read once at Init -- the
+// pump reads it every pass and getenv is not something to put on that path.
+bool      g_always_pad = false;
 
 // Guards the track table against the pump's mix pass. Non-recursive, never
 // nested -- the same role as Solarus's audio_mutex.
@@ -141,9 +164,30 @@ void *pump_main(void *) {
     // consumption toward kTargetFillFrames of occupancy -- so neither side has
     // to assume the other's rate. Sleep only when there is nothing to do.
     const struct timespec idle = { 0, 1000 * 1000 };   // 1 ms
+    // Starvation report. The FPGA cannot raise this: gm_audio's underflow
+    // counter stays at zero whenever the host pads, because a padded ring
+    // never actually runs dry. Silent while the number is zero.
+    uint64_t last_starved = 0;
+    struct timespec last_report = { 0, 0 };
+    clock_gettime(CLOCK_MONOTONIC, &last_report);
+
     while (g_pump_running.load(std::memory_order_acquire)) {
-        if (MisterAudio_PumpOnce() == 0)
-            nanosleep(&idle, nullptr);
+        if (MisterAudio_PumpOnce() != 0) continue;
+        nanosleep(&idle, nullptr);
+
+        const uint64_t now_starved = g_starved;
+        if (now_starved == last_starved) continue;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const long elapsed_s = now.tv_sec - last_report.tv_sec;
+        if (elapsed_s < 5) continue;
+        fprintf(stderr, "MisterAudio: starved %llu frames (%.1f ms/s) over %lds\n",
+                (unsigned long long)(now_starved - last_starved),
+                (double)(now_starved - last_starved) * 1000.0 /
+                    ((double)NA_SAMPLE_RATE * (double)elapsed_s),
+                elapsed_s);
+        last_starved = now_starved;
+        last_report = now;
     }
     return nullptr;
 }
@@ -154,6 +198,13 @@ bool MisterAudio_Init(void) {
     if (g_active) return true;
     memset(g_tracks, 0, sizeof(g_tracks));
     g_dropped = 0;
+    g_starved = 0;
+    {
+        const char *v = getenv("GMLOADER_AUDIO_SILENCE_PAD");
+        g_always_pad = (v && v[0] == '1');
+        if (g_always_pad)
+            fprintf(stderr, "MisterAudio: silence padding forced on (A/B)\n");
+    }
     if (!NativeAudioWriter_Init()) {
         fprintf(stderr,
             "MisterAudio: /dev/mem unavailable, falling back to SDL devices\n");
@@ -301,6 +352,8 @@ void MisterAudio_Pause(MisterAudioTrack t, int pause_on) {
 
 uint64_t MisterAudio_DroppedFrames(void) { return g_dropped; }
 
+uint64_t MisterAudio_StarvedFrames(void) { return g_starved; }
+
 size_t MisterAudio_PumpOnce(void) {
     if (!g_active) return 0;
 
@@ -318,14 +371,15 @@ size_t MisterAudio_PumpOnce(void) {
 
     pthread_mutex_lock(&g_lock);
 
-    // Silence is the floor, not the absence of a submit: the FPGA FIFO holds
-    // its last sample when starved, so a dry ring parks the DAC at a DC level.
     memset(g_mixbuf, 0, (size_t)want_bytes);
 
     int mixed = 0;
+    int have_bytes = 0;         // real audio in the mix, in bytes
+    bool any_playing = false;
     for (int i = 0; i < MISTER_AUDIO_MAX_TRACKS; ++i) {
         Track *tr = &g_tracks[i];
         if (!tr->open || tr->paused || !tr->conv) continue;
+        any_playing = true;
 
         if (tr->pull && SDL_AudioStreamAvailable(tr->conv) < want_bytes)
             fill_pull_track(tr, want_bytes);
@@ -334,9 +388,9 @@ size_t MisterAudio_PumpOnce(void) {
                                      mixed == 0 ? g_mixbuf : g_tmpbuf,
                                      want_bytes);
         if (got <= 0) {
-            // A track with nothing available contributes silence, exactly as
-            // an underrunning SDL device would. g_mixbuf was zeroed at the top
-            // of the pass, so there is nothing to do here.
+            // Nothing available from this track this pass. It contributes
+            // silence to the mix; whether that silence is SUBMITTED is decided
+            // below, from the ring backlog.
             continue;
         }
         if (mixed == 0) {
@@ -349,12 +403,55 @@ size_t MisterAudio_PumpOnce(void) {
             for (int s = 0; s < n; ++s)
                 g_mixbuf[s] = sat_add_s16(g_mixbuf[s], g_tmpbuf[s]);
         }
+        if (got > have_bytes) have_bytes = got;
         ++mixed;
     }
 
     pthread_mutex_unlock(&g_lock);
 
+    const size_t have = (size_t)have_bytes / NA_BYTES_PER_FRAME;
+
+    // Nothing playing: silence is the correct submit and always has been. The
+    // FPGA FIFO holds its last sample when starved, so a dry ring parks the
+    // DAC at a DC level rather than at zero.
+    if (!any_playing || g_always_pad) {
+        if (any_playing && have < want) g_starved += want - have;
+        return NativeAudioWriter_Submit(g_mixbuf, want);
+    }
+
+    // A track is playing and its producer is short this pass. While the ring
+    // still holds a real cushion, submit only what is real and let the backlog
+    // cover the rest -- that is what the cushion is for, and a short submit is
+    // invisible where spliced silence is not. Only once the backlog falls
+    // through the floor does padding become the lesser artifact.
+    if (have >= want) return NativeAudioWriter_Submit(g_mixbuf, want);
+    if (used >= kStarveFloorFrames)
+        return have ? NativeAudioWriter_Submit(g_mixbuf, have) : 0;
+
+    g_starved += want - have;
     return NativeAudioWriter_Submit(g_mixbuf, want);
+}
+
+uint32_t MisterAudio_StagingHighWater(MisterAudioTrack t) {
+    pthread_mutex_lock(&g_lock);
+    Track *tr = track_of(t);
+    uint32_t hw = 0;
+    if (tr) {
+        // The caller's buffer, in ITS frames, restated in sink frames.
+        long sink_frames = 0;
+        if (tr->spec.freq > 0)
+            sink_frames = ((long)tr->spec.samples * NA_SAMPLE_RATE) /
+                          tr->spec.freq;
+        long bytes = sink_frames * NA_BYTES_PER_FRAME;
+        if (bytes < (long)kMinHighWaterBytes) bytes = kMinHighWaterBytes;
+        // Never let the mark reach the staging cap, or a blocking write would
+        // wait on a level MisterAudio_Queue is already refusing to reach.
+        if (bytes > (long)(kStagingCapBytes / 2))
+            bytes = (long)(kStagingCapBytes / 2);
+        hw = (uint32_t)bytes;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return hw;
 }
 
 bool MisterAudio_ThreadActive(void) {

@@ -65,10 +65,24 @@ uint32_t MisterAudio_QueuedBytes(MisterAudioTrack t);
 void MisterAudio_Clear(MisterAudioTrack t);
 void MisterAudio_Pause(MisterAudioTrack t, int pause_on);
 
+/// Bytes of staging a blocking writer must be allowed to keep, mirroring the
+/// buffer android.media.AudioTrack was opened with. 0 for a closed handle.
+/// AudioTrack.write(WRITE_BLOCKING) blocks until the data is ACCEPTED into
+/// that buffer, not until it has played, so this -- not zero -- is what a
+/// blocking write waits down to.
+uint32_t MisterAudio_StagingHighWater(MisterAudioTrack t);
+
 /// Run one pump pass: top the ring back up to TARGET_FILL by mixing every
-/// active, unpaused track. Returns the frames submitted. Submits silence when
-/// nothing is playing -- the FPGA FIFO holds its last sample when starved, so
-/// an empty ring would park the DAC at a DC offset.
+/// active, unpaused track. Returns the frames submitted.
+///
+/// Submits silence only when nothing is playing, or when the ring backlog has
+/// fallen below the starvation floor -- the FPGA FIFO holds its last sample
+/// when starved, so an empty ring would park the DAC at a DC offset. While a
+/// track IS playing and the backlog is healthy, a momentarily dry producer
+/// gets a SHORT submit (possibly zero) instead: the ring is the latency
+/// cushion, and splicing silence into a live stream spends that cushion on an
+/// audible gap. GMLOADER_AUDIO_SILENCE_PAD=1 restores the old always-pad
+/// behaviour for A/B measurement on device.
 /// The pump thread calls this in a loop; tests call it directly.
 size_t MisterAudio_PumpOnce(void);
 
@@ -80,6 +94,12 @@ bool MisterAudio_ThreadActive(void);
 /// Frames refused by the staging cap since Init. Non-zero on device is a bug
 /// signal, not normal operation.
 uint64_t MisterAudio_DroppedFrames(void);
+
+/// Frames of silence the pump spliced into the ring while at least one track
+/// was open and unpaused, i.e. audible gaps in a live stream. This is the
+/// starvation signal the FPGA side cannot see: gm_audio's underflow counter
+/// stays at zero when the host pads, because the ring never actually runs dry.
+uint64_t MisterAudio_StarvedFrames(void);
 
 #ifdef __cplusplus
 }

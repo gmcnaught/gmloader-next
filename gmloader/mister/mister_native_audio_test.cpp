@@ -42,6 +42,19 @@ static void drain_ring(void) {
         *(volatile uint32_t *)(g_map + 0x30u);
 }
 
+// Stand in for a PARTIAL FPGA drain: consume exactly `frames` from the ring,
+// leaving the rest as backlog. drain_ring() cannot express "the ring still
+// holds a cushion", which is the whole subject of the starvation tests.
+static void consume_frames(size_t frames) {
+    volatile uint32_t *rd = (volatile uint32_t *)(g_map + RD_OFF);
+    *rd = (*rd + (uint32_t)(frames * NA_BYTES_PER_FRAME)) & 0xFFFFu;
+}
+
+// Top the ring up to the pump's target from empty.
+static void fill_ring_to_target(void) {
+    for (int i = 0; i < 8 && MisterAudio_PumpOnce() > 0; ++i) {}
+}
+
 int main(void) {
     make_region();
     CHECK(MisterAudio_Init());
@@ -201,6 +214,65 @@ int main(void) {
     MisterAudio_Close(tb);
     MisterAudio_Pause(t44, 1);
     MisterAudio_Pause(t, 1);
+
+    // --- Starvation hold-off ---------------------------------------------
+    // The ring is a 100 ms latency cushion. A producer that is briefly late
+    // must be covered BY that cushion; splicing silence into a playing
+    // track's stream instead spends the cushion on nothing and puts an
+    // audible gap in the music. It also hides the shortfall from gm_audio's
+    // slew loop, which reads ring occupancy as its only rate signal.
+    MisterAudio_Clear(t);
+    MisterAudio_Clear(t44);
+    drain_ring();
+
+    // Fill to target with every track paused -- that is the one case where
+    // silence IS the right submit, so the setup exercises it too.
+    fill_ring_to_target();
+    CHECK(MisterAudio_PumpOnce() == 0);
+
+    MisterAudio_Pause(t, 0);
+    const uint64_t starved0 = MisterAudio_StarvedFrames();
+
+    // 10 ms drained, ~90 ms of backlog left, staging dry: submit nothing.
+    consume_frames(NA_SAMPLE_RATE / 100);
+    CHECK(MisterAudio_PumpOnce() == 0);
+    CHECK(MisterAudio_StarvedFrames() == starved0);
+
+    // Room for 10 ms but only 64 frames staged: submit the 64 real frames,
+    // not 64 real frames followed by a silent tail.
+    static const size_t kShortFrames = 64;
+    static int16_t shortbuf[64 * 2];
+    for (size_t i = 0; i < kShortFrames * 2; ++i) shortbuf[i] = 500;
+    CHECK(MisterAudio_Queue(t, shortbuf, sizeof(shortbuf)) == 0);
+    CHECK(MisterAudio_PumpOnce() == kShortFrames);
+    CHECK(MisterAudio_StarvedFrames() == starved0);
+
+    // Cushion spent: below the floor the FPGA FIFO really would run dry and
+    // hold its last sample as DC, so silence is correct here -- and counted,
+    // because on device a non-zero rate is the starvation signal.
+    {
+        const size_t used_now = NativeAudioWriter_CapacityFrames() -
+                                NativeAudioWriter_FreeFrames();
+        CHECK(used_now > 100);
+        consume_frames(used_now - 100);
+        CHECK(MisterAudio_PumpOnce() > 0);
+        CHECK(MisterAudio_StarvedFrames() > starved0);
+    }
+    MisterAudio_Pause(t, 1);
+
+    // --- Blocking-write high-water ---------------------------------------
+    // android.media.AudioTrack.write(WRITE_BLOCKING) blocks until the data is
+    // ACCEPTED into the track's buffer, not until it has been played. The
+    // mark below is that buffer expressed in sink bytes; waiting for staging
+    // to reach ZERO instead would drain the producer's slack to nothing on
+    // every chunk and manufacture the gap the section above guards against.
+    // t: 1024 frames at the sink's own rate -> 1024 sink frames.
+    CHECK(MisterAudio_StagingHighWater(t) == 1024u * NA_BYTES_PER_FRAME);
+    // t44: 512 frames at 44.1 kHz -> 256 sink frames == 1024 bytes, under the
+    // 20 ms floor, so the floor is what a caller with a tiny buffer gets.
+    CHECK(MisterAudio_StagingHighWater(t44) ==
+          (uint32_t)(NA_SAMPLE_RATE / 50) * NA_BYTES_PER_FRAME);
+    CHECK(MisterAudio_StagingHighWater(0) == 0u);   // closed handle: no wait
 
     // Closing frees the slot so a later open succeeds.
     MisterAudio_Close(t);

@@ -1,9 +1,15 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1   /* cpu_set_t / CPU_SET / pthread_setaffinity_np */
+#endif
+
 #include <errno.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <semaphore.h>
+#include <unistd.h>
 
 #include "platform.h"
 #include "thunk_pthread.h"
@@ -191,7 +197,26 @@ ABI_ATTR int pthread_once_impl(volatile int *once_control, void (*init_routine)(
 // TODO: probably shouldn't assume default attributes
 ABI_ATTR int pthread_create_impl(pthread_t *thread, const void *unused, void *(*entry)(void *), void *arg)
 {
-    return pthread_create(thread, NULL, entry, arg);
+    int rc = pthread_create(thread, NULL, entry, arg);
+#ifdef __linux__
+    // Linux gives a new thread its creator's CPU affinity mask. On MiSTer the
+    // main thread is pinned to core 0 (mister_native_audio.cpp) so the fabric
+    // backend's C_DONE spin cannot starve the audio pump on core 1 -- but that
+    // pin is inherited by every thread the guest creates from the main thread,
+    // including OpenAL Soft's mixer thread, which then has to share one core
+    // with a loop that spins. Give guest threads the whole machine back; the
+    // pin exists to place OUR two threads, not to confine the runner's.
+    if (rc == 0) {
+        cpu_set_t all;
+        CPU_ZERO(&all);
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n < 1) n = 1;
+        if (n > CPU_SETSIZE) n = CPU_SETSIZE;
+        for (long i = 0; i < n; ++i) CPU_SET((int)i, &all);
+        pthread_setaffinity_np(*thread, sizeof(all), &all);
+    }
+#endif
+    return rc;
 }
 
 ABI_ATTR int pthread_mutexattr_init_impl(pthread_mutexattr_t **attr_ptr)
