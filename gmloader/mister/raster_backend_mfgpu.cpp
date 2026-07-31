@@ -898,10 +898,25 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     // the ANSWER to Phase 0's open question #1 (measured ~8.0 vs sim ~6-7 cyc/px), not a
     // discrepancy to suppress.
     double cov_exact = (double)mf_ctrl_rd_hi(MF_C_FLAGS);
+    // [W3 Stage C] `notice` attribution, published by the fabric at C_CMDCOUNT.hi:
+    //   [31:16] snap tail     (C_DONE written -> polling resumed), cycles >> 3
+    //   [15:0]  submit detect (polling -> new work seen),          cycles >> 3
+    // Both belong to the SAME frame whose C_DONE we just observed: the fabric writes
+    // this word immediately before C_DONE, and the pair it holds is the contiguous
+    // C_DONE(N-1) -> work-seen(N) window, i.e. the delay THIS frame's submit hit.
+    // Together they are the fabric's whole share of `notice`; the host's share is
+    // notice - (snap + detect), which is the host's own C_DONE observation latency.
+    // Each field saturates at 0xFFFF = 5.33 ms, so a pegged 65535*8 cyc reads as a
+    // wedge rather than a wrapped small number.
+    const uint32_t attrib = mf_ctrl_rd_hi(MF_C_CMDCOUNT);
+    const double snap_ms   = ((attrib >> 16) * 8.0) / (MF_CLK_SYS_MHZ * 1000.0);
+    const double detect_ms = ((attrib & 0xFFFFu) * 8.0) / (MF_CLK_SYS_MHZ * 1000.0);
     static unsigned n = 0, to = 0; static double sum = 0; static long it_sum = 0;
     static double fsum = 0, tsum = 0, xsum = 0, csum = 0, esum = 0;
+    static double nsum = 0.0, dsum = 0.0;   // [W3 Stage C] snap / detect, ms
     n++; to += timeout ? 1u : 0u; sum += us; it_sum += iters; fsum += frame_ms; tsum += tri_ms; xsum += texw_ms;
     esum += cov_exact;
+    nsum += snap_ms; dsum += detect_ms;
     // [Phase 1 B2] Still correctly paired with the batch being measured after the deferral.
     // mf_device_await -- and therefore this function -- now runs at the TOP of the next
     // mf_frame_begin, but strictly before blt_begin_frame and before any draw of that frame
@@ -930,12 +945,15 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
         else                   snprintf(ratio_buf, sizeof ratio_buf, "%.2f", d.est_ratio);
         fprintf(stderr, "MFSUBMIT n=%u wait_ms[avg=%.2f] fabric_ms[frame=%.2f tri=%.2f "
                 "texwait=%.2f dpath=%.2f ovhd=%.2f] cov_px=%.0f cov_px_est=%.0f "
-                "est_ratio=%s overdraw=%.2f cyc_px=%.1f cov_src=%s spin_avg=%ld to=%u\n",
+                "est_ratio=%s overdraw=%.2f cyc_px=%.1f cov_src=%s spin_avg=%ld to=%u "
+                "snap=%.3f detect=%.3f\n",
                 n, (sum/30.0)/1e3, f, t, x, dpath_ms, f-t,
                 e, c, ratio_buf, d.overdraw, d.cyc_px,
-                d.estimated ? "est" : "exact", it_sum/30, to);
+                d.estimated ? "est" : "exact", it_sum/30, to,
+                nsum/30.0, dsum/30.0);
         sum = 0; it_sum = 0; to = 0;
         fsum = 0; tsum = 0; xsum = 0; csum = 0; esum = 0;
+        nsum = 0; dsum = 0;   // [W3 Stage C]
     }
 }
 #endif // MISTER_NATIVE_VIDEO — device transport internals end here
