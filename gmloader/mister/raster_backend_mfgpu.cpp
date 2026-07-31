@@ -750,6 +750,17 @@ static void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2
 // unbatched path accumulate identically. cov_px is the A/B correctness gate for
 // batching, and it is only a gate if the two arms count the same triangles: this
 // runs PER GROUP in both, never per command, so merging cannot move it.
+//
+// [W3 batching] Counted at a different MOMENT in each arm, though: the batched
+// call site (mf_emit_group, after blt_push_tris) fires once this group's
+// vertices are queued but BEFORE the deferred blt_trilist that actually emits
+// them; the unbatched call site fires only after that blt_trilist already
+// succeeded. So a ring overflow can make the batched arm count triangles that
+// never reached the ring. Cannot reach a published figure: blt_trilist
+// failure sets g_e.overflow, and mf_frame_end returns before
+// mf_device_publish whenever g_e.overflow is set (both the device and
+// host-oracle halves) -- the frame that over-counted always drops,
+// unpublished.
 static void mf_cov_add_group(const BVtx *verts, int nt) {
     if (!mf_stat_on()) return;
     for (int i = 0; i < nt; i++) {
@@ -1900,6 +1911,34 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
     // blt_stage_surface (its decoupled sdram_off != src_off would render black on HW).
     // Tied to the upload (miss only) => each resident page is staged exactly once;
     // cache hits reuse the SDRAM-resident copy with no re-STAGE.
+    //
+    // [W3 batching] The one ring op in this file that is NOT a flush point --
+    // contrast the numbered FLUSH-POINT list at mf_batch_flush's definition --
+    // so it can reach the ring while a batch is still open. Safe because it
+    // fires ONLY on a cache miss, on src_off a blt_upload just allocated fresh:
+    // for the reorder to corrupt anything, that fresh offset would have to
+    // alias the open batch's own src_off, which needs the batch's page to have
+    // been freed first. Every free reachable from here is blocked while the
+    // page is touched this frame: evict_one_lru (above) refuses anything with
+    // .lru > g_lru_evict_floor; the cache-slot replace below is gated by the
+    // same pin test and drops the frame rather than steal a pinned slot; and
+    // the free on that drop path releases only the page just uploaded, never
+    // the batch's. (Two groups merged into one batch also share src_off by
+    // construction -- mf_batch_key_eq requires it -- so the second is a cache
+    // HIT and never reaches this call.) SAFETY DEPENDS ON g_lru_evict_floor'S
+    // PIN: relaxing the pin-for-two-frames invariant reopens this silently.
+    // Device-only in effect -- the refmodel no-ops OP_STAGE (case_stage_noop,
+    // above) -- so no host test exercises this hazard either way.
+    //
+    // Caveat this argument does NOT cover: RasterBackend_MFGPU_InvalidateTex
+    // (this file, below) frees a cache entry unconditionally on a GL texture
+    // re-upload/delete, with no g_lru_evict_floor check. If it ever fires on
+    // the OPEN BATCH's own texture before that batch flushes, the same
+    // reorder hazard applies with nothing here to stop it. Pre-existing
+    // (evict_one_lru's pin predates W3, and the same exposure already applies
+    // to any not-yet-consumed TRILIST, batched or not) and not introduced by
+    // batching, but not yet audited against this call either -- flagged, not
+    // fixed, here.
     if (blt_stage(&g_e, ref.off, (uint32_t)ref.stride * ref.h) != 0)
         fprintf(stderr, "backend_mfgpu: blt_stage overflow (off=%u) - draw may drop\n", ref.off);
     else
