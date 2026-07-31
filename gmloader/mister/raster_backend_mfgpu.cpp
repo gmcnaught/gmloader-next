@@ -904,19 +904,65 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     // Both belong to the SAME frame whose C_DONE we just observed: the fabric writes
     // this word immediately before C_DONE, and the pair it holds is the contiguous
     // C_DONE(N-1) -> work-seen(N) window, i.e. the delay THIS frame's submit hit.
-    // Together they are the fabric's whole share of `notice`; the host's share is
-    // notice - (snap + detect), which is the host's own C_DONE observation latency.
     // Each field saturates at 0xFFFF = 5.33 ms, so a pegged 65535*8 cyc reads as a
     // wedge rather than a wrapped small number.
+    //
+    // THE IDENTITY IS  notice = snap + detect - pub,  NOT
+    // "host share = notice - (snap + detect)". With mf_seam_stat.h's definitions
+    // (notice = (host+block) - frame; host starts at doorbell N; pub = barrier
+    // return -> doorbell N+1), t0 = the fabric's C_DONE(N-1) write, t2 = doorbell N,
+    // t3 = polling resumed, t4 = work seen, t5 = C_DONE(N), and eps = this host's own
+    // C_DONE observation latency (so it observes at t5 + eps and, symmetrically,
+    // t2 = t0 + eps + pub):
+    //     snap + detect = t4 - t0 = (t4 - t2) + eps + pub
+    //     notice        = (t5 + eps - t2) - (t5 - t4) = (t4 - t2) + eps
+    //  => notice - (snap + detect) = -pub
+    // eps cancels: the host spends it INSIDE the snap tail, so it is eaten off the
+    // front of snap and re-exposed exactly once. pub here measures 0.00-0.01 ms, so
+    // the old subtraction would have reported a host share of ~0 while eps is real
+    // and hidden inside snap. Full derivation in blitter_top.sv's counter block.
+    //
+    // FIRST THING TO DO WITH THESE NUMBERS: check notice ?= snap + detect - pub
+    // against the MFSEAM line, over a window where MFSEAM's blocked_frac is 1.0.
+    // Both sides now average over the same BLOCKED-frame population (see the
+    // accumulate below). If it does not hold within MF_SEAM_TOL_MS, the INSTRUMENT
+    // is wrong, not the fabric.
+    //
+    // snap is a PURE FABRIC interval (t3 - t0). It OVER-STATES the dead window's
+    // exposed contribution to notice by (eps + pub): the exposed part is
+    // snap - eps - pub, because for the first eps + pub of the tail the host is not
+    // waiting on the doorbell yet. Against the prior sweep's numbers (snap ~0.335,
+    // eps ~0.237, pub ~0.00) that would be ~0.098 ms -- derived from that sweep as
+    // an illustration, NOT measured by this counter.
+    //
+    // So the pair settles `detect` directly and the sum (snap - pub) = exposed tail
+    // + eps. It does NOT settle the split of that sum: one equation, two unknowns.
+    // Separating them needs a host timestamp on the fabric clock, which this does
+    // not provide. Do not quote either half as measured.
     const uint32_t attrib = mf_ctrl_rd_hi(MF_C_CMDCOUNT);
     const double snap_ms   = ((attrib >> 16) * 8.0) / (MF_CLK_SYS_MHZ * 1000.0);
     const double detect_ms = ((attrib & 0xFFFFu) * 8.0) / (MF_CLK_SYS_MHZ * 1000.0);
     static unsigned n = 0, to = 0; static double sum = 0; static long it_sum = 0;
     static double fsum = 0, tsum = 0, xsum = 0, csum = 0, esum = 0;
     static double nsum = 0.0, dsum = 0.0;   // [W3 Stage C] snap / detect, ms
+    static unsigned nblk = 0;               // [W3 Stage C] their denominator
     n++; to += timeout ? 1u : 0u; sum += us; it_sum += iters; fsum += frame_ms; tsum += tri_ms; xsum += texw_ms;
     esum += cov_exact;
-    nsum += snap_ms; dsum += detect_ms;
+    // [W3 Stage C] BLOCKED FRAMES ONLY, matching mf_seam_add's notice_sum filter
+    // (mf_seam_stat.h:76-81) for exactly the same reason. These means only mean
+    // anything read against `notice` via notice = snap + detect - pub, and that
+    // identity holds per blocked frame — on a host-late frame the fabric sits in
+    // S_POLL_SUBMIT for the host's ENTIRE overrun, so detect is milliseconds rather
+    // than microseconds and snap+detect-pub over-states notice by all of it.
+    // Sizing, so this does not read as pedantry: windows here run blocked 60%-100%,
+    // so at 60% twelve of thirty frames carry overrun, and ONE 5 ms overrun moves an
+    // unfiltered mean by 5/30 = 0.17 ms — comparable to the whole 0.565 ms signal.
+    // A single pegged frame is 5.33/30 = 0.18 ms on its own.
+    // Both nsum and dsum are gated, never just dsum: they are read together, so they
+    // must share a denominator. `blk` is printed so the denominator is visible — a
+    // snap/detect pair whose blk is far below n is averaging over a different
+    // population than MFSEAM's notice and must not be differenced against it.
+    if (g_seam_blocked) { nsum += snap_ms; dsum += detect_ms; nblk++; }
     // [Phase 1 B2] Still correctly paired with the batch being measured after the deferral.
     // mf_device_await -- and therefore this function -- now runs at the TOP of the next
     // mf_frame_begin, but strictly before blt_begin_frame and before any draw of that frame
@@ -930,6 +976,10 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     csum += g_cov_px_published;
     if (n % 30 == 0) {
         double f=fsum/30.0, t=tsum/30.0, x=xsum/30.0, c=csum/30.0, e=esum/30.0;
+        // snap/detect divide by the BLOCKED count, not 30. A window with no blocked
+        // frame reports 0.000/0.000 with blk=0, which is the honest answer: nothing
+        // in it measured the fabric's doorbell->done latency.
+        const double nb = nblk ? (double)nblk : 1.0;
         double dpath_ms = t - x;
         // Screen area comes from the fabric geometry macros, never a literal:
         // MISTER_WIDTH/HEIGHT arrive as -D flags, so a hardcoded 288x216 here
@@ -946,14 +996,14 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
         fprintf(stderr, "MFSUBMIT n=%u wait_ms[avg=%.2f] fabric_ms[frame=%.2f tri=%.2f "
                 "texwait=%.2f dpath=%.2f ovhd=%.2f] cov_px=%.0f cov_px_est=%.0f "
                 "est_ratio=%s overdraw=%.2f cyc_px=%.1f cov_src=%s spin_avg=%ld to=%u "
-                "snap=%.3f detect=%.3f\n",
+                "snap=%.3f detect=%.3f blk=%u\n",
                 n, (sum/30.0)/1e3, f, t, x, dpath_ms, f-t,
                 e, c, ratio_buf, d.overdraw, d.cyc_px,
                 d.estimated ? "est" : "exact", it_sum/30, to,
-                nsum/30.0, dsum/30.0);
+                nsum/nb, dsum/nb, nblk);
         sum = 0; it_sum = 0; to = 0;
         fsum = 0; tsum = 0; xsum = 0; csum = 0; esum = 0;
-        nsum = 0; dsum = 0;   // [W3 Stage C]
+        nsum = 0; dsum = 0; nblk = 0;   // [W3 Stage C]
     }
 }
 #endif // MISTER_NATIVE_VIDEO — device transport internals end here
