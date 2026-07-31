@@ -131,6 +131,7 @@ extern "C" uint32_t RasterBackend_MFGPU_TestClearsEmitted(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestFillCommandCount(void);
 extern "C" int      RasterBackend_MFGPU_TestFirstCommandIsFill(void);
 extern "C" int      RasterBackend_MFGPU_TestFirstFillColor(void);
+extern "C" int      RasterBackend_MFGPU_TestFillPrecedesTrilist(void);
 // [Ring-order regression] Force mf_fps_overlay_enabled()'s C_STATUS bit1 so a
 // host test can drive the FPS overlay path. See the hook's comment in
 // raster_backend_mfgpu.cpp.
@@ -2743,6 +2744,66 @@ static int case_deferred_clear_appsurf_target_not_swallowed(void) {
     return 1;
 }
 
+// [Ring-order regression, source-sample discharge] A different concern from
+// case_deferred_clear_appsurf_target_not_swallowed above (which pins the SLOT
+// MAPPING: an appsurf-target clear must not be silently swallowed). This one
+// pins ORDER: mf_emit_group's clear-discharge logic used to look only at
+// g_cur_target -- the draw's own DESTINATION -- so a clear(APPSURF) with no
+// appsurf-TARGETED draw in between, followed directly by a composite that
+// SAMPLES the app surface (BLT_F_SRC_SURFACE, raster_backend_mfgpu.cpp's
+// src_is_appsurf branch), left the fill pending past that draw. It would still
+// get flushed eventually (mf_pc_flush_all at frame end), but by then the
+// composite had already sampled the PRE-CLEAR surface: a stale-pixel read.
+// Sequence: clear(APPSURF) -> draw(WORK, samples APPSURF) -- deliberately no
+// draw targets APPSURF in between. Assert the fill was emitted at all AND that
+// it precedes the sampling draw in the ring, exactly the ordering the fabric
+// needs to avoid reading stale pixels.
+static int case_deferred_clear_discharged_by_source_sample(void) {
+    enum { PAGE_W = 512, PAGE_H = 256 };          // padded POT page (device)
+    const float UMAX = (float)BW / PAGE_W;
+    const float VMAX = (float)BH / PAGE_H;
+    const uint32_t APPSURF_FBO = 92, APPSURF_TEX = 93;
+
+    RasterBackend_MFGPU_TestReset();
+    setenv("GMLOADER_MFGPU_DEFER_CLEAR", "1", 1);
+    RasterBackend_MFGPU_TestEnvReset();
+
+    static uint8_t work_rgba[BW*BH*4];
+    RSurface s_appsurf = { nullptr, BW, BH, APPSURF_FBO };
+    RSurface s_work    = { work_rgba, BW, BH, 0 };
+    RasterBackend_MFGPU_SetDefaultSurface(work_rgba);
+    RasterBackend_MFGPU_SetAppSurface(APPSURF_FBO, APPSURF_TEX);
+
+    backend_mfgpu.clear(&s_appsurf, 0, 0, 255, 255);   // pending clear on APPSURF only
+
+    // NO draw targets APPSURF here -- go straight to the composite, which
+    // SAMPLES it (tex_key == APPSURF_TEX), exactly the device draw order this
+    // case exists to cover.
+    RTexture surfSrc = { nullptr, PAGE_W, PAGE_H, 1, 0, 0, 0 };   // padded page dims
+    BVtx comp[6] = {
+        {   0.f,    0.f, 0.f, VMAX, 1,1,1,1 }, { (float)BW,    0.f, UMAX, VMAX, 1,1,1,1 },
+        { (float)BW,(float)BH, UMAX, 0.f,  1,1,1,1 },
+        {   0.f,    0.f, 0.f, VMAX, 1,1,1,1 }, { (float)BW,(float)BH, UMAX, 0.f, 1,1,1,1 },
+        {   0.f,(float)BH, 0.f, 0.f,  1,1,1,1 },
+    };
+    backend_mfgpu.draw(&s_work, comp, 2, &surfSrc, RB_NONE, 0.f, APPSURF_TEX);
+    backend_mfgpu.present(&s_work);
+
+    RasterBackend_MFGPU_SetAppSurface(0, 0);   // don't leak state into later cases
+
+    uint32_t emitted  = RasterBackend_MFGPU_TestClearsEmitted();
+    int      precedes = RasterBackend_MFGPU_TestFillPrecedesTrilist();
+    if (emitted != 1 || precedes != 1) {
+        printf("  FAIL deferred-clear-source-sample  emitted=%u(want 1) fill_precedes_trilist=%d"
+               "(want 1) -- a pending APPSURF clear must be discharged before a draw that SAMPLES"
+               " it, not only one that targets it\n", emitted, precedes);
+        return 0;
+    }
+    printf("  OK   deferred-clear-source-sample  a clear on APPSURF is discharged before the "
+           "composite draw that samples it, even with no appsurf-targeted draw in between\n");
+    return 1;
+}
+
 // [Ring-order regression] mf_present() used to call mf_emit_fps_overlay_fills()
 // BEFORE mf_frame_end() -- the only place that flushed a clear no draw covered.
 // On a clear-then-no-draw frame with the FPS overlay ON, that queued the
@@ -3010,6 +3071,8 @@ int main(void){
     else printf("raster_backend mfgpu-defer-clear-off OK\n");
     if (!case_deferred_clear_appsurf_target_not_swallowed()) { printf("FAIL mfgpu-defer-clear-appsurf\n"); ok = 0; }
     else printf("raster_backend mfgpu-defer-clear-appsurf OK\n");
+    if (!case_deferred_clear_discharged_by_source_sample()) { printf("FAIL mfgpu-defer-clear-source-sample\n"); ok = 0; }
+    else printf("raster_backend mfgpu-defer-clear-source-sample OK\n");
     if (!case_deferred_clear_precedes_fps_overlay_when_no_draw()) { printf("FAIL mfgpu-defer-clear-vs-overlay-order\n"); ok = 0; }
     else printf("raster_backend mfgpu-defer-clear-vs-overlay-order OK\n");
     // Deliberately registered LAST, after every other case has already called

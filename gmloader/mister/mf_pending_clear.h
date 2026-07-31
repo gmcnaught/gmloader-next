@@ -24,6 +24,15 @@
 // Any condition not provably met emits the fill. The permitted failure is a
 // lost 0.632 ms, never a stale pixel.
 //
+// A pending clear on a target is discharged by EITHER of two draws: one that
+// TARGETS it (mf_emit_group's destination-side check, keyed on g_cur_target)
+// or one that SAMPLES it (the app-surface composite's BLT_F_SRC_SURFACE read,
+// discharged source-side before that same draw's blt_trilist) -- and, failing
+// both, by mf_pc_flush_all at frame end. A composite that reads a surface with
+// a clear still pending on it is exactly the stale-pixel case this module
+// exists to rule out, so the sampling side had to be covered too, not just the
+// targeting side.
+//
 // Pure by construction: no I/O, no globals, no device headers, no engine types,
 // so the whole decision is unit-testable on the host.
 #include <stdint.h>

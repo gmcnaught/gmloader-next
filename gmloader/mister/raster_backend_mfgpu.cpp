@@ -1848,6 +1848,35 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
     }
     g_last_trilist_blend = blend_mode;   // host-test hook (opaque-ALPHA -> COPY promotion)
 
+    // [Phase 4 Stage B follow-up] A pending APPSURF clear must be discharged not
+    // only by a draw that TARGETS the app surface (the destination-side logic
+    // just below, keyed on g_cur_target) but also by a draw that SAMPLES it --
+    // extra_flags carrying BLT_F_SRC_SURFACE, i.e. the app-surface composite at
+    // this file's src_is_appsurf call site. Without this, clear(APPSURF) -> (no
+    // draw targeting APPSURF) -> composite reading APPSURF leaves the fill
+    // pending past the sampling draw: it still reaches the ring eventually (
+    // mf_pc_flush_all at frame end), but by then the composite already sampled
+    // the PRE-CLEAR surface -- a stale-pixel read mf_pending_clear.h's contract
+    // forbids. Discharge it here, correctly targeted, before this draw's own
+    // blt_trilist below, so the fill lands in the ring ahead of the read.
+    if (extra_flags & BLT_F_SRC_SURFACE) {
+        const int as_slot = mf_pc_slot_of(MF_TARGET_APPSURF);
+        if (mf_pc_pending(&g_pc, as_slot)) {
+            const int saved_target = g_cur_target;
+            if (saved_target != MF_TARGET_APPSURF) {
+                blt_set_target(&g_e, MF_TARGET_APPSURF);
+                g_cur_target = MF_TARGET_APPSURF;
+            }
+            int fw, fh; uint16_t fc;
+            if (mf_pc_take(&g_pc, as_slot, &fw, &fh, &fc))
+                blt_fill(&g_e, 0, 0, fw, fh, fc);
+            if (g_cur_target != saved_target) {
+                blt_set_target(&g_e, saved_target);
+                g_cur_target = saved_target;
+            }
+        }
+    }
+
     // [Phase 4 Stage B] Discharge or drop the deferred full-screen clear. This
     // is the only point where BOTH facts are known: that the draw survived every
     // silent-discard path in mf_draw, and what fabric blend it actually resolved
@@ -2823,6 +2852,24 @@ extern "C" int RasterBackend_MFGPU_TestFirstFillColor(void) {
         if (c.opcode == BLT_OP_FILL) return (int)c.color;
     }
     return -1;
+}
+// [Ring-order regression, source-sample discharge] True (1) iff the ring's
+// first BLT_OP_FILL appears BEFORE its first BLT_OP_TRILIST; 0 if either is
+// absent or the fill comes after. TestFirstCommandIsFill only answers "is
+// index 0 a fill", which a SET_TARGET (or nothing at all, if the fill never
+// got emitted ahead of the draw) already defeats -- this instead pins the fill
+// against the specific draw it must precede, regardless of what else sits
+// between them in the ring.
+extern "C" int RasterBackend_MFGPU_TestFillPrecedesTrilist(void) {
+    int fill_idx = -1, tri_idx = -1;
+    for (int i = 0; i < g_e.cmd_count; i++) {
+        blt_cmd_t c;
+        blt_unpack_cmd(g_e.ring + (size_t)i * BLT_CMD_BYTES, &c);
+        if (fill_idx < 0 && c.opcode == BLT_OP_FILL)    fill_idx = i;
+        if (tri_idx  < 0 && c.opcode == BLT_OP_TRILIST) tri_idx  = i;
+    }
+    if (fill_idx < 0 || tri_idx < 0) return 0;
+    return fill_idx < tri_idx;
 }
 // [Phase 4 Stage B] host-test-only hook: force GMLOADER_MFGPU_DEFER_CLEAR's
 // cached getenv() read to re-resolve. Same rationale + idiom as
