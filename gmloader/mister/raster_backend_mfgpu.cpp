@@ -2416,6 +2416,25 @@ static void mf_emit_fps_overlay_fills(void) {
 
 static void mf_frame_end(void);   // forward decl: defined below, called from mf_present
 
+// [Phase 4 Stage B] Discharge every still-pending deferred clear, re-selecting
+// each fill's own target via mf_pc_target_of() before emitting (g_cur_target
+// may have moved since the clear was recorded). Idempotent: mf_pc_take
+// returns 0 for an already-taken/empty slot, so a second call in the same
+// frame is a no-op. Extracted so mf_present() can run it BEFORE the FPS
+// overlay -- see the ordering note at mf_present() below -- while
+// mf_frame_end() keeps its own call as a backstop for callers that reach
+// frame-end without going through mf_present().
+static void mf_pc_flush_all(void) {
+    for (int slot = 0; slot < MF_PC_TARGETS; slot++) {
+        int fw, fh; uint16_t fc;
+        if (mf_pc_take(&g_pc, slot, &fw, &fh, &fc)) {
+            int t = mf_pc_target_of(slot);
+            if (t != g_cur_target) { blt_set_target(&g_e, t); g_cur_target = t; }
+            blt_fill(&g_e, 0, 0, fw, fh, fc);
+        }
+    }
+}
+
 // Task 7: production entry point for present() — the frame loop calls
 // clear()/draw() then present() (never frame_end() directly). Execute the
 // accumulated ring into g_fb565 (mf_frame_end already does the blt_execute)
@@ -2424,6 +2443,17 @@ static void mf_frame_end(void);   // forward decl: defined below, called from mf
 static void mf_present(const RSurface *) {
     mf_fps_tick();   // engine present cadence == the FPS the display shows
     if (g_frame_active) {
+        // [Phase 4 Stage B] Discharge any pending deferred clear BEFORE the FPS
+        // overlay draws. A frame that clears and issues no draw never reaches
+        // mf_emit_group (the only other place a pending clear is resolved), so
+        // without this the overlay's fills would land in the ring first and the
+        // clear -- flushed later by mf_frame_end -- would paint over the readout.
+        // Guarded by g_frame_dropped only, matching mf_frame_end's own guard:
+        // a dropped frame's ring must not grow, but g_e.overflow does not block
+        // this (mf_frame_end already runs the equivalent flush regardless of
+        // overflow, since overflow is only checked after blt_end_frame).
+        if (!g_frame_dropped)
+            mf_pc_flush_all();
         // [OSD-fps] Emit last, over everything this frame drew. Skipped when the
         // ring was never rebuilt (g_frame_dropped) or already overflowed — those
         // frames are dropped by mf_frame_end and must not grow the batch.
@@ -2440,16 +2470,10 @@ static void mf_frame_end(void) {
     // and the doorbell would then ack a batch that was never rebuilt, so return before both.
     if (g_frame_dropped) return;
     // [Phase 4 Stage B] A frame that cleared and never drew still has to clear.
-    // Re-select the target explicitly: g_cur_target may have moved since the
-    // clear was recorded, and the fill must land on the buffer it was meant for.
-    for (int slot = 0; slot < MF_PC_TARGETS; slot++) {
-        int fw, fh; uint16_t fc;
-        if (mf_pc_take(&g_pc, slot, &fw, &fh, &fc)) {
-            int t = mf_pc_target_of(slot);
-            if (t != g_cur_target) { blt_set_target(&g_e, t); g_cur_target = t; }
-            blt_fill(&g_e, 0, 0, fw, fh, fc);
-        }
-    }
+    // Backstop for callers that reach frame-end without going through
+    // mf_present() (which already ran this above): idempotent, so if
+    // mf_present() already discharged the pending fill this is a no-op.
+    mf_pc_flush_all();
     // [Task 9 bring-up diagnostic] Log BEFORE blt_end_frame touches anything --
     // g_lru_frame_floor (set in mf_frame_begin) still delimits exactly this
     // frame's pinned working set at this point.
@@ -2748,6 +2772,17 @@ extern "C" void RasterBackend_MFGPU_TestSetCtrlSrcsel(uint32_t v) {
     (void)v;
 #endif
 }
+// [OSD-fps] Force mf_fps_overlay_enabled()'s C_STATUS bit1 so a host test can
+// exercise the FPS overlay path without a device: MF_C_STATUS is never
+// written elsewhere in this file (it is an OSD-mirror register the firmware
+// sets, only ever read here), so this cannot be clobbered by frame logic.
+extern "C" void RasterBackend_MFGPU_TestSetFpsOverlay(int on) {
+#ifndef MISTER_NATIVE_VIDEO
+    g_ctrl_shadow[MF_C_STATUS] = on ? 0x2u : 0u;
+#else
+    (void)on;
+#endif
+}
 // Blend mode the last TRILIST went out with, so a test can pin the opaque-ALPHA -> COPY
 // promotion (and, just as importantly, that a NON-opaque draw is left alone).
 extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void) { return g_last_trilist_blend; }
@@ -2775,6 +2810,19 @@ extern "C" int RasterBackend_MFGPU_TestFirstCommandIsFill(void) {
     blt_cmd_t c;
     blt_unpack_cmd(g_e.ring, &c);
     return c.opcode == BLT_OP_FILL;
+}
+// [Ring-order regression] The RGB565 color of the FIRST BLT_OP_FILL anywhere
+// in the ring (not necessarily the first command overall -- a SET_TARGET may
+// precede it), or -1 if the ring has no fill at all. Distinguishes WHICH fill
+// went out first (the deferred clear vs. the FPS overlay's background panel)
+// where TestFirstCommandIsFill only pins that a fill happened to be first.
+extern "C" int RasterBackend_MFGPU_TestFirstFillColor(void) {
+    for (int i = 0; i < g_e.cmd_count; i++) {
+        blt_cmd_t c;
+        blt_unpack_cmd(g_e.ring + (size_t)i * BLT_CMD_BYTES, &c);
+        if (c.opcode == BLT_OP_FILL) return (int)c.color;
+    }
+    return -1;
 }
 // [Phase 4 Stage B] host-test-only hook: force GMLOADER_MFGPU_DEFER_CLEAR's
 // cached getenv() read to re-resolve. Same rationale + idiom as

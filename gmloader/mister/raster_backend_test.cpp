@@ -130,6 +130,11 @@ extern "C" uint32_t RasterBackend_MFGPU_TestClearsDropped(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestClearsEmitted(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestFillCommandCount(void);
 extern "C" int      RasterBackend_MFGPU_TestFirstCommandIsFill(void);
+extern "C" int      RasterBackend_MFGPU_TestFirstFillColor(void);
+// [Ring-order regression] Force mf_fps_overlay_enabled()'s C_STATUS bit1 so a
+// host test can drive the FPS overlay path. See the hook's comment in
+// raster_backend_mfgpu.cpp.
+extern "C" void     RasterBackend_MFGPU_TestSetFpsOverlay(int on);
 
 extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
 
@@ -2738,6 +2743,47 @@ static int case_deferred_clear_appsurf_target_not_swallowed(void) {
     return 1;
 }
 
+// [Ring-order regression] mf_present() used to call mf_emit_fps_overlay_fills()
+// BEFORE mf_frame_end() -- the only place that flushed a clear no draw covered.
+// On a clear-then-no-draw frame with the FPS overlay ON, that queued the
+// overlay's fills first and the deferred clear last, so the clear painted over
+// the FPS readout. The fix discharges the pending fill in mf_present() itself,
+// immediately before the overlay call. Distinguish the clear's fill from the
+// overlay's own fills (background 0x0000, digits 0x07E0) with a color neither
+// of them uses, and check which one lands FIRST in the ring -- not merely
+// whether a fill is first (TestFirstCommandIsFill already knows that; it does
+// not know WHICH fill).
+static int case_deferred_clear_precedes_fps_overlay_when_no_draw(void) {
+    RasterBackend_MFGPU_TestReset();
+    setenv("GMLOADER_MFGPU_DEFER_CLEAR", "1", 1);
+    RasterBackend_MFGPU_TestEnvReset();
+    RasterBackend_MFGPU_TestSetFpsOverlay(1);
+
+    RSurface d; mf_test_make_default_surface(&d);
+    backend_mfgpu.clear(&d, 0, 0, 255, 255);   // blue -> RGB565 0x001F, distinct from
+                                                // the overlay's black bg / green digits
+    backend_mfgpu.present(&d);                 // NO draw follows: only mf_frame_end's
+                                                // (or, with the fix, mf_present's) flush
+                                                // ever discharges this clear
+
+    RasterBackend_MFGPU_TestSetFpsOverlay(0);  // restore, so later cases are unaffected
+
+    const int BLUE_565 = 0x001F;
+    uint32_t emitted     = RasterBackend_MFGPU_TestClearsEmitted();
+    uint32_t fills        = RasterBackend_MFGPU_TestFillCommandCount();
+    int      first_color  = RasterBackend_MFGPU_TestFirstFillColor();
+    if (emitted != 1 || fills <= 1 || first_color != BLUE_565) {
+        printf("  FAIL deferred-clear-precedes-overlay  emitted=%u(want 1) fills=%u(want >1) "
+               "first_fill_color=0x%04x(want 0x%04x) -- the clear must be the FIRST fill in "
+               "the ring, ahead of the FPS overlay's background/digit fills\n",
+               emitted, fills, (unsigned)first_color, (unsigned)BLUE_565);
+        return 0;
+    }
+    printf("  OK   deferred-clear-precedes-overlay  the deferred clear is discharged before "
+           "the FPS overlay fills, exactly where an undeferred clear would have sat\n");
+    return 1;
+}
+
 // ── [Phase 3 Stage A] GMLOADER_MFGPU_TRACE draw-stream capture (Task 2) ──────
 // Local plumbing named to match the task brief's helper names, built from
 // this file's existing reinit/draw/end-frame idiom (case_cache_hit /
@@ -2964,6 +3010,8 @@ int main(void){
     else printf("raster_backend mfgpu-defer-clear-off OK\n");
     if (!case_deferred_clear_appsurf_target_not_swallowed()) { printf("FAIL mfgpu-defer-clear-appsurf\n"); ok = 0; }
     else printf("raster_backend mfgpu-defer-clear-appsurf OK\n");
+    if (!case_deferred_clear_precedes_fps_overlay_when_no_draw()) { printf("FAIL mfgpu-defer-clear-vs-overlay-order\n"); ok = 0; }
+    else printf("raster_backend mfgpu-defer-clear-vs-overlay-order OK\n");
     // Deliberately registered LAST, after every other case has already called
     // backend_mfgpu.draw() many times over: proves RasterBackend_MFGPU_TestTraceReset()
     // actually makes this case position-independent rather than merely untested at
