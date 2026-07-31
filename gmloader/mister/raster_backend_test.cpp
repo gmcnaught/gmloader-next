@@ -143,6 +143,14 @@ extern "C" int      RasterBackend_MFGPU_TestFillPrecedesTrilist(void);
 // raster_backend_mfgpu.cpp.
 extern "C" void     RasterBackend_MFGPU_TestSetFpsOverlay(int on);
 
+// [W3 batching] consecutive same-state quad merging: the emitted-vs-merged
+// counts for the last closed frame, the run total of merges, and an independent
+// count of BLT_OP_TRILIST commands actually in the ring.
+extern "C" uint32_t RasterBackend_MFGPU_TestTrilistCmds(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestTrilistGroups(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestBatchMerged(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestTrilistCommandCount(void);
+
 extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
 
 // Task 1: tiny monotonic key so each battery case gets a distinct tex_key —
@@ -2851,6 +2859,347 @@ static int case_deferred_clear_precedes_fps_overlay_when_no_draw(void) {
     return 1;
 }
 
+// ── [W3 batching] consecutive same-state quad merging ────────────────────────
+// The lever merges consecutive same-state sprite quads into one BLT_OP_TRILIST.
+// Nothing about WHAT is rendered may change -- same triangles, same order, same
+// state, fewer command headers -- so these cases pin both halves: that the merge
+// happens, and that the framebuffer is byte-identical to the unmerged arm.
+
+// A second opaque texture, visibly different from mf_test_opaque_texture's grey,
+// so a case can force a state change mid-run and see it in the pixels too.
+static const RTexture *mf_test_opaque_texture_b(void) {
+    static uint8_t tex[4*4*4];
+    for (int i = 0; i < 4*4; i++) {
+        tex[i*4+0] = 20; tex[i*4+1] = 220; tex[i*4+2] = 60; tex[i*4+3] = 255;
+    }
+    static RTexture t = { tex, 4, 4, 1, 1, /*RTEX_RGBA8888*/0, 1 };
+    return &t;
+}
+
+// A 2-tri sprite quad at (x,y), w x h, sampling the whole page. Distinct
+// positions matter: mf_draw's duplicate-draw elision would swallow a verbatim
+// repeat, and this suite is about merging DIFFERENT quads, not eliding same ones.
+static void mf_test_make_quad_at(BVtx *q, float x, float y, float w, float h, float a) {
+    q[0] = BVtx{ x,     y,     0,0, 1,1,1,a };
+    q[1] = BVtx{ x + w, y,     1,0, 1,1,1,a };
+    q[2] = BVtx{ x + w, y + h, 1,1, 1,1,1,a };
+    q[3] = BVtx{ x,     y,     0,0, 1,1,1,a };
+    q[4] = BVtx{ x + w, y + h, 1,1, 1,1,1,a };
+    q[5] = BVtx{ x,     y + h, 0,1, 1,1,1,a };
+}
+
+static void mf_test_set_batch(const char *v) {
+    setenv("GMLOADER_MFGPU_BATCH_TRILIST", v, 1);
+    RasterBackend_MFGPU_TestEnvReset();
+}
+
+// Four consecutive quads sharing every header field must collapse to ONE
+// command. No clear() here on purpose: a pending deferred clear deliberately
+// forces the first following group down the unbatched path (see
+// mf_batch_clear_relevant), which is a different case, tested below.
+static int case_batch_merges_consecutive_same_state_quads(void) {
+    RasterBackend_MFGPU_TestReset();
+    mf_test_set_batch("1");
+
+    RSurface d; mf_test_make_default_surface(&d);
+    BVtx q[6];
+    for (int i = 0; i < 4; i++) {
+        mf_test_make_quad_at(q, 10.f + 20 * i, 10.f, 16.f, 16.f, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_NONE, 0.0f, 0x2001);
+    }
+    backend_mfgpu.present(&d);
+
+    uint32_t groups = RasterBackend_MFGPU_TestTrilistGroups();
+    uint32_t cmds   = RasterBackend_MFGPU_TestTrilistCmds();
+    uint32_t ring   = RasterBackend_MFGPU_TestTrilistCommandCount();
+    if (groups != 4 || cmds != 1 || ring != 1) {
+        printf("  FAIL batch-merge  groups=%u(want 4) cmds=%u(want 1) ring_trilists=%u(want 1)\n",
+               groups, cmds, ring);
+        return 0;
+    }
+    printf("  OK   batch-merge  4 same-state quads collapsed to 1 TRILIST (8 tris)\n");
+    return 1;
+}
+
+// The knob's off arm must be the pre-batching emitter exactly: one command per
+// group, and not a single merge recorded.
+static int case_batch_off_is_one_command_per_group(void) {
+    RasterBackend_MFGPU_TestReset();
+    mf_test_set_batch("0");
+
+    RSurface d; mf_test_make_default_surface(&d);
+    BVtx q[6];
+    for (int i = 0; i < 4; i++) {
+        mf_test_make_quad_at(q, 10.f + 20 * i, 10.f, 16.f, 16.f, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_NONE, 0.0f, 0x2002);
+    }
+    backend_mfgpu.present(&d);
+
+    uint32_t groups = RasterBackend_MFGPU_TestTrilistGroups();
+    uint32_t cmds   = RasterBackend_MFGPU_TestTrilistCmds();
+    uint32_t ring   = RasterBackend_MFGPU_TestTrilistCommandCount();
+    uint32_t merged = RasterBackend_MFGPU_TestBatchMerged();
+    mf_test_set_batch("1");
+    if (groups != 4 || cmds != 4 || ring != 4 || merged != 0) {
+        printf("  FAIL batch-off  groups=%u(want 4) cmds=%u(want 4) ring=%u(want 4) merged=%u(want 0)\n",
+               groups, cmds, ring, merged);
+        return 0;
+    }
+    printf("  OK   batch-off  GMLOADER_MFGPU_BATCH_TRILIST=0 emits one command per group\n");
+    return 1;
+}
+
+// A differing batch key must close the open command. Alternating two textures
+// gives four distinct-state groups in a row, so nothing may merge -- this is the
+// case that fails if the key is too coarse (e.g. ignoring src_off).
+static int case_batch_state_change_forces_a_flush(void) {
+    RasterBackend_MFGPU_TestReset();
+    mf_test_set_batch("1");
+
+    RSurface d; mf_test_make_default_surface(&d);
+    BVtx q[6];
+    for (int i = 0; i < 4; i++) {
+        mf_test_make_quad_at(q, 10.f + 20 * i, 40.f, 16.f, 16.f, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, (i & 1) ? mf_test_opaque_texture_b()
+                                             : mf_test_opaque_texture(),
+                           RB_NONE, 0.0f, (i & 1) ? 0x2004 : 0x2003);
+    }
+    backend_mfgpu.present(&d);
+
+    uint32_t groups = RasterBackend_MFGPU_TestTrilistGroups();
+    uint32_t cmds   = RasterBackend_MFGPU_TestTrilistCmds();
+    if (groups != 4 || cmds != 4) {
+        printf("  FAIL batch-state-change  groups=%u(want 4) cmds=%u(want 4) -- the key merged "
+               "groups that do not share a header\n", groups, cmds);
+        return 0;
+    }
+    printf("  OK   batch-state-change  alternating texture pages never merge\n");
+    return 1;
+}
+
+// THE CORRECTNESS GATE, in framebuffer form. Same scene, both arms, byte-compared
+// -- the host analogue of the device's cov_px identity check. The scene is built
+// to walk the flush points on purpose: a deferred clear, runs of mergeable quads
+// around a blend change, a texture change, translucent draws whose ORDER is
+// observable through alpha compositing, and the FPS overlay's fills at the end.
+static int mf_test_render_batch_scene(uint16_t *out) {
+    RasterBackend_MFGPU_TestReset();
+    RSurface d; mf_test_make_default_surface(&d);
+    BVtx q[6];
+
+    backend_mfgpu.clear(&d, 10, 20, 30, 255);
+    // Run 1: three mergeable opaque quads.
+    for (int i = 0; i < 3; i++) {
+        mf_test_make_quad_at(q, 8.f + 24 * i, 8.f, 40.f, 40.f, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_NONE, 0.0f, 0x2101);
+    }
+    // Blend change: the run closes here.
+    for (int i = 0; i < 3; i++) {
+        mf_test_make_quad_at(q, 8.f + 24 * i, 20.f, 40.f, 40.f, 0.5f);
+        backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_ALPHA, 0.0f, 0x2101);
+    }
+    // Texture change, then OVERLAPPING translucent quads: if a merge ever
+    // reordered triangles, these composite in the wrong order and the pixels
+    // differ. Overlap is what makes the check sensitive to order at all.
+    for (int i = 0; i < 4; i++) {
+        mf_test_make_quad_at(q, 30.f + 6 * i, 60.f, 60.f, 60.f, 0.4f);
+        backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture_b(), RB_ALPHA, 0.0f, 0x2102);
+    }
+    // Back to the first page, another mergeable run.
+    for (int i = 0; i < 3; i++) {
+        mf_test_make_quad_at(q, 100.f + 18 * i, 120.f, 30.f, 30.f, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_NONE, 0.0f, 0x2101);
+    }
+    RasterBackend_MFGPU_TestSetFpsOverlay(1);
+    backend_mfgpu.present(&d);
+    RasterBackend_MFGPU_TestSetFpsOverlay(0);
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, out);
+    return (int)RasterBackend_MFGPU_TestTrilistCmds();
+}
+
+static int case_batch_output_is_bit_identical(void) {
+    static uint16_t fb_on[BW*BH], fb_off[BW*BH];
+
+    mf_test_set_batch("0");
+    int cmds_off = mf_test_render_batch_scene(fb_off);
+    mf_test_set_batch("1");
+    int cmds_on  = mf_test_render_batch_scene(fb_on);
+
+    if (memcmp(fb_on, fb_off, sizeof fb_on) != 0) {
+        int first = -1, ndiff = 0;
+        for (int i = 0; i < BW*BH; i++)
+            if (fb_on[i] != fb_off[i]) { if (first < 0) first = i; ndiff++; }
+        printf("  FAIL batch-identical  %d/%d pixels differ, first at (%d,%d) on=%04x off=%04x\n",
+               ndiff, BW*BH, first % BW, first / BW, fb_on[first], fb_off[first]);
+        return 0;
+    }
+    // A byte-identical framebuffer proves nothing if the arms emitted the same
+    // ring: pin that the batched arm really did merge.
+    if (!(cmds_on < cmds_off)) {
+        printf("  FAIL batch-identical  output matched but nothing merged (cmds on=%d off=%d)\n",
+               cmds_on, cmds_off);
+        return 0;
+    }
+    printf("  OK   batch-identical  framebuffer byte-identical with %d commands vs %d unbatched\n",
+           cmds_on, cmds_off);
+    return 1;
+}
+
+// A pending deferred clear must still be discharged exactly where it was, and
+// the W2 lever's coverage proof (which only holds for a 2-triangle quad) must
+// still be reachable with batching on -- i.e. the covering quad must NOT have
+// been folded into a wider command.
+static int case_batch_preserves_deferred_clear_drop(void) {
+    RasterBackend_MFGPU_TestReset();
+    setenv("GMLOADER_MFGPU_DEFER_CLEAR", "1", 1);
+    mf_test_set_batch("1");
+
+    RSurface d; mf_test_make_default_surface(&d);
+    backend_mfgpu.clear(&d, 0, 0, 0, 255);
+    BVtx q[6]; mf_test_make_full_screen_quad(q);
+    backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_NONE, 1.0f, 0x2201);
+    // ...and three mergeable quads AFTER it, which must merge normally now that
+    // the clear is resolved.
+    for (int i = 0; i < 3; i++) {
+        mf_test_make_quad_at(q, 10.f + 20 * i, 90.f, 16.f, 16.f, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_NONE, 0.0f, 0x2201);
+    }
+    backend_mfgpu.present(&d);
+
+    uint32_t dropped = RasterBackend_MFGPU_TestClearsDropped();
+    uint32_t fills   = RasterBackend_MFGPU_TestFillCommandCount();
+    uint32_t groups  = RasterBackend_MFGPU_TestTrilistGroups();
+    uint32_t cmds    = RasterBackend_MFGPU_TestTrilistCmds();
+    // 4 groups -> 2 commands: the clear-resolving cover quad stands alone, the
+    // three that follow merge.
+    if (dropped != 1 || fills != 0 || groups != 4 || cmds != 2) {
+        printf("  FAIL batch-vs-defer-clear  dropped=%u(want 1) fills=%u(want 0) "
+               "groups=%u(want 4) cmds=%u(want 2)\n", dropped, fills, groups, cmds);
+        return 0;
+    }
+    printf("  OK   batch-vs-defer-clear  the covering quad stayed standalone (clear still "
+           "dropped) and the following run merged\n");
+    return 1;
+}
+
+// A render-target switch must close the open command: the pending triangles were
+// built for the OLD target. Draw into the app surface, then to the screen, and
+// require that the appsurf run did not swallow the screen run.
+static int case_batch_flushes_on_target_switch(void) {
+    RasterBackend_MFGPU_TestReset();
+    mf_test_set_batch("1");
+    const uint32_t APPSURF_FBO = 7, APPSURF_TEX = 77;
+    RasterBackend_MFGPU_SetAppSurface(APPSURF_FBO, APPSURF_TEX);
+
+    RSurface scr; mf_test_make_default_surface(&scr);
+    RSurface as = scr; as.fbo = APPSURF_FBO;
+
+    BVtx q[6];
+    for (int i = 0; i < 3; i++) {   // into the app surface: one merged command
+        mf_test_make_quad_at(q, 10.f + 20 * i, 10.f, 16.f, 16.f, 1.0f);
+        backend_mfgpu.draw(&as, q, 2, mf_test_opaque_texture(), RB_NONE, 0.0f, 0x2301);
+    }
+    for (int i = 0; i < 2; i++) {   // then to the screen: a second merged command
+        mf_test_make_quad_at(q, 10.f + 20 * i, 60.f, 16.f, 16.f, 1.0f);
+        backend_mfgpu.draw(&scr, q, 2, mf_test_opaque_texture(), RB_NONE, 0.0f, 0x2301);
+    }
+    backend_mfgpu.present(&scr);
+    RasterBackend_MFGPU_SetAppSurface(0, 0);
+
+    uint32_t groups = RasterBackend_MFGPU_TestTrilistGroups();
+    uint32_t cmds   = RasterBackend_MFGPU_TestTrilistCmds();
+    if (groups != 5 || cmds != 2) {
+        printf("  FAIL batch-target-switch  groups=%u(want 5) cmds=%u(want 2) -- a target "
+               "switch did not close the open command\n", groups, cmds);
+        return 0;
+    }
+    printf("  OK   batch-target-switch  the app-surface run closed before the screen run\n");
+    return 1;
+}
+
+// A MID-FRAME clear must not overtake triangles drawn before it. Written against
+// GMLOADER_MFGPU_DEFER_CLEAR=0, where mf_clear emits its BLT_OP_FILL immediately:
+// that is the shape where an unflushed batch would land BEHIND the fill and the
+// erased quad would come back. (With the clear deferred, the next draw's
+// unbatched path happens to flush first, so the deferred arm cannot see this --
+// which is exactly why the flush in mf_clear is unconditional and this case
+// forces the undeferred arm.)
+static int case_batch_flushes_before_a_midframe_clear(void) {
+    RasterBackend_MFGPU_TestReset();
+    setenv("GMLOADER_MFGPU_DEFER_CLEAR", "0", 1);
+    mf_test_set_batch("1");
+
+    RSurface d; mf_test_make_default_surface(&d);
+    BVtx q[6];
+    backend_mfgpu.clear(&d, 0, 0, 0, 255);
+    mf_test_make_quad_at(q, 10.f, 10.f, 40.f, 40.f, 1.0f);       // must be ERASED
+    backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_NONE, 0.0f, 0x2401);
+    backend_mfgpu.clear(&d, 0, 0, 255, 255);                      // blue, over the quad
+    mf_test_make_quad_at(q, 100.f, 100.f, 40.f, 40.f, 1.0f);      // same state: mergeable
+    backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_NONE, 0.0f, 0x2401);
+    backend_mfgpu.present(&d);
+
+    static uint16_t fb[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb);
+    setenv("GMLOADER_MFGPU_DEFER_CLEAR", "1", 1);
+    RasterBackend_MFGPU_TestEnvReset();
+
+    const uint16_t BLUE_565 = 0x001F;
+    uint16_t erased = fb[20 * BW + 20];       // inside the first quad
+    uint16_t kept   = fb[110 * BW + 110];     // inside the second
+    if (erased != BLUE_565 || kept == BLUE_565) {
+        printf("  FAIL batch-midframe-clear  (20,20)=0x%04x(want 0x%04x, the clear) "
+               "(110,110)=0x%04x(want != clear) -- a pending command outlived the clear "
+               "that should have erased it\n", erased, BLUE_565, kept);
+        return 0;
+    }
+    printf("  OK   batch-midframe-clear  an undeferred mid-frame clear erases the quads "
+           "drawn before it and not the ones after\n");
+    return 1;
+}
+
+// A deferred clear that survives to FRAME END discharges through
+// mf_pc_flush_all, which re-selects the clear's own target before filling. Any
+// command still open at that moment would be emitted afterwards -- under the
+// WRONG target. Reached by clearing the app surface and then drawing only to the
+// screen, so nothing discharges the APPSURF slot until present().
+static int case_batch_flushes_before_end_of_frame_clear_discharge(void) {
+    RasterBackend_MFGPU_TestReset();
+    setenv("GMLOADER_MFGPU_DEFER_CLEAR", "1", 1);
+    mf_test_set_batch("1");
+    const uint32_t APPSURF_FBO = 9, APPSURF_TEX = 99;
+    RasterBackend_MFGPU_SetAppSurface(APPSURF_FBO, APPSURF_TEX);
+
+    RSurface scr; mf_test_make_default_surface(&scr);
+    RSurface as = scr; as.fbo = APPSURF_FBO;
+
+    backend_mfgpu.clear(&as, 255, 0, 0, 255);   // deferred, on the APPSURF slot
+    BVtx q[6];
+    for (int i = 0; i < 3; i++) {               // screen-target run, still open at present()
+        mf_test_make_quad_at(q, 10.f + 20 * i, 150.f, 16.f, 16.f, 1.0f);
+        backend_mfgpu.draw(&scr, q, 2, mf_test_opaque_texture(), RB_NONE, 0.0f, 0x2501);
+    }
+    backend_mfgpu.present(&scr);
+    RasterBackend_MFGPU_SetAppSurface(0, 0);
+
+    static uint16_t fb[BW*BH];
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb);
+    uint32_t emitted = RasterBackend_MFGPU_TestClearsEmitted();
+    // The quads must be on the SCREEN. If the open command outlived
+    // mf_pc_flush_all's SET_TARGET APPSURF, they went into the app surface
+    // instead and the scanned-out buffer is empty here.
+    uint16_t inside = fb[158 * BW + 16];
+    if (emitted != 1 || inside == 0) {
+        printf("  FAIL batch-end-of-frame-clear  clears_emitted=%u(want 1) fb(16,158)=0x%04x"
+               "(want nonzero) -- the open command was emitted after the clear's "
+               "SET_TARGET and landed on the wrong buffer\n", emitted, inside);
+        return 0;
+    }
+    printf("  OK   batch-end-of-frame-clear  the screen run closed before the app-surface "
+           "clear discharged at frame end\n");
+    return 1;
+}
+
 // ── [Phase 3 Stage A] GMLOADER_MFGPU_TRACE draw-stream capture (Task 2) ──────
 // Local plumbing named to match the task brief's helper names, built from
 // this file's existing reinit/draw/end-frame idiom (case_cache_hit /
@@ -3119,6 +3468,23 @@ int main(void){
     else printf("raster_backend mfgpu-defer-clear-source-sample OK\n");
     if (!case_deferred_clear_precedes_fps_overlay_when_no_draw()) { printf("FAIL mfgpu-defer-clear-vs-overlay-order\n"); ok = 0; }
     else printf("raster_backend mfgpu-defer-clear-vs-overlay-order OK\n");
+    // [W3 batching] consecutive same-state quad merging.
+    if (!case_batch_merges_consecutive_same_state_quads()) { printf("FAIL mfgpu-batch-merge\n"); ok = 0; }
+    else printf("raster_backend mfgpu-batch-merge OK\n");
+    if (!case_batch_off_is_one_command_per_group()) { printf("FAIL mfgpu-batch-off\n"); ok = 0; }
+    else printf("raster_backend mfgpu-batch-off OK\n");
+    if (!case_batch_state_change_forces_a_flush()) { printf("FAIL mfgpu-batch-state-change\n"); ok = 0; }
+    else printf("raster_backend mfgpu-batch-state-change OK\n");
+    if (!case_batch_output_is_bit_identical()) { printf("FAIL mfgpu-batch-identical\n"); ok = 0; }
+    else printf("raster_backend mfgpu-batch-identical OK\n");
+    if (!case_batch_preserves_deferred_clear_drop()) { printf("FAIL mfgpu-batch-vs-defer-clear\n"); ok = 0; }
+    else printf("raster_backend mfgpu-batch-vs-defer-clear OK\n");
+    if (!case_batch_flushes_on_target_switch()) { printf("FAIL mfgpu-batch-target-switch\n"); ok = 0; }
+    else printf("raster_backend mfgpu-batch-target-switch OK\n");
+    if (!case_batch_flushes_before_a_midframe_clear()) { printf("FAIL mfgpu-batch-midframe-clear\n"); ok = 0; }
+    else printf("raster_backend mfgpu-batch-midframe-clear OK\n");
+    if (!case_batch_flushes_before_end_of_frame_clear_discharge()) { printf("FAIL mfgpu-batch-end-of-frame-clear\n"); ok = 0; }
+    else printf("raster_backend mfgpu-batch-end-of-frame-clear OK\n");
     // Deliberately registered LAST, after every other case has already called
     // backend_mfgpu.draw() many times over: proves RasterBackend_MFGPU_TestTraceReset()
     // actually makes this case position-independent rather than merely untested at

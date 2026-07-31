@@ -414,6 +414,98 @@ static inline int mf_pc_target_of(int slot) {
     return (slot == 1) ? MF_TARGET_APPSURF : MF_TARGET_WORK;
 }
 
+// ── [W3 batching] Merge consecutive same-state quads into one TRILIST ────────
+//
+// WHY. W3's fabric prefetch runs triangle N+1's setup + vertex fetch during
+// triangle N's pixel walk, but triangle 0 of a command has no previous walk to
+// hide behind. The engine emitted exactly ONE BLT_OP_TRILIST per GameMaker
+// sprite quad -- 2 triangles -- so half of every command's setup was
+// unprefetchable and the RTL hit a hard 50% ceiling. Merging consecutive
+// same-state quads into one N-triangle command raises the prefetch hit rate and
+// drops one ~40-cycle ring fetch per command eliminated. Measured heavy-B:
+// 98 commands / 196 triangles per frame with 45.8 consecutive same-state runs,
+// so this merges 98 -> ~46 (the draw stream alternates state; 30 of the 46 runs
+// are a single group). No RTL change: the fabric already walks an N-triangle
+// TRILIST, which is the same path the 2-triangle commands took.
+//
+// WHY IT CANNOT CHANGE A PIXEL. The fabric walks a command's triangles in list
+// order, and blt_push_tris is a bump append, so a merged command renders the
+// SAME triangles in the SAME order with the SAME header as the separate
+// commands did. Only the number of command headers changes. That is the whole
+// safety argument, and it holds only for CONSECUTIVE groups -- alpha blending is
+// order-dependent, so anything that could interpose a ring op between two groups
+// has to flush first. Every such point calls mf_batch_flush(); see the list at
+// mf_batch_flush's definition.
+//
+// The batch never buffers vertices: each group's vertices are pushed as it
+// arrives and the pending command records only (first entry offset, running
+// triangle count). Contiguity is re-checked against the offset blt_push_tris
+// actually returns rather than assumed, so anything that ever appends between
+// two groups forces a flush instead of silently widening a command over foreign
+// vertices.
+static int g_batch_v = -1;
+static int mf_batch_on(void) {
+    if (g_batch_v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_BATCH_TRILIST");
+        g_batch_v = (e && *e) ? atoi(e) : 1;   // on by default: this is the lever
+    }
+    return g_batch_v;
+}
+// Every field the TRILIST command header carries (blt_trilist: blend_mode,
+// format, flags, src_off, src_stride, src_x=tex.w, src_y=tex.h, colorkey;
+// alpha is the constant 255 at every call site), PLUS two pieces of
+// command-EXTERNAL state that change what the command means:
+//   target - which buffer BLT_OP_SET_TARGET last selected. Command-external but
+//            it decides where the pixels land, so two groups under different
+//            targets must never share a header.
+//   tw/th  - the page dimensions mf_emit_group scales UVs by. They do NOT reach
+//            the header (the vertices are already converted by push time), so
+//            including them cannot be required for correctness -- but on the
+//            BLT_F_SRC_SURFACE path `tex` is zeroed while tw/th carry the real
+//            page size, which is the one case where the header fields alone
+//            would not distinguish two genuinely different groups. Cheap, and
+//            it can only ever suppress a merge.
+struct MfBatchKey {
+    uint32_t src_off;
+    uint16_t src_stride, tex_w, tex_h, colorkey;
+    int      tw, th, target;
+    uint8_t  format, blend_mode, flags;
+};
+static inline bool mf_batch_key_eq(const MfBatchKey &a, const MfBatchKey &b) {
+    return a.src_off == b.src_off && a.src_stride == b.src_stride &&
+           a.tex_w == b.tex_w && a.tex_h == b.tex_h && a.colorkey == b.colorkey &&
+           a.tw == b.tw && a.th == b.th && a.target == b.target &&
+           a.format == b.format && a.blend_mode == b.blend_mode && a.flags == b.flags;
+}
+// Safety bound on a merged command, mirroring the per-group g_vtxscratch bound.
+// cmd.w (the triangle count on the wire) is a uint16, and the 128 KiB per-frame
+// vertex arena tops out at 2730 triangles anyway -- blt_push_tris fails first --
+// so this never fires on real content (the longest measured run is 12 groups =
+// 24 triangles). It exists so the wire field can never be overrun by a future
+// caller with a large nt.
+enum { MF_BATCH_MAX_TRIS = MF_MAX_VERTS / 3 };
+static struct {
+    bool              valid;
+    MfBatchKey        key;
+    blt_surface_ref_t tex;       // the ref blt_trilist will read the page fields from
+    uint32_t          base_raw;  // vtx_buf-relative offset of the batch's first vertex
+    uint32_t          next_raw;  // the offset the NEXT push must return to stay contiguous
+    int               nt;        // triangles accumulated so far
+} g_batch;
+// Emit the pending merged TRILIST, if any. Declared here because the flush
+// points (mf_select_target, mf_clear, mf_present, mf_frame_end) all precede the
+// definition, which lives next to mf_emit_group.
+static void mf_batch_flush(void);
+// Per-frame TRILIST accounting, so the merge is visible in a log rather than
+// inferred. `groups` counts mf_emit_group calls that reached the ring, `cmds`
+// counts the BLT_OP_TRILIST commands they became; unbatched, the two are equal.
+static uint32_t g_tl_groups = 0, g_tl_cmds = 0, g_tl_tris = 0;
+// Snapshotted at publish for the same reason g_cov_px_published is (the await
+// moved past this frame's draws), so MFSUBMIT pairs them with the right batch.
+static uint32_t g_tl_groups_pub = 0, g_tl_cmds_pub = 0, g_tl_tris_pub = 0;
+// Run total of groups absorbed into an already-open command (= commands saved).
+static uint32_t g_batch_merged = 0;
+
 static inline uint16_t mf_rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
 }
@@ -645,6 +737,27 @@ static MfCovDerived mf_derive_cov(double dpath_ms, double cov_exact, double cov_
 
 static void mf_cov_add_triangle(float x0, float y0, float x1, float y1, float x2, float y2) {
     g_cov_px_accum += mf_clip_tri_area(x0, y0, x1, y1, x2, y2);
+}
+
+// Coverage estimate (Task 4, moved into mf_emit_group per review — see the long
+// comment at g_cov_px_accum's declaration): the actual point triangles are
+// pushed into the fabric ring, downstream of every silent-discard path in
+// mf_draw (in-flight-batch guard, self-referential appsurf guard, CRT-ghost
+// strip, duplicate-draw elision) and of the overflow checks. `verts` are the
+// pre-bvtx_to_blt screen-space coordinates, the same space blitter.cpp decoded.
+//
+// [W3 batching] Factored out of mf_emit_group's tail so BOTH the merged and the
+// unbatched path accumulate identically. cov_px is the A/B correctness gate for
+// batching, and it is only a gate if the two arms count the same triangles: this
+// runs PER GROUP in both, never per command, so merging cannot move it.
+static void mf_cov_add_group(const BVtx *verts, int nt) {
+    if (!mf_stat_on()) return;
+    for (int i = 0; i < nt; i++) {
+        const BVtx &a = verts[i * 3 + 0];
+        const BVtx &b = verts[i * 3 + 1];
+        const BVtx &c = verts[i * 3 + 2];
+        mf_cov_add_triangle(a.x, a.y, b.x, b.y, c.x, c.y);
+    }
 }
 
 // ── CONTROL-BLOCK REGISTER INDICES + WRITE TRACE (Phase 1 B2) ────────────────
@@ -945,6 +1058,12 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     static unsigned n = 0, to = 0; static double sum = 0; static long it_sum = 0;
     static double fsum = 0, tsum = 0, xsum = 0, csum = 0, esum = 0;
     static double nsum = 0.0, dsum = 0.0;   // [W3 Stage C] snap / detect, ms
+    // [W3 batching] TRILIST commands / pre-merge groups / triangles per frame,
+    // averaged over the SAME 30-frame window as cov_px so an A/B can pair them
+    // on one line. `cmds` is the lever's direct readout; `groups` is what it
+    // would have been unbatched, so cmds/groups is the achieved merge factor and
+    // a regression shows up as the two converging.
+    static double gsum = 0.0, msum = 0.0, rsum = 0.0;
     static unsigned nblk = 0;               // [W3 Stage C] their denominator
     n++; to += timeout ? 1u : 0u; sum += us; it_sum += iters; fsum += frame_ms; tsum += tri_ms; xsum += texw_ms;
     esum += cov_exact;
@@ -974,6 +1093,7 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
     // would pair the counters of the batch we just waited on with the NEXT frame's estimate.
     // g_cov_px_published is the snapshot taken at publish, so the pairing survives the move.
     csum += g_cov_px_published;
+    gsum += (double)g_tl_groups_pub; msum += (double)g_tl_cmds_pub; rsum += (double)g_tl_tris_pub;
     if (n % 30 == 0) {
         double f=fsum/30.0, t=tsum/30.0, x=xsum/30.0, c=csum/30.0, e=esum/30.0;
         // snap/detect divide by the BLOCKED count, not 30. A window with no blocked
@@ -996,14 +1116,16 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
         fprintf(stderr, "MFSUBMIT n=%u wait_ms[avg=%.2f] fabric_ms[frame=%.2f tri=%.2f "
                 "texwait=%.2f dpath=%.2f ovhd=%.2f] cov_px=%.0f cov_px_est=%.0f "
                 "est_ratio=%s overdraw=%.2f cyc_px=%.1f cov_src=%s spin_avg=%ld to=%u "
-                "snap=%.3f detect=%.3f blk=%u\n",
+                "snap=%.3f detect=%.3f blk=%u cmds=%.1f groups=%.1f tris=%.1f batch=%d\n",
                 n, (sum/30.0)/1e3, f, t, x, dpath_ms, f-t,
                 e, c, ratio_buf, d.overdraw, d.cyc_px,
                 d.estimated ? "est" : "exact", it_sum/30, to,
-                nsum/nb, dsum/nb, nblk);
+                nsum/nb, dsum/nb, nblk,
+                msum/30.0, gsum/30.0, rsum/30.0, mf_batch_on());
         sum = 0; it_sum = 0; to = 0;
         fsum = 0; tsum = 0; xsum = 0; csum = 0; esum = 0;
         nsum = 0; dsum = 0; nblk = 0;   // [W3 Stage C]
+        gsum = 0; msum = 0; rsum = 0;   // [W3 batching]
     }
 }
 #endif // MISTER_NATIVE_VIDEO — device transport internals end here
@@ -1156,6 +1278,12 @@ static void mf_device_publish(void) {
     // accumulator and get the right frame. Exact cov_px still comes from the fabric.
     g_cov_px_published = g_cov_px_accum;
     g_cov_px_accum     = 0.0;
+    // [W3 batching] Snapshot the TRILIST accounting for the SAME reason and at
+    // the same point, so MFSUBMIT's cmds/groups/tris describe the batch whose
+    // fabric counters it is about to read. (These reset in mf_frame_begin, not
+    // here: unlike g_cov_px_accum they are also read by host-test hooks after
+    // present() has closed the frame.)
+    g_tl_groups_pub = g_tl_groups; g_tl_cmds_pub = g_tl_cmds; g_tl_tris_pub = g_tl_tris;
     mf_ctrl_wr(MF_C_CMDCOUNT, (uint32_t)g_e.cmd_count);
     mf_ctrl_wr(MF_C_TARGET,   (uint32_t)g_e.target_buf);
     mf_ctrl_wr(MF_C_CLEAR,    (uint32_t)g_e.clear_color);
@@ -1321,6 +1449,10 @@ static void mf_init_once(void) {
     // the file's one "start clean" primitive, and every case uses it as such.
     mf_pc_reset(&g_pc);
     g_pc_dropped_total = 0; g_pc_emitted_total = 0;
+    // [W3 batching] Same "start clean" contract: no open command, no carried counts.
+    g_batch.valid = false; g_batch_merged = 0;
+    g_tl_groups = 0; g_tl_cmds = 0; g_tl_tris = 0;
+    g_tl_groups_pub = 0; g_tl_cmds_pub = 0; g_tl_tris_pub = 0;
     g_inited = true;
 }
 
@@ -1554,6 +1686,15 @@ static void mf_frame_begin(void) {
     // A deferred fill must never span frames -- the ring it would have gone
     // into has just been rewound.
     mf_pc_reset(&g_pc);
+    // [W3 batching] Same rule, same reason: an open command references a vertex
+    // offset in an arena blt_begin_frame/blt_vtx_buf_init has just rewound (and
+    // possibly swapped), so it can never be emitted from here. It must already be
+    // closed -- mf_frame_end and mf_present both flush -- so this only matters for
+    // a caller that reopens a frame without ending the previous one, where the
+    // ring rewind discards those commands regardless of what this does.
+    g_batch.valid = false;
+    // Per-frame TRILIST accounting resets with the ring it describes.
+    g_tl_groups = 0; g_tl_cmds = 0; g_tl_tris = 0;
     g_frame_active = true;
     g_frame_no++;
 }
@@ -1574,13 +1715,28 @@ static void mf_ensure_frame(void) {
 static void mf_select_target(uint32_t fbo) {
     bool is_appsurf = (g_appSurfFbo != 0) && (fbo == g_appSurfFbo);
     int want = is_appsurf ? MF_TARGET_APPSURF : MF_TARGET_WORK;
-    if (want != g_cur_target) { blt_set_target(&g_e, want); g_cur_target = want; }
+    // [W3 batching] FLUSH POINT: a render-target switch. The pending command's
+    // triangles were built under the OLD target and must reach the ring ahead of
+    // the SET_TARGET, or they land in the wrong buffer. (g_cur_target is also in
+    // the batch key, so mf_emit_group would refuse the merge anyway -- but that
+    // only helps if a draw follows. A clear() or the FPS overlay switching target
+    // has no such backstop, which is why the flush lives here and not only there.)
+    if (want != g_cur_target) {
+        mf_batch_flush();
+        blt_set_target(&g_e, want); g_cur_target = want;
+    }
 }
 
 static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     mf_ensure_frame();
     if (g_frame_dropped) return;   // [in-flight-batch guard] emit nothing this frame
     g_last_draw.valid = false;     // [duplicate-draw elimination] a clear breaks the run
+    // [W3 batching] FLUSH POINT: a clear. Both of this function's outcomes must
+    // be ordered after the triangles already drawn -- the immediate blt_fill
+    // obviously, and the DEFERRED record too, because the fill it eventually
+    // emits takes the ring position it would have occupied here. Unconditional
+    // (not just on a target switch): a same-target clear needs it just as much.
+    mf_batch_flush();
     mf_select_target(d->fbo);
     (void)a;   // fabric FILL writes opaque RGB565; no alpha channel on the wire
     int w = d->w < BLT_FB_WIDTH  ? d->w : BLT_FB_WIDTH;
@@ -2003,7 +2159,7 @@ static int mf_trace_on(void);
 static int mf_trace_in_window(void);
 static void mf_trace_group(const blt_surface_ref_t &tex, int tw, int th,
                            uint8_t blend_mode, uint16_t colorkey,
-                           uint8_t extra_flags, int nt);
+                           uint8_t extra_flags, int nt, const blt_vtx_t *vtx);
 
 // Emit one BLT_OP_TRILIST for `nt` triangles (`verts` = nt*3 vertices, whose UVs
 // address the `tw`x`th` page `tex`). Converts + pushes the vertices, selects the
@@ -2012,6 +2168,72 @@ static void mf_trace_group(const blt_surface_ref_t &tex, int tw, int th,
 // emits. Shared by the sub-region quad loop, the untextured single-page path, and
 // the app-surface path (extra_flags carries BLT_F_SRC_SURFACE there). A hard emit
 // failure is logged and drops just this group's triangles.
+// [W3 batching] FLUSH: emit the accumulated TRILIST, if one is open.
+//
+// THE COMPLETE FLUSH-POINT LIST. Every path that can put anything into the ring
+// between two groups, or that can end the ring, calls this first:
+//   1. a group whose batch key differs        -- mf_emit_group, below
+//   2. a group whose vertices did not land contiguously after the batch's
+//                                             -- mf_emit_group, below
+//   3. MF_BATCH_MAX_TRIS reached              -- mf_emit_group, below
+//   4. a group that must resolve a DEFERRED CLEAR (mf_batch_clear_relevant)
+//                                             -- mf_emit_group, below
+//   5. a render-target switch                 -- mf_select_target
+//   6. any clear(), immediate or deferred     -- mf_clear
+//   7. a fall-through to the software rasterizer -- mf_draw's two backend_sw.draw sites
+//   8. frame end                              -- mf_frame_end, ahead of mf_pc_flush_all
+//   9. present()                              -- mf_present, ahead of mf_pc_flush_all
+//  10. the FPS overlay's fills                -- mf_emit_fps_overlay_fills
+// (9 and 10 are already covered by 8 in the normal path; they are separate calls
+// because both emit ring ops BEFORE mf_frame_end runs, and 10 also switches
+// target. A missed flush is a rendering bug and an extra flush costs one
+// command, so these are deliberately redundant.)
+//
+// The batch is invalidated BEFORE the emit, so a failed blt_trilist -- which
+// means the ring overflowed and the whole frame is about to drop -- cannot leave
+// a command that a later flush would emit a second time.
+static void mf_batch_flush(void) {
+    if (!g_batch.valid) return;
+    g_batch.valid = false;
+    // Same arena rebase as the unbatched path; the batch cannot span a frame
+    // (flush point 8), so g_arena is the one it was built under.
+    const uint32_t eoff = g_batch.base_raw + (g_arena ? (uint32_t)MF_VTX_HALF : 0u);
+    if (blt_trilist(&g_e, g_batch.tex, g_batch.key.blend_mode, g_batch.key.colorkey,
+                    /*alpha=*/255, eoff, g_batch.nt, g_batch.key.flags) != 0) {
+        fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris, merged) - draw dropped\n",
+                g_batch.nt);
+        return;
+    }
+    g_tl_cmds++;
+    if (mf_trace_on() && mf_trace_in_window())
+        mf_trace_group(g_batch.tex, g_batch.key.tw, g_batch.key.th,
+                       g_batch.key.blend_mode, g_batch.key.colorkey,
+                       g_batch.key.flags, g_batch.nt,
+                       (const blt_vtx_t *)(g_e.vtx_buf + g_batch.base_raw));
+}
+
+// [W3 batching] Would this group have to resolve a deferred clear? If so it is
+// emitted UNBATCHED, and the pending batch is flushed ahead of it.
+//
+// This is not just an ordering guard, it also protects the W2 lever's value.
+// mf_pc_is_cover only proves coverage for a 2-triangle quad, so folding a
+// covering quad into a merged 4+-triangle command would fail the proof and emit
+// the 0.632 ms full-screen fill that W2 exists to drop. Keeping the clear-
+// resolving group standalone preserves the exact shape that proof needs.
+//
+// Cost is bounded and tiny: at most the FIRST group after each clear opts out,
+// and the streams carry 1-2 clears per frame. Crucially this tests only the
+// slots mf_emit_group's clear logic actually inspects -- the current target, plus
+// the app surface for a BLT_F_SRC_SURFACE sampler -- and not "any slot pending".
+// A clear recorded on WORK stays pending across the whole scene while every draw
+// targets APPSURF, so an any-slot test would disable batching for entire frames.
+static bool mf_batch_clear_relevant(uint8_t extra_flags) {
+    if (mf_pc_pending(&g_pc, mf_pc_slot_of(g_cur_target))) return true;
+    if ((extra_flags & BLT_F_SRC_SURFACE) &&
+        mf_pc_pending(&g_pc, mf_pc_slot_of(MF_TARGET_APPSURF))) return true;
+    return false;
+}
+
 static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
                           const BVtx *verts, int nt, RBlend bl,
                           bool has_key, uint8_t extra_flags) {
@@ -2026,18 +2248,11 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         g_vtxscratch[i] = bvtx_to_blt(&verts[i], tw, th);
         if (verts[i].a < min_vtx_a) min_vtx_a = verts[i].a;
     }
-    uint32_t eoff = blt_push_tris(&g_e, g_vtxscratch, nt);
-    if (eoff == 0xFFFFFFFFu) {
-        fprintf(stderr, "backend_mfgpu: vertex push overflow (%d tris) - draw dropped\n", nt);
-        return;
-    }
-    // [Phase 1 B1] blt_push_tris returns an offset relative to vtx_buf, but the consumer —
-    // blt_execute and the fabric alike — resolves it as heap_base + entry_off (see
-    // blt_vtx_buf_init's comment in 3rdparty/mfgpu). Those coincided only while vtx_buf WAS
-    // the heap base. Arena 1's vertex window starts MF_VTX_HALF up, so the offset must be
-    // rebased or every TRILIST reads its vertices from the wrong address — garbage geometry
-    // with no error, on device and in the oracle alike.
-    eoff += g_arena ? (uint32_t)MF_VTX_HALF : 0u;
+    // [W3 batching] Blend resolution moved AHEAD of blt_push_tris: blend_mode and
+    // colorkey are header fields, so the batch key -- and therefore the decision
+    // whether to flush -- needs them before anything touches the emitter. The
+    // conversion loop above writes only g_vtxscratch, which no flush reads, so
+    // the reorder is inert. The push itself now happens inside each branch.
     uint8_t blend_mode;
     uint16_t colorkey;
     if (has_key && min_vtx_a * 255.0f >= 254.0f) {
@@ -2066,6 +2281,73 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         colorkey = 0;
     }
     g_last_trilist_blend = blend_mode;   // host-test hook (opaque-ALPHA -> COPY promotion)
+    // Counted here, before either path's vertex push, so `groups` means "groups
+    // this frame tried to emit". The only way that differs from "groups emitted"
+    // is a vertex-arena overflow, which sets g_e.overflow and drops the whole
+    // frame -- and a dropped frame never publishes, so it never reaches MFSUBMIT.
+    g_tl_groups++;
+
+    // ── [W3 batching] merge into the open command, or open a new one ─────────
+    if (mf_batch_on() && !mf_batch_clear_relevant(extra_flags)) {
+        MfBatchKey k;
+        k.src_off    = tex.off;
+        k.src_stride = tex.stride;
+        k.tex_w      = tex.w;
+        k.tex_h      = tex.h;
+        k.colorkey   = colorkey;
+        k.tw         = tw;
+        k.th         = th;
+        k.target     = g_cur_target;
+        k.format     = tex.format;
+        k.blend_mode = blend_mode;
+        k.flags      = extra_flags;
+        // Different state => the open command closes here, BEFORE this group's
+        // vertices are appended, so the ring keeps draw order.
+        if (g_batch.valid && !mf_batch_key_eq(g_batch.key, k)) mf_batch_flush();
+        uint32_t raw = blt_push_tris(&g_e, g_vtxscratch, nt);
+        if (raw == 0xFFFFFFFFu) {
+            fprintf(stderr, "backend_mfgpu: vertex push overflow (%d tris) - draw dropped\n", nt);
+            return;   // the open batch stays open; a later flush point still emits it
+        }
+        // CONTIGUITY, CHECKED NOT ASSUMED. A merged command is one (entry_off,
+        // ntris) pair, so it can only span vertices that are physically adjacent
+        // in the arena. Nothing else in this backend calls blt_push_tris today,
+        // but a future one that did would silently widen the command over foreign
+        // vertices. Closing the old command here still preserves order: its
+        // vertices are already written and untouched, and its TRILIST goes into
+        // the ring ahead of this group's.
+        if (g_batch.valid && raw != g_batch.next_raw) mf_batch_flush();
+        if (!g_batch.valid) {
+            g_batch.valid = true; g_batch.key = k; g_batch.tex = tex;
+            g_batch.base_raw = raw; g_batch.nt = 0;
+        } else {
+            g_batch_merged++;   // one command saved
+        }
+        g_batch.nt   += nt;
+        g_batch.next_raw = raw + (uint32_t)nt * 3u * (uint32_t)sizeof(blt_vtx_t);
+        g_tl_tris    += nt;
+        if (g_batch.nt >= (int)MF_BATCH_MAX_TRIS) mf_batch_flush();
+        mf_cov_add_group(verts, nt);
+        return;
+    }
+
+    // ── unbatched: the knob is off, or this group resolves a deferred clear ──
+    // FLUSH POINT 4. Everything below is the pre-batching code path, unchanged:
+    // it is what the deferred clear's ring-position and coverage-proof logic was
+    // written against, and it stays the authority for those frames.
+    mf_batch_flush();
+    uint32_t eoff = blt_push_tris(&g_e, g_vtxscratch, nt);
+    if (eoff == 0xFFFFFFFFu) {
+        fprintf(stderr, "backend_mfgpu: vertex push overflow (%d tris) - draw dropped\n", nt);
+        return;
+    }
+    // [Phase 1 B1] blt_push_tris returns an offset relative to vtx_buf, but the consumer —
+    // blt_execute and the fabric alike — resolves it as heap_base + entry_off (see
+    // blt_vtx_buf_init's comment in 3rdparty/mfgpu). Those coincided only while vtx_buf WAS
+    // the heap base. Arena 1's vertex window starts MF_VTX_HALF up, so the offset must be
+    // rebased or every TRILIST reads its vertices from the wrong address — garbage geometry
+    // with no error, on device and in the oracle alike.
+    eoff += g_arena ? (uint32_t)MF_VTX_HALF : 0u;
 
     // [Phase 4 Stage B follow-up] A pending APPSURF clear must be discharged not
     // only by a draw that TARGETS the app surface (the destination-side logic
@@ -2125,25 +2407,14 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", nt);
         return;
     }
+    g_tl_cmds++;
+    g_tl_tris += nt;
     // Drop only once the covering draw is actually in the ring: a failed
     // blt_trilist must leave the clear pending for a later draw or for frame end.
     if (pc_pending && pc_covers) mf_pc_drop(&g_pc, pc_target);
     if (mf_trace_on() && mf_trace_in_window())
-        mf_trace_group(tex, tw, th, blend_mode, colorkey, extra_flags, nt);
-    // Coverage estimate (Task 4, moved here per review — see the long comment at
-    // g_cov_px_accum's declaration): this is the actual point triangles are pushed
-    // into the fabric ring, downstream of every silent-discard path in mf_draw
-    // (in-flight-batch guard, self-referential appsurf guard, CRT-ghost strip,
-    // duplicate-draw elision) and of both overflow checks above. `verts` are still
-    // the pre-bvtx_to_blt screen-space coordinates, same space blitter.cpp decoded.
-    if (mf_stat_on()) {
-        for (int i = 0; i < nt; i++) {
-            const BVtx &a = verts[i * 3 + 0];
-            const BVtx &b = verts[i * 3 + 1];
-            const BVtx &c = verts[i * 3 + 2];
-            mf_cov_add_triangle(a.x, a.y, b.x, b.y, c.x, c.y);
-        }
-    }
+        mf_trace_group(tex, tw, th, blend_mode, colorkey, extra_flags, nt, g_vtxscratch);
+    mf_cov_add_group(verts, nt);
 }
 
 // ── [Phase 3 Stage A] GMLOADER_MFGPU_TRACE ───────────────────────────────────
@@ -2179,9 +2450,16 @@ static int mf_trace_in_window(void) {
     }
     return g_frame_no >= mf_trace_start && g_frame_no < mf_trace_start + mf_trace_frames;
 }
+// [W3 batching] `vtx` is the converted vertex run this command points at, passed
+// in rather than read off g_vtxscratch: a merged command spans several groups'
+// worth of vertices and only the LAST group is still in the scratch buffer. The
+// batched flush passes the vertex arena itself (g_e.vtx_buf + the command's own
+// entry offset), which is literally the bytes the fabric will read -- so the
+// capture still describes the emitted command, merged or not, and the G-line
+// count still equals the command count the offline sizing consumes.
 static void mf_trace_group(const blt_surface_ref_t &tex, int tw, int th,
                            uint8_t blend_mode, uint16_t colorkey,
-                           uint8_t extra_flags, int nt) {
+                           uint8_t extra_flags, int nt, const blt_vtx_t *vtx) {
     fprintf(mf_trace_f,
             "MFTRACE G f=%d off=%u stride=%u texw=%d texh=%d fmt=%u "
             "blend=%u key=%u alpha=255 flags=%u nt=%d\n",
@@ -2190,9 +2468,9 @@ static void mf_trace_group(const blt_surface_ref_t &tex, int tw, int th,
             (unsigned)extra_flags, nt);
     for (int i = 0; i < nt * 3; i++)
         fprintf(mf_trace_f, "MFTRACE V %d %d %d %d %08x\n",
-                (int)g_vtxscratch[i].x, (int)g_vtxscratch[i].y,
-                (int)g_vtxscratch[i].u, (int)g_vtxscratch[i].v,
-                g_vtxscratch[i].rgba);
+                (int)vtx[i].x, (int)vtx[i].y,
+                (int)vtx[i].u, (int)vtx[i].v,
+                vtx[i].rgba);
     fflush(mf_trace_f);   // engine may be SIGKILLed by the bench teardown
 }
 
@@ -2347,12 +2625,17 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
     // fabric has one scanout FB plus the one app-surface BRAM, so effect
     // surfaces beyond the application surface stay on the SW rasterizer
     // (step-1 scope; step 2 adds N surfaces).
+    // [W3 batching] FLUSH POINT 7 (both SW fall-throughs below): those pixels land
+    // by a different path entirely and must not overtake triangles still pending
+    // in an unemitted command.
     if (g_defRGBA && d->rgba != g_defRGBA && !dst_is_appsurf) {
+        mf_batch_flush();
         backend_sw.draw(d, v, triCount, t, bl, ar, tex_key); return;
     }
     // Premultiplied-alpha source-over (dst = src + dst*(1-a)) has no exact fabric
     // blend; keep it on SW for bring-up (see raster_backend_convert.h).
-    if (bl == RB_PREMULT)        { backend_sw.draw(d, v, triCount, t, bl, ar, tex_key); return; }
+    if (bl == RB_PREMULT)        { mf_batch_flush();
+                                   backend_sw.draw(d, v, triCount, t, bl, ar, tex_key); return; }
     if (triCount <= 0) return;
 
     mf_select_target(d->fbo);
@@ -2645,6 +2928,12 @@ static void mf_emit_fps_digit(int x, int y, int digit) {
 // bottom-right corner of the WORK buffer. Called from present() right before
 // mf_frame_end, so it overlays the game's own draws for this frame.
 static void mf_emit_fps_overlay_fills(void) {
+    // [W3 batching] FLUSH POINT 10: the overlay paints OVER the frame's draws, so
+    // every pending triangle must already be in the ring. Redundant with
+    // mf_present's own flush just above the call, and kept anyway -- this
+    // function emits fills and switches target, so it must not depend on its
+    // caller having done it.
+    mf_batch_flush();
     // The overlay lands on the scanned-out WORK buffer, never the app surface:
     // restore the target if the frame's last op left it on APPSURF.
     if (g_cur_target != MF_TARGET_WORK) {
@@ -2700,8 +2989,14 @@ static void mf_present(const RSurface *) {
         // a dropped frame's ring must not grow, but g_e.overflow does not block
         // this (mf_frame_end already runs the equivalent flush regardless of
         // overflow, since overflow is only checked after blt_end_frame).
-        if (!g_frame_dropped)
+        // [W3 batching] FLUSH POINT 9, and it must come FIRST: mf_pc_flush_all
+        // emits fills, and a pending clear discharged at frame end paints the
+        // whole target -- landing it ahead of this frame's own triangles would
+        // erase them.
+        if (!g_frame_dropped) {
+            mf_batch_flush();
             mf_pc_flush_all();
+        }
         // [OSD-fps] Emit last, over everything this frame drew. Skipped when the
         // ring was never rebuilt (g_frame_dropped) or already overflowed — those
         // frames are dropped by mf_frame_end and must not grow the batch.
@@ -2716,7 +3011,19 @@ static void mf_frame_end(void) {
     // [in-flight-batch guard] Nothing was emitted and the cursors were never rewound: the
     // ring still holds the batch the fabric is reading. blt_end_frame would bump submit_seq
     // and the doorbell would then ack a batch that was never rebuilt, so return before both.
-    if (g_frame_dropped) return;
+    if (g_frame_dropped) {
+        // [W3 batching] DISCARD, deliberately not flush: emitting into a ring the
+        // fabric is still reading is the exact corruption this guard prevents.
+        // Nothing should be pending anyway -- mf_draw/mf_clear both early-return
+        // on g_frame_dropped, and the previous frame's own flush emptied it -- so
+        // this is a belt-and-braces reset, not a routine discard path.
+        g_batch.valid = false;
+        return;
+    }
+    // [W3 batching] FLUSH POINT 8. Ahead of mf_pc_flush_all for the same reason
+    // as in mf_present: a discharged full-screen clear would otherwise paint over
+    // this frame's own triangles.
+    mf_batch_flush();
     // [Phase 4 Stage B] A frame that cleared and never drew still has to clear.
     // Backstop for callers that reach frame-end without going through
     // mf_present() (which already ran this above): idempotent, so if
@@ -3118,7 +3425,28 @@ extern "C" int RasterBackend_MFGPU_TestFillPrecedesTrilist(void) {
 // RasterBackend_MFGPU_TestTraceReset above (GMLOADER_MFGPU_TRACE): a host case
 // that sets the env var mid-run needs the cache cleared, or it only works as
 // the first thing in the binary to call mf_defer_clear_on().
-extern "C" void RasterBackend_MFGPU_TestEnvReset(void) { g_defer_clear_v = -1; }
+// [W3 batching] GMLOADER_MFGPU_BATCH_TRILIST joins it for the same reason: an
+// A/B case that flips the knob mid-binary needs the cached read cleared.
+extern "C" void RasterBackend_MFGPU_TestEnvReset(void) { g_defer_clear_v = -1; g_batch_v = -1; }
+// [W3 batching] Witnesses. TRILIST commands and pre-merge groups for the LAST
+// closed frame (valid after present()/frame_end), and the run total of groups
+// absorbed into an already-open command. Unbatched, cmds == groups and merged
+// stays 0 -- which is what makes the off arm assertable, not just believed.
+extern "C" uint32_t RasterBackend_MFGPU_TestTrilistCmds(void)   { return g_tl_cmds; }
+extern "C" uint32_t RasterBackend_MFGPU_TestTrilistGroups(void) { return g_tl_groups; }
+extern "C" uint32_t RasterBackend_MFGPU_TestBatchMerged(void)   { return g_batch_merged; }
+// Count BLT_OP_TRILIST entries actually in the ring, independent of the counters
+// above -- a counter can only witness the emitter if something checks it against
+// the ring it claims to describe.
+extern "C" uint32_t RasterBackend_MFGPU_TestTrilistCommandCount(void) {
+    uint32_t n = 0;
+    for (int i = 0; i < g_e.cmd_count; i++) {
+        blt_cmd_t c;
+        blt_unpack_cmd(g_e.ring + (size_t)i * BLT_CMD_BYTES, &c);
+        if (c.opcode == BLT_OP_TRILIST) n++;
+    }
+    return n;
+}
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_inited = false; g_frame_active = false;
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap
