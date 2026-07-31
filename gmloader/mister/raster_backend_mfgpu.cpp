@@ -66,6 +66,7 @@
 #include "raster_backend_convert.h"
 #include "fps_overlay.h"   // [OSD-fps] clamp + 7-seg digit table (Solarus port)
 #include "mf_seam_stat.h"   // [Phase 4 Stage A] submit-seam decomposition
+#include "mf_pending_clear.h"   // [Phase 4 Stage B] deferred full-screen clear
 extern "C" {
 #include "blt_emitter.h"
 #include "blt_wire.h"
@@ -376,6 +377,38 @@ static int g_cur_target = MF_TARGET_WORK;
 
 extern "C" void RasterBackend_MFGPU_SetAppSurface(uint32_t fbo, uint32_t tex) {
     g_appSurfFbo = fbo; g_appSurfTex = tex;
+}
+
+// [Phase 4 Stage B] Deferred full-screen clear. See mf_pending_clear.h for why
+// the decision cannot be made in mf_clear().
+static mf_pc_t g_pc;
+// Run totals: g_pc itself is reset every frame (mf_frame_begin), so a device
+// stat line or a host test that wants "since reinit" totals needs these.
+static uint32_t g_pc_dropped_total = 0, g_pc_emitted_total = 0;
+// Cached GMLOADER_MFGPU_DEFER_CLEAR read. A file-scope static (not a
+// function-local static like the brief's first draft) so a host test can force
+// it to re-resolve -- same idiom as mf_trace_v/RasterBackend_MFGPU_TestTraceReset
+// below, for the same reason: a function-local static cannot be reset from
+// outside the function, and RasterBackend_MFGPU_TestEnvReset needs to.
+static int g_defer_clear_v = -1;
+static int mf_defer_clear_on(void) {
+    if (g_defer_clear_v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_DEFER_CLEAR");
+        g_defer_clear_v = (e && *e) ? atoi(e) : 1;   // on by default: this is the lever
+    }
+    return g_defer_clear_v;
+}
+// mf_pending_clear's target is a COMPACT slot index (0/1, bounds-checked against
+// MF_PC_TARGETS==2 by mf_pc_valid_target). g_cur_target instead holds the raw
+// BLT_TARGET_* wire id (WORK=0, APPSURF=2) -- passing 2 straight through would
+// fail that bounds check and silently no-op every mf_pc_* call on the app
+// surface, which for mf_pc_record means the clear is simply never emitted at
+// all. Map explicitly rather than assume the two numberings coincide.
+static inline int mf_pc_slot_of(int blt_target) {
+    return (blt_target == MF_TARGET_APPSURF) ? 1 : 0;
+}
+static inline int mf_pc_target_of(int slot) {
+    return (slot == 1) ? MF_TARGET_APPSURF : MF_TARGET_WORK;
 }
 
 static inline uint16_t mf_rgb565(uint8_t r, uint8_t g, uint8_t b) {
@@ -1166,6 +1199,10 @@ static void mf_init_once(void) {
     g_fabric_pending = false; g_frame_dropped = false; g_drop_count = 0; g_drop_run = 0;
     g_last_draw.valid = false; g_dup_skipped = 0;
     g_appsurf_presented = false; g_crt_stripped = 0;
+    // [Phase 4 Stage B] host-test determinism: RasterBackend_MFGPU_TestReinit is
+    // the file's one "start clean" primitive, and every case uses it as such.
+    mf_pc_reset(&g_pc);
+    g_pc_dropped_total = 0; g_pc_emitted_total = 0;
     g_inited = true;
 }
 
@@ -1392,6 +1429,13 @@ static void mf_frame_begin(void) {
     // WORK (blt_execute's own default, matched by the RTL) -- see g_cur_target's
     // comment for why this reset (not just the variable's initial value) matters.
     g_cur_target = MF_TARGET_WORK;
+    // [Phase 4 Stage B] Fold last frame's counts into the run totals BEFORE
+    // resetting g_pc: g_pc itself only ever holds the current frame's tally.
+    g_pc_dropped_total += g_pc.dropped;
+    g_pc_emitted_total += g_pc.emitted;
+    // A deferred fill must never span frames -- the ring it would have gone
+    // into has just been rewound.
+    mf_pc_reset(&g_pc);
     g_frame_active = true;
     g_frame_no++;
 }
@@ -1423,7 +1467,16 @@ static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     (void)a;   // fabric FILL writes opaque RGB565; no alpha channel on the wire
     int w = d->w < BLT_FB_WIDTH  ? d->w : BLT_FB_WIDTH;
     int h = d->h < BLT_FB_HEIGHT ? d->h : BLT_FB_HEIGHT;
-    blt_fill(&g_e, 0, 0, w, h, mf_rgb565(r, g, b));
+    uint16_t col = mf_rgb565(r, g, b);
+    // [Phase 4 Stage B] Only a FULL-EXTENT clear is deferrable. A partial clear
+    // is not the redundant full-screen fill this lever targets, and deferring it
+    // would introduce a superseding rule (partial-then-full vs full-then-partial)
+    // that buys nothing.
+    if (mf_defer_clear_on() && w == BLT_FB_WIDTH && h == BLT_FB_HEIGHT) {
+        mf_pc_record(&g_pc, mf_pc_slot_of(g_cur_target), w, h, col);
+        return;
+    }
+    blt_fill(&g_e, 0, 0, w, h, col);
 }
 
 static bool evict_one_lru(void) {
@@ -1794,11 +1847,39 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         colorkey = 0;
     }
     g_last_trilist_blend = blend_mode;   // host-test hook (opaque-ALPHA -> COPY promotion)
+
+    // [Phase 4 Stage B] Discharge or drop the deferred full-screen clear. This
+    // is the only point where BOTH facts are known: that the draw survived every
+    // silent-discard path in mf_draw, and what fabric blend it actually resolved
+    // to. A COPY over the whole target writes every pixel, so the clear beneath
+    // it cannot be observed.
+    const int pc_target  = mf_pc_slot_of(g_cur_target);
+    const int pc_pending = mf_pc_pending(&g_pc, pc_target);
+    int pc_covers = 0;
+    if (pc_pending) {
+        if (nt == 2) {
+            float cxs[6], cys[6];
+            for (int i = 0; i < 6; i++) { cxs[i] = verts[i].x; cys[i] = verts[i].y; }
+            pc_covers = mf_pc_is_cover(blend_mode == BLT_BLEND_COPY, nt,
+                                       cxs, cys, BLT_FB_WIDTH, BLT_FB_HEIGHT);
+        }
+        if (!pc_covers) {
+            // Not provably covered: emit the fill FIRST, in the ring position it
+            // would have occupied had it never been deferred.
+            int fw, fh; uint16_t fc;
+            if (mf_pc_take(&g_pc, pc_target, &fw, &fh, &fc))
+                blt_fill(&g_e, 0, 0, fw, fh, fc);
+        }
+    }
+
     if (blt_trilist(&g_e, tex, blend_mode, colorkey, /*alpha=*/255,
                     eoff, nt, extra_flags) != 0) {
         fprintf(stderr, "backend_mfgpu: blt_trilist emit failed (%d tris) - draw dropped\n", nt);
         return;
     }
+    // Drop only once the covering draw is actually in the ring: a failed
+    // blt_trilist must leave the clear pending for a later draw or for frame end.
+    if (pc_pending && pc_covers) mf_pc_drop(&g_pc, pc_target);
     if (mf_trace_on() && mf_trace_in_window())
         mf_trace_group(tex, tw, th, blend_mode, colorkey, extra_flags, nt);
     // Coverage estimate (Task 4, moved here per review — see the long comment at
@@ -2358,6 +2439,17 @@ static void mf_frame_end(void) {
     // ring still holds the batch the fabric is reading. blt_end_frame would bump submit_seq
     // and the doorbell would then ack a batch that was never rebuilt, so return before both.
     if (g_frame_dropped) return;
+    // [Phase 4 Stage B] A frame that cleared and never drew still has to clear.
+    // Re-select the target explicitly: g_cur_target may have moved since the
+    // clear was recorded, and the fill must land on the buffer it was meant for.
+    for (int slot = 0; slot < MF_PC_TARGETS; slot++) {
+        int fw, fh; uint16_t fc;
+        if (mf_pc_take(&g_pc, slot, &fw, &fh, &fc)) {
+            int t = mf_pc_target_of(slot);
+            if (t != g_cur_target) { blt_set_target(&g_e, t); g_cur_target = t; }
+            blt_fill(&g_e, 0, 0, fw, fh, fc);
+        }
+    }
     // [Task 9 bring-up diagnostic] Log BEFORE blt_end_frame touches anything --
     // g_lru_frame_floor (set in mf_frame_begin) still delimits exactly this
     // frame's pinned working set at this point.
@@ -2371,6 +2463,8 @@ static void mf_frame_end(void) {
             fprintf(stderr, "MFDUP frames=%u dup_draws_elided=%u (+%u since last) crt_ghost_stripped=%u\n",
                     nf, g_dup_skipped, g_dup_skipped - last, g_crt_stripped);
             last = g_dup_skipped;
+            fprintf(stderr, "MFCLEAR frames=%u clears_dropped=%u clears_emitted=%u defer=%d\n",
+                    nf, g_pc_dropped_total, g_pc_emitted_total, mf_defer_clear_on());
         }
     }
 #endif
@@ -2661,6 +2755,33 @@ extern "C" int RasterBackend_MFGPU_TestLastTrilistBlend(void) { return g_last_tr
 extern "C" uint32_t RasterBackend_MFGPU_TestDupSkipped(void) { return g_dup_skipped; }
 // [strip in-game CRT simulation] old-TV ghost passes dropped.
 extern "C" uint32_t RasterBackend_MFGPU_TestCrtStripped(void) { return g_crt_stripped; }
+// [Phase 4 Stage B] deferred full-screen clear: witness counters (run totals +
+// whatever the in-flight frame has not yet folded in) and a ring-content probe.
+extern "C" uint32_t RasterBackend_MFGPU_TestClearsDropped(void) { return g_pc_dropped_total + g_pc.dropped; }
+extern "C" uint32_t RasterBackend_MFGPU_TestClearsEmitted(void) { return g_pc_emitted_total + g_pc.emitted; }
+// Count BLT_OP_FILL entries currently in g_e's command list (the ring, not a
+// decoded copy) -- valid any time after present()/frame_end closes the frame.
+extern "C" uint32_t RasterBackend_MFGPU_TestFillCommandCount(void) {
+    uint32_t n = 0;
+    for (int i = 0; i < g_e.cmd_count; i++) {
+        blt_cmd_t c;
+        blt_unpack_cmd(g_e.ring + (size_t)i * BLT_CMD_BYTES, &c);
+        if (c.opcode == BLT_OP_FILL) n++;
+    }
+    return n;
+}
+extern "C" int RasterBackend_MFGPU_TestFirstCommandIsFill(void) {
+    if (g_e.cmd_count <= 0) return 0;
+    blt_cmd_t c;
+    blt_unpack_cmd(g_e.ring, &c);
+    return c.opcode == BLT_OP_FILL;
+}
+// [Phase 4 Stage B] host-test-only hook: force GMLOADER_MFGPU_DEFER_CLEAR's
+// cached getenv() read to re-resolve. Same rationale + idiom as
+// RasterBackend_MFGPU_TestTraceReset above (GMLOADER_MFGPU_TRACE): a host case
+// that sets the env var mid-run needs the cache cleared, or it only works as
+// the first thing in the binary to call mf_defer_clear_on().
+extern "C" void RasterBackend_MFGPU_TestEnvReset(void) { g_defer_clear_v = -1; }
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_inited = false; g_frame_active = false;
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap
@@ -2673,6 +2794,12 @@ extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_seam_frame_ms  = 0.0;            // [Finding 2] stale fabric-ms from a prior run
     g_seam_incomplete = 0;             // [Finding 2] stale skipped-sample count from a prior run
 }
+// [Phase 4 Stage B] Alias over the established "start clean" primitive. No
+// bespoke whole-state reset hook existed before this task -- every other case
+// in this file already uses RasterBackend_MFGPU_TestReinit(0) for that job: it
+// re-runs mf_init_once (which now also clears g_pc/g_pc_dropped_total/
+// g_pc_emitted_total, see mf_init_once's [Phase 4 Stage B] block).
+extern "C" void RasterBackend_MFGPU_TestReset(void) { RasterBackend_MFGPU_TestReinit(0); }
 
 // Free the cached entry for GL texture `id` so the next draw re-stages it. Called
 // by blitter.cpp on TexImage2D re-upload and DeleteTexture — exactly when the SW

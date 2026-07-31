@@ -120,6 +120,17 @@ extern "C" int RasterBackend_MFGPU_TestFrameNo(void);
 // reads to re-resolve. See raster_backend_mfgpu.cpp's hook comment.
 extern "C" void RasterBackend_MFGPU_TestTraceReset(void);
 
+// [Phase 4 Stage B] deferred full-screen clear: witness counters + env-cache reset.
+// TestReset is a thin alias over TestReinit(0) (see the definition site for why: no
+// bespoke "reset everything" hook existed before this task, and every other case in
+// this file already uses TestReinit(0) as that primitive).
+extern "C" void     RasterBackend_MFGPU_TestReset(void);
+extern "C" void     RasterBackend_MFGPU_TestEnvReset(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestClearsDropped(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestClearsEmitted(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestFillCommandCount(void);
+extern "C" int      RasterBackend_MFGPU_TestFirstCommandIsFill(void);
+
 extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
 
 // Task 1: tiny monotonic key so each battery case gets a distinct tex_key —
@@ -2557,6 +2568,176 @@ static int case_strip_crt_mask(void) {
     return 1;
 }
 
+// ── [Phase 4 Stage B] deferred full-screen clear ─────────────────────────────
+// Local plumbing named to match the task brief's helper names, built from this
+// file's existing idiom (a static BW x BH RGBA8888 surface + SetDefaultSurface,
+// same shape as every other case's rgba_mf/s_mf pair).
+static void mf_test_make_default_surface(RSurface *d) {
+    static uint8_t rgba[BW*BH*4];
+    d->rgba = rgba; d->w = BW; d->h = BH; d->fbo = 0;
+    RasterBackend_MFGPU_SetDefaultSurface(rgba);
+}
+
+// Two triangles covering [0,BW]x[0,BH] exactly, split along the TL-BR diagonal
+// (tri0 = TL,TR,BR; tri1 = TL,BR,BL) -- the tiling mf_pc_is_cover requires.
+static void mf_test_make_full_screen_quad(BVtx *q) {
+    q[0] = BVtx{   0.f,        0.f,        0,0, 1,1,1,1 };
+    q[1] = BVtx{ (float)BW,    0.f,        1,0, 1,1,1,1 };
+    q[2] = BVtx{ (float)BW,  (float)BH,    1,1, 1,1,1,1 };
+    q[3] = BVtx{   0.f,        0.f,        0,0, 1,1,1,1 };
+    q[4] = BVtx{ (float)BW,  (float)BH,    1,1, 1,1,1,1 };
+    q[5] = BVtx{   0.f,      (float)BH,    0,1, 1,1,1,1 };
+}
+
+// A small fully-opaque (alpha==255 everywhere) texture: has_key stays false, so
+// RB_NONE resolves straight to BLT_BLEND_COPY and RB_ALPHA is eligible for the
+// opaque-ALPHA -> COPY promotion in mf_emit_group.
+static const RTexture *mf_test_opaque_texture(void) {
+    static uint8_t tex[4*4*4];
+    for (int i = 0; i < 4*4; i++) {
+        tex[i*4+0] = 180; tex[i*4+1] = 180; tex[i*4+2] = 180; tex[i*4+3] = 255;
+    }
+    static RTexture t = { tex, 4, 4, 1, 1, /*RTEX_RGBA8888*/0, 1 };
+    return &t;
+}
+
+// [Phase 4 Stage B] The deferred clear must be invisible in the emitted ring
+// whenever the frame's first draw provably repaints the screen, and must appear
+// -- in its original position, before the draw -- whenever it does not.
+static int case_deferred_clear_drops_under_a_full_copy_quad(void) {
+    RasterBackend_MFGPU_TestReset();
+    setenv("GMLOADER_MFGPU_DEFER_CLEAR", "1", 1);
+    RasterBackend_MFGPU_TestEnvReset();
+
+    RSurface d; mf_test_make_default_surface(&d);
+    backend_mfgpu.clear(&d, 0, 0, 0, 255);
+
+    // A full-screen 2-tri quad with RB_NONE resolves to BLT_BLEND_COPY.
+    BVtx q[6]; mf_test_make_full_screen_quad(q);
+    backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_NONE, 1.0f, 0x1001);
+    backend_mfgpu.present(&d);
+
+    uint32_t dropped = RasterBackend_MFGPU_TestClearsDropped();
+    uint32_t emitted = RasterBackend_MFGPU_TestClearsEmitted();
+    uint32_t fills    = RasterBackend_MFGPU_TestFillCommandCount();
+    if (dropped != 1 || emitted != 0 || fills != 0) {
+        printf("  FAIL deferred-clear-drop  dropped=%u(want 1) emitted=%u(want 0) fills=%u(want 0)\n",
+               dropped, emitted, fills);
+        return 0;
+    }
+    printf("  OK   deferred-clear-drop  clear proven redundant under a full COPY quad, dropped\n");
+    return 1;
+}
+
+static int case_deferred_clear_emits_under_an_alpha_draw(void) {
+    RasterBackend_MFGPU_TestReset();
+    setenv("GMLOADER_MFGPU_DEFER_CLEAR", "1", 1);
+    RasterBackend_MFGPU_TestEnvReset();
+
+    RSurface d; mf_test_make_default_surface(&d);
+    BVtx q[6]; mf_test_make_full_screen_quad(q);
+    // Prime the texture cache with a no-clear frame so the real frame below is a
+    // cache HIT: otherwise the first-use BLT_OP_STAGE upload (unconditional on a
+    // cache miss, see raster_backend_mfgpu.cpp's stage_texture) would legitimately
+    // sit ahead of the fill in the ring, which is not what this case is proving.
+    backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_NONE, 1.0f, 0x1002);
+    backend_mfgpu.present(&d);
+
+    backend_mfgpu.clear(&d, 0, 0, 0, 255);
+
+    // A translucent full-screen quad -- the obj_fade_in / obj_fade_out case.
+    // Dropping the clear here would blank the whole transition.
+    for (int i = 0; i < 6; i++) q[i].a = 0.5f;
+    backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_ALPHA, 1.0f, 0x1002);
+    backend_mfgpu.present(&d);
+
+    uint32_t dropped = RasterBackend_MFGPU_TestClearsDropped();
+    uint32_t emitted = RasterBackend_MFGPU_TestClearsEmitted();
+    uint32_t fills    = RasterBackend_MFGPU_TestFillCommandCount();
+    int first_is_fill = RasterBackend_MFGPU_TestFirstCommandIsFill();
+    if (dropped != 0 || emitted != 1 || fills != 1 || first_is_fill != 1) {
+        printf("  FAIL deferred-clear-alpha-survives  dropped=%u(want 0) emitted=%u(want 1) "
+               "fills=%u(want 1) first_is_fill=%d(want 1)\n",
+               dropped, emitted, fills, first_is_fill);
+        return 0;
+    }
+    printf("  OK   deferred-clear-alpha-survives  a translucent full-screen draw does not drop "
+           "the clear beneath it, and the fill stays first in the ring\n");
+    return 1;
+}
+
+static int case_deferred_clear_emits_when_no_draw_follows(void) {
+    RasterBackend_MFGPU_TestReset();
+    setenv("GMLOADER_MFGPU_DEFER_CLEAR", "1", 1);
+    RasterBackend_MFGPU_TestEnvReset();
+
+    RSurface d; mf_test_make_default_surface(&d);
+    backend_mfgpu.clear(&d, 0, 0, 0, 255);
+    backend_mfgpu.present(&d);           // frame ends with the fill undecided
+
+    uint32_t emitted = RasterBackend_MFGPU_TestClearsEmitted();
+    uint32_t fills    = RasterBackend_MFGPU_TestFillCommandCount();
+    if (emitted != 1 || fills != 1) {
+        printf("  FAIL deferred-clear-flush-at-end  emitted=%u(want 1) fills=%u(want 1)\n",
+               emitted, fills);
+        return 0;
+    }
+    printf("  OK   deferred-clear-flush-at-end  a clear with no following draw still clears\n");
+    return 1;
+}
+
+static int case_deferred_clear_off_is_the_old_behaviour(void) {
+    RasterBackend_MFGPU_TestReset();
+    setenv("GMLOADER_MFGPU_DEFER_CLEAR", "0", 1);
+    RasterBackend_MFGPU_TestEnvReset();
+
+    RSurface d; mf_test_make_default_surface(&d);
+    backend_mfgpu.clear(&d, 0, 0, 0, 255);
+    BVtx q[6]; mf_test_make_full_screen_quad(q);
+    backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_NONE, 1.0f, 0x1003);
+    backend_mfgpu.present(&d);
+
+    uint32_t dropped = RasterBackend_MFGPU_TestClearsDropped();
+    uint32_t fills    = RasterBackend_MFGPU_TestFillCommandCount();
+    if (dropped != 0 || fills != 1) {
+        printf("  FAIL deferred-clear-off  dropped=%u(want 0) fills=%u(want 1)\n", dropped, fills);
+        return 0;
+    }
+    printf("  OK   deferred-clear-off  GMLOADER_MFGPU_DEFER_CLEAR=0 restores the old undeferred emit\n");
+    return 1;
+}
+
+// [Phase 4 Stage B regression] mf_pending_clear's target is a COMPACT slot
+// index (0/1, bounds-checked against MF_PC_TARGETS==2); g_cur_target instead
+// holds the raw BLT_TARGET_* wire id (WORK=0, APPSURF=2). Passing 2 straight
+// through fails that bounds check and silently drops the record -- an
+// app-surface clear would vanish entirely whenever defer is on (the default),
+// with no error and no fallback fill. Pins that the app-surface target is
+// mapped, not passed through raw.
+static int case_deferred_clear_appsurf_target_not_swallowed(void) {
+    const uint32_t APPSURF_FBO = 90, APPSURF_TEX = 91;
+    RasterBackend_MFGPU_SetAppSurface(APPSURF_FBO, APPSURF_TEX);
+    RasterBackend_MFGPU_TestReset();
+    setenv("GMLOADER_MFGPU_DEFER_CLEAR", "1", 1);
+    RasterBackend_MFGPU_TestEnvReset();
+
+    static uint8_t rgba[BW*BH*4];
+    RSurface d = { rgba, BW, BH, APPSURF_FBO };
+    backend_mfgpu.clear(&d, 0, 0, 0, 255);
+    backend_mfgpu.present(&d);   // no draw follows: frame-end must flush it
+
+    uint32_t emitted = RasterBackend_MFGPU_TestClearsEmitted();
+    uint32_t fills    = RasterBackend_MFGPU_TestFillCommandCount();
+    RasterBackend_MFGPU_SetAppSurface(0, 0);
+    if (emitted != 1 || fills != 1) {
+        printf("  FAIL deferred-clear-appsurf-target  emitted=%u(want 1) fills=%u(want 1) "
+               "-- an app-surface-target clear must not be silently dropped\n", emitted, fills);
+        return 0;
+    }
+    printf("  OK   deferred-clear-appsurf-target  an app-surface-target clear survives to frame end\n");
+    return 1;
+}
+
 // ── [Phase 3 Stage A] GMLOADER_MFGPU_TRACE draw-stream capture (Task 2) ──────
 // Local plumbing named to match the task brief's helper names, built from
 // this file's existing reinit/draw/end-frame idiom (case_cache_hit /
@@ -2773,6 +2954,16 @@ int main(void){
     else printf("raster_backend mfgpu-strip-crt OK\n");
     if (!case_strip_crt_mask()) { printf("FAIL mfgpu-strip-mask\n"); ok = 0; }
     else printf("raster_backend mfgpu-strip-mask OK\n");
+    if (!case_deferred_clear_drops_under_a_full_copy_quad()) { printf("FAIL mfgpu-defer-clear-drop\n"); ok = 0; }
+    else printf("raster_backend mfgpu-defer-clear-drop OK\n");
+    if (!case_deferred_clear_emits_under_an_alpha_draw()) { printf("FAIL mfgpu-defer-clear-alpha\n"); ok = 0; }
+    else printf("raster_backend mfgpu-defer-clear-alpha OK\n");
+    if (!case_deferred_clear_emits_when_no_draw_follows()) { printf("FAIL mfgpu-defer-clear-flush\n"); ok = 0; }
+    else printf("raster_backend mfgpu-defer-clear-flush OK\n");
+    if (!case_deferred_clear_off_is_the_old_behaviour()) { printf("FAIL mfgpu-defer-clear-off\n"); ok = 0; }
+    else printf("raster_backend mfgpu-defer-clear-off OK\n");
+    if (!case_deferred_clear_appsurf_target_not_swallowed()) { printf("FAIL mfgpu-defer-clear-appsurf\n"); ok = 0; }
+    else printf("raster_backend mfgpu-defer-clear-appsurf OK\n");
     // Deliberately registered LAST, after every other case has already called
     // backend_mfgpu.draw() many times over: proves RasterBackend_MFGPU_TestTraceReset()
     // actually makes this case position-independent rather than merely untested at
