@@ -59,6 +59,12 @@ extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void);
 // (publish) and how many times it waited for the ack (await), since reinit.
 extern "C" uint32_t RasterBackend_MFGPU_TestPublishCount(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void);
+// [Phase 4 W3 Stage A] Doorbell-delay probe. The knob inserts a busy-wait between the
+// await returning and the doorbell being rung, so a device sweep can find the knee at
+// which `period` starts tracking the delay 1:1 -- that knee is the fabric's post-C_DONE
+// dead time, the component of `notice` the W3 spec calls inferred and never measured.
+extern "C" long   RasterBackend_MFGPU_TestPublishDelayUs(void);
+extern "C" double RasterBackend_MFGPU_TestSpinDelayMs(void);
 // awaits that ran with no batch in flight — the only way to observe publish/await ORDER on
 // a host build, where both halves are near-no-ops and counters look identical either way.
 extern "C" uint32_t RasterBackend_MFGPU_TestUnpairedAwaits(void);
@@ -2981,6 +2987,44 @@ static int case_mfgpu_trace_capture(void) {
     return 1;
 }
 
+static void test_publish_delay_knob(void) {
+    // Default (unset) must be 0 -- the knob is a probe and must cost nothing when off.
+    unsetenv("GMLOADER_MFGPU_PUBLISH_DELAY_US");
+    RasterBackend_MFGPU_TestReinit(0);
+    if (RasterBackend_MFGPU_TestPublishDelayUs() != 0) {
+        printf("FAIL: publish delay default is %ld, want 0\n",
+               RasterBackend_MFGPU_TestPublishDelayUs());
+        exit(1);
+    }
+    // With the knob off, the delay call must be effectively free.
+    double off_ms = RasterBackend_MFGPU_TestSpinDelayMs();
+    if (off_ms > 0.05) {
+        printf("FAIL: disabled publish delay spun %.3f ms, want <= 0.05\n", off_ms);
+        exit(1);
+    }
+    printf("  publish delay: default off, spin %.4f ms\n", off_ms);
+}
+
+static void test_publish_delay_spins(void) {
+    // 400 us is the middle of the sweep range the device probe uses.
+    setenv("GMLOADER_MFGPU_PUBLISH_DELAY_US", "400", 1);
+    RasterBackend_MFGPU_TestReinit(0);
+    if (RasterBackend_MFGPU_TestPublishDelayUs() != 400) {
+        printf("FAIL: parsed publish delay is %ld, want 400\n",
+               RasterBackend_MFGPU_TestPublishDelayUs());
+        exit(1);
+    }
+    double ms = RasterBackend_MFGPU_TestSpinDelayMs();
+    // Lower bound is the contract. Upper bound catches a nanosleep-style
+    // implementation whose scheduler granularity would blur the knee the device
+    // sweep is looking for: the whole measurement rests on the delay being the
+    // value asked for, not "at least" it rounded up to a timer tick.
+    if (ms < 0.400) { printf("FAIL: spun %.3f ms, want >= 0.400\n", ms); exit(1); }
+    if (ms > 0.600) { printf("FAIL: spun %.3f ms, want <= 0.600\n", ms); exit(1); }
+    printf("  publish delay: 400 us requested, %.4f ms spun\n", ms);
+    unsetenv("GMLOADER_MFGPU_PUBLISH_DELAY_US");
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -3081,5 +3125,7 @@ int main(void){
     // a later position.
     if (!case_mfgpu_trace_capture()) { printf("FAIL mfgpu-trace\n"); ok = 0; }
     else printf("raster_backend mfgpu-trace OK\n");
+    test_publish_delay_knob();
+    test_publish_delay_spins();
     return ok ? 0 : 1;
 }

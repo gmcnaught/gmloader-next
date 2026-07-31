@@ -970,6 +970,51 @@ static inline void mf_ctrl_barrier(void) {
     __sync_synchronize();
 }
 
+// [Phase 4 W3 Stage A] Doorbell-delay probe (GMLOADER_MFGPU_PUBLISH_DELAY_US, 0 = off,
+// the shipping default). Inserted between the await returning and the doorbell being
+// rung, i.e. inside the seam's `pub` term.
+//
+// WHY IT MEASURES SOMETHING. `pub` is 0.00 ms on 159 of 160 Stage A windows, so the
+// host rings the next doorbell the instant it observes C_DONE. If the fabric is still
+// in its S_SNAP_* WORK->DDR copy tail at that moment it is not polling C_SUBMIT, and
+// the doorbell waits -- that wait lands in the NEXT sample's `notice`, not in any host
+// term. So: sweep this delay and watch `period`. While the delay is shorter than the
+// fabric's dead time the fabric was not listening anyway and `period` does not move;
+// past it, every microsecond adds 1:1. The knee is the fabric-side share of `notice`.
+//
+// A SPIN, NOT A SLEEP, ON PURPOSE. nanosleep rounds up to the scheduler tick, which is
+// coarser than the 0.1-0.8 ms window the knee is expected in -- the rounding would BE
+// the measurement. This burns a core for at most the swept delay, on a probe path.
+//
+// Deliberately placed here, OUTSIDE #ifdef MISTER_NATIVE_VIDEO (unlike mf_poll_us just
+// above, which is inside it): mf_device_publish's body compiles in BOTH builds so the
+// host oracle can check write order, and this probe is called from that body, so it
+// and its host-test hooks (further below) must be reachable in the host build too.
+//
+// File-scope (not a function-local static like mf_poll_us's `v`) so the host test can
+// force a re-read of the env var: RasterBackend_MFGPU_TestReinit -> mf_init_once resets
+// this to -1 between arms, since a function-local static has no such reset hook.
+static long g_publish_delay_us = -1;   // -1 = unparsed; see mf_publish_delay_us
+static long mf_publish_delay_us(void) {
+    if (g_publish_delay_us < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_PUBLISH_DELAY_US");
+        g_publish_delay_us = (e && *e) ? atol(e) : 0;
+        if (g_publish_delay_us < 0) g_publish_delay_us = 0;
+    }
+    return g_publish_delay_us;
+}
+static void mf_publish_delay(void) {
+    const long us = mf_publish_delay_us();
+    if (us <= 0) return;
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed_us = (now.tv_sec - t0.tv_sec) * 1000000L
+                        + (now.tv_nsec - t0.tv_nsec) / 1000L;
+        if (elapsed_us >= us) return;
+    }
+}
+
 // ── SUBMIT SEAM (Phase 1 B2) ─────────────────────────────────────────────────
 // The frame's handoff to the fabric, in three parts: mf_device_publish (control-block
 // mirror, barrier, doorbell), mf_device_await (poll C_DONE), and mf_device_submit, which
@@ -1056,6 +1101,7 @@ static void mf_device_publish(void) {
         srcsel = (srcsel & ~(1u << 2)) | ((g_arena & 1u) << 2);
         mf_ctrl_wr(MF_C_SRCSEL, srcsel);
     }
+    mf_publish_delay();                         // [W3 Stage A] probe: delay the doorbell
     mf_ctrl_barrier();                          // data before doorbell (traced)
     mf_ctrl_wr(MF_C_SUBMIT, g_e.submit_seq);    // doorbell LAST
     g_last_published_seq = g_e.submit_seq;      // [Phase 2 host lever] seam witness
@@ -1195,6 +1241,7 @@ static void mf_init_once(void) {
     g_frame_ovf_cause = MF_OVF_UNKNOWN;            // [Phase 1 B3] per-frame overflow cause
     g_lru_evict_floor = 0;                         // [Phase 1 B3] lagging floor
     g_publish_count = 0; g_await_count = 0;   // [Phase 1 B2] submit-seam counters
+    g_publish_delay_us = -1;   // [W3 Stage A] re-read the probe knob on reinit
     g_arena = 0;                                                              // [Phase 1 B1] arena parity
     g_publish_depth = 0; g_unpaired_awaits = 0; g_seam_depth_violations = 0;  // [Phase 1 B2] ordering witness
     g_last_published_seq = 0; g_last_awaited_seq = 0;   // [Phase 2 host lever] seam witnesses
@@ -2841,6 +2888,15 @@ extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy) {
 extern "C" uint32_t RasterBackend_MFGPU_TestDropCount(void) { return g_drop_count; }
 // [Phase 1 B2] host-test hooks: prove publish and await are separable and each ran once.
 extern "C" uint32_t RasterBackend_MFGPU_TestPublishCount(void) { return g_publish_count; }
+// [Phase 4 W3 Stage A] Probe-knob observability for the host test.
+extern "C" long RasterBackend_MFGPU_TestPublishDelayUs(void) { return mf_publish_delay_us(); }
+extern "C" double RasterBackend_MFGPU_TestSpinDelayMs(void) {
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    mf_publish_delay();
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    return (b.tv_sec - a.tv_sec) * 1000.0 + (b.tv_nsec - a.tv_nsec) / 1e6;
+}
 extern "C" uint32_t RasterBackend_MFGPU_TestAwaitCount(void)   { return g_await_count; }
 // [Phase 1 B2] Ordering witness: awaits that ran with no batch in flight, and publishes
 // issued while one was already in flight. Both must always be 0 — counters alone cannot see
