@@ -883,7 +883,9 @@ static inline double mf_seam_ms(const struct timespec *a, const struct timespec 
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
-#include <stdlib.h>   // getenv (GMLOADER_MFSUBMIT_STAT instrumentation)
+#include <stdlib.h>   // getenv (GMLOADER_MFSUBMIT_STAT instrumentation), abort
+#include <errno.h>    // mf_map_wc_overlay diagnostics
+#include <string.h>   // strerror
 // <time.h> was here; hoisted to the top includes when mf_device_publish stopped being
 // device-only and needed clock_gettime in both builds.
 enum {
@@ -910,6 +912,36 @@ enum {
     MF_DEV_SRC_CAP   = MF_DEV_TLBUF_OFF - MF_DEV_SRC_OFF,
     MF_DEV_DONE_TIMEOUT_MS = 200,
     // MF_C_* register indices moved above the guard: publish's body compiles in both builds.
+
+    // ── WRITE-COMBINING SUB-WINDOW (mem_wc) ─────────────────────────────────
+    // The half of the 16 MiB window that is HOST-WRITE / FABRIC-READ only, and
+    // is therefore safe to remap Normal Non-Cacheable. See mf_map_wc_overlay.
+    //
+    //   0x3B000000..+0x001000  BLTCTRL: C_SUBMIT doorbell, C_DONE/C_STATUS polled   SO
+    //   0x3B001000..+0x080000  ring A (from 0x1000) + ring B                        WC
+    //   0x3B080000..+0xF40000  SRC texture heap                                     WC
+    //   0x3BF40000..end        tilelist buf + SCANFRM (fabric-written, host-read)    SO
+    //
+    // The split is PAGE-EXACT and the boundaries are not negotiable:
+    //
+    //  - The doorbell must not be write-combined. It is one 32-bit store with no
+    //    traffic behind it to force a drain, so under WC it can sit in the write
+    //    buffer while blitter_top.sv's prologue polls a stale C_SUBMIT. Its
+    //    transaction cost is irrelevant; its ordering is not.
+    //  - C_DONE and C_STATUS are written by the FABRIC and polled by us. Leave
+    //    the whole control page alone rather than reason about NC read
+    //    behaviour on a location another master owns.
+    //  - No page may be mapped at two memory types. The MAP_FIXED overlay
+    //    REPLACES the strongly-ordered pages rather than aliasing them; a
+    //    mismatched alias is architecturally unpredictable on ARMv7.
+    //
+    // Cost of starting at page 1 rather than at RING_OFF: ring A's first 0xFC0
+    // bytes (~126 of ~8190 commands) stay strongly-ordered, because ring A
+    // begins 0x40 into page 0 behind BLTCTRL. That is ~1.5% of the ring's
+    // capacity in exchange for the window staying two linear pointers instead
+    // of the emitter growing a straddling special case.
+    MF_DEV_WC_OFF    = 0x00001000u,   // first page after BLTCTRL
+    MF_DEV_WC_END    = MF_DEV_TLBUF_OFF,   // end of the SRC heap
 };
 static volatile uint8_t *g_dev_base = nullptr;   // mmap of 0x3B000000
 static volatile uint8_t *g_dev_ctrl = nullptr;   // = base (control block)
@@ -917,6 +949,7 @@ static uint8_t          *g_dev_ring = nullptr;   // = base + RING_OFF
 static uint8_t          *g_dev_ring_b = nullptr; // [Phase 1 B1] = base + RING_B_OFF
 static uint8_t          *g_dev_src  = nullptr;   // = base + SRC_OFF
 static bool              g_dev_ok   = false;     // mmap ok -> submits reach the fabric
+static bool              g_dev_wc   = false;     // rings + SRC heap are Normal-NC, not SO
 
 static inline uint32_t mf_ctrl_rd(int qw) {
     return *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u);
@@ -924,6 +957,87 @@ static inline uint32_t mf_ctrl_rd(int qw) {
 static inline uint32_t mf_ctrl_rd_hi(int qw) {
     return *(volatile uint32_t *)(g_dev_ctrl + (size_t)qw * 8u + 4u);   // high u32 of the qword
 }
+// GMLOADER_NO_WC=1 forces the strongly-ordered /dev/mem mapping even when
+// mem_wc is loaded. That is the A/B arm — no rmmod, no relaunch of anything
+// else — and the escape hatch if write-combining is ever suspected in a bug.
+static int mf_no_wc(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_NO_WC"); v = (e && *e) ? 1 : 0; }
+    return v;
+}
+
+// Overlay [WC_OFF, WC_END) of an already-mapped window with a write-combining
+// mapping of the same physical pages, via skmp/minicast's mem_wc driver.
+//
+// WHY THIS EXISTS. ARM's phys_mem_access_prot() (arch/arm/mm/mmu.c) returns
+// pgprot_noncached() -- Strongly-Ordered -- for any pfn where pfn_valid() is
+// false, and only reaches the O_SYNC test that would give pgprot_writecombine()
+// when it is true. /proc/iomem on the DE10-Nano puts System RAM at
+// 0x00000000-0x1fefffff, so 0x3B000000 is outside the kernel's memblock and
+// ALWAYS takes the first branch: no argument to /dev/mem yields write-combining.
+// Strongly-Ordered stores cannot merge, so each is its own bus transaction.
+// Measured on .81 (kernel 5.15.1-MiSTer, mamester's tools/mister/ddr-write-bench):
+//   memcpy to /dev/mem      80.3 MB/s      (O_SYNC and no-O_SYNC identical)
+//   memcpy to /dev/mem_wc  813.9 MB/s      10.1x
+// Our SRC-heap traffic is the texture upload path (blt_upload's per-row memcpy
+// in 3rdparty/mfgpu/host/blt_emitter.c), which is ~0 in steady state but is the
+// whole cost of a scene transition: the ~20 MB spritesheet set that overflows
+// the 14.75 MB heap is 250 ms of stores at 80 MB/s and 25 ms at 814.
+//
+// OPTIONAL BY CONSTRUCTION. mem_wc is built out-of-tree against one MiSTer
+// kernel's vermagic, so a MiSTer update makes insmod start failing on users'
+// machines. That must cost frame rate, not boot: every failure below falls back
+// to the strongly-ordered mapping we already have and the engine runs exactly
+// as it does today.
+static bool mf_map_wc_overlay(volatile uint8_t *base) {
+    if (mf_no_wc()) return false;
+
+    int fd = open("/dev/mem_wc", O_RDWR);
+    if (fd < 0) return false;   // module not loaded -- expected, not an error
+
+    const size_t len  = (size_t)(MF_DEV_WC_END - MF_DEV_WC_OFF);
+    const off_t  phys = (off_t)(MF_DEV_PHYS_BASE + MF_DEV_WC_OFF);
+
+    // PROBE AT A SCRATCH ADDRESS FIRST, and this is not belt-and-braces.
+    // MAP_FIXED unmaps its target range BEFORE the driver's .mmap runs. mem_wc
+    // loaded with an allowlist that does not cover our window returns -EPERM,
+    // and a rejected overlay would leave a HOLE from 0x3B001000 to 0x3BF40000
+    // rather than the strongly-ordered mapping we started from. The next
+    // blt_upload then takes SIGSEGV inside the heap allocator -- a fault that
+    // reads as an allocator bug, at an address the allocator computed
+    // correctly. So: map it somewhere harmless, see whether the driver accepts
+    // the range at all, and only then commit.
+    void *probe = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, phys);
+    if (probe == MAP_FAILED) {
+        fprintf(stderr, "backend_mfgpu: /dev/mem_wc rejected 0x%08lx+0x%zx (%s)"
+                        " -- staying strongly-ordered\n",
+                (unsigned long)phys, len, strerror(errno));
+        close(fd);
+        return false;
+    }
+    munmap(probe, len);
+
+    void *ov = mmap((void *)(base + MF_DEV_WC_OFF), len, PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_FIXED, fd, phys);
+    close(fd);
+    if (ov != MAP_FAILED) return true;
+
+    // The probe passed and the overlay still failed, so the SO pages are gone
+    // and the hole above is now real. Put them back or nothing can render.
+    int mfd = open("/dev/mem", O_RDWR | O_SYNC);
+    void *restore = (mfd < 0) ? MAP_FAILED
+                  : mmap((void *)(base + MF_DEV_WC_OFF), len, PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_FIXED, mfd, phys);
+    if (mfd >= 0) close(mfd);
+    if (restore == MAP_FAILED) {
+        fprintf(stderr, "backend_mfgpu: FATAL -- WC overlay failed and the "
+                        "strongly-ordered mapping could not be restored\n");
+        abort();   // the alternative is a SIGSEGV later, somewhere unrelated
+    }
+    fprintf(stderr, "backend_mfgpu: WC overlay failed, restored strongly-ordered\n");
+    return false;
+}
+
 // Open /dev/mem + mmap the DDR blitter region once (mirrors native_video_writer.c).
 static bool mf_ddr_map(void) {
     if (g_dev_base) return g_dev_ok;
@@ -933,6 +1047,13 @@ static bool mf_ddr_map(void) {
                    fd, (off_t)MF_DEV_PHYS_BASE);
     close(fd);   // the mapping outlives the fd
     if (m == MAP_FAILED) { fprintf(stderr, "backend_mfgpu: mmap 0x3B000000 failed\n"); return false; }
+    // Overlay the host-write-only half write-combining, if mem_wc is available.
+    // Done BEFORE the control-block memset and before any pointer is published,
+    // so nothing has written through a mapping that is about to be replaced.
+    g_dev_wc = mf_map_wc_overlay((volatile uint8_t *)m);
+    fprintf(stderr, "backend_mfgpu: DDR window 0x%08x+%uMiB, rings+heap %s\n",
+            (unsigned)MF_DEV_PHYS_BASE, (unsigned)(MF_DEV_MAP_SIZE >> 20),
+            g_dev_wc ? "write-combined (/dev/mem_wc)" : "strongly-ordered (/dev/mem)");
     g_dev_base = (volatile uint8_t *)m;
     g_dev_ctrl = g_dev_base;
     g_dev_ring = (uint8_t *)(g_dev_base + MF_DEV_RING_OFF);
@@ -1127,12 +1248,17 @@ static void mf_submit_stat(const struct timespec *t0, long iters, int timeout) {
         fprintf(stderr, "MFSUBMIT n=%u wait_ms[avg=%.2f] fabric_ms[frame=%.2f tri=%.2f "
                 "texwait=%.2f dpath=%.2f ovhd=%.2f] cov_px=%.0f cov_px_est=%.0f "
                 "est_ratio=%s overdraw=%.2f cyc_px=%.1f cov_src=%s spin_avg=%ld to=%u "
-                "snap=%.3f detect=%.3f blk=%u cmds=%.1f groups=%.1f tris=%.1f batch=%d\n",
+                "snap=%.3f detect=%.3f blk=%u cmds=%.1f groups=%.1f tris=%.1f batch=%d "
+                // Self-labelling A/B: GMLOADER_NO_WC=1 and a missing mem_wc.ko are
+                // indistinguishable in a log otherwise, and they are the two ways a
+                // "write-combining made no difference" table gets written by accident.
+                "ddr=%s\n",
                 n, (sum/30.0)/1e3, f, t, x, dpath_ms, f-t,
                 e, c, ratio_buf, d.overdraw, d.cyc_px,
                 d.estimated ? "est" : "exact", it_sum/30, to,
                 nsum/nb, dsum/nb, nblk,
-                msum/30.0, gsum/30.0, rsum/30.0, mf_batch_on());
+                msum/30.0, gsum/30.0, rsum/30.0, mf_batch_on(),
+                g_dev_wc ? "write-combined" : "strongly-ordered");
         sum = 0; it_sum = 0; to = 0;
         fsum = 0; tsum = 0; xsum = 0; csum = 0; esum = 0;
         nsum = 0; dsum = 0; nblk = 0;   // [W3 Stage C]
@@ -1162,13 +1288,42 @@ static inline void mf_ctrl_wr(int qw, uint32_t v) {
 #endif
 }
 
+// THE BARRIER, and it is `dsb sy` for a reason.
+//
+// __sync_synchronize() lowers to `dmb ish` on ARMv7 -- INNER-SHAREABLE, i.e. the
+// A9 cluster's own coherency domain. The fabric does not live there: it reaches
+// DDR through the f2h SDRAM ports, outside that domain, so `dmb ish` never
+// ordered our stores against blitter_top.sv's reads at all.
+//
+// That was harmless only by accident. Under the strongly-ordered /dev/mem
+// mapping the MEMORY TYPE did the ordering by itself -- SO stores cannot be
+// buffered, merged or reordered, so the ring and the heap were always visible
+// before the doorbell no matter what barrier stood here. The write-combining
+// overlay removes exactly that guarantee: Normal Non-Cacheable stores sit in
+// the write buffer until something drains them, and an SO doorbell store is NOT
+// ordered against earlier Normal-NC stores either. So this barrier stops being
+// decorative the moment mem_wc loads, and its failure mode is a torn frame
+// every few thousand publishes -- the class of bug that gets misattributed to
+// the rasterizer.
+//
+// `dsb sy` is full-system and, unlike a dmb, waits for the write buffer to
+// actually drain. Cost measured on .81: 0.093 us including the doorbell store.
+//
+// UNCONDITIONAL on both mappings, deliberately. It is correct under SO too, and
+// 93 ns a frame is not worth a branch on which mapping we got.
+#if defined(__arm__)
+#  define MF_FENCE() __asm__ __volatile__("dsb sy" ::: "memory")
+#else
+#  define MF_FENCE() __sync_synchronize()   // host oracle: no fabric to order against
+#endif
+
 // [Phase 1 B2] The publish barrier AND its trace marker, deliberately one call. If these
-// were two statements a mutation could move __sync_synchronize() while leaving the marker
+// were two statements a mutation could move MF_FENCE() while leaving the marker
 // behind, and the trace would still claim a barrier that is no longer there. Moving this
 // moves both, so the test sees the real ordering.
 static inline void mf_ctrl_barrier(void) {
     mf_trace_add(MF_TRACE_BARRIER, 0);   // no-op on device; one call, so it cannot drift
-    __sync_synchronize();
+    MF_FENCE();
 }
 
 // [Phase 4 W3 Stage A] Doorbell-delay probe (GMLOADER_MFGPU_PUBLISH_DELAY_US, 0 = off,
