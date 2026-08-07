@@ -84,7 +84,7 @@ extern "C" uint32_t RasterBackend_MFGPU_TestTraceOverflow(void);
 // the wire contract (3rdparty/mfgpu/docs/blitter-protocol.md §2), not build-dependent
 // addresses. MF_TRACE_BARRIER is the sentinel the shim records where the memory barrier sits.
 enum { TC_SUBMIT = 0, TC_CMDCOUNT = 1, TC_TARGET = 2, TC_CLEAR = 3, TC_FLAGS = 4,
-       TC_SRCSEL = 7, TC_BARRIER = -1 };
+       TC_DONE = 5, TC_SRCSEL = 7, TC_BARRIER = -1 };
 // [Phase 1 B1] value recorded alongside the register, and a seed for C_SRCSEL's
 // read-modify-write so "the throttle field survives" is a real claim, not 0 == 0.
 extern "C" uint32_t RasterBackend_MFGPU_TestTraceVal(uint32_t i);
@@ -3248,6 +3248,292 @@ static void rbt_end_frame(void) {
 // so this case's position in main() is NOT load-bearing. It also reads the
 // frame number the emitter is ALREADY at via TestFrameNo() instead of assuming
 // 0, so the window math stays correct regardless of position too.
+// ── [fabric lifecycle] bring-up and teardown over the shared DDR window ──────
+// The blitter's control block, rings and texture heap live in a FIXED DDR window
+// that outlives the process, and blitter_top.sv's whole idle predicate is
+// "C_DONE == C_SUBMIT". Startup used to open with a byte-wise memset of all eight
+// control qwords, which (a) transiently mismatches that pair and makes the fabric
+// execute the DEAD engine's ring, (b) writes C_DONE, which the fabric owns, and
+// (c) restarts the host sequence at 0 against a leftover C_DONE, so the first
+// await can never be satisfied — the frame-1 wedge.
+//
+// None of that is a pixel property, so none of it is visible to the parity cases
+// above. What IS visible off-device is the PROTOCOL: which sequence was adopted,
+// which registers were written and in what order, which were never written, how
+// many attempts ran, and what state teardown leaves behind. That is exactly the
+// set of things the memset got wrong, so that is what these four cases assert.
+extern "C" uint32_t RasterBackend_MFGPU_TestBootSeqBase(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestBringupAttempts(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestQuiescePolls(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestQuiesceTimeouts(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestHandshakeProbes(void);
+extern "C" int      RasterBackend_MFGPU_TestHandshakeOk(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestRingCleared(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestHeapCleared(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestTeardownRuns(void);
+extern "C" int      RasterBackend_MFGPU_TestShutdownFlag(void);
+extern "C" void     RasterBackend_MFGPU_TestSetHandshakeAck(int ack);
+extern "C" void     RasterBackend_MFGPU_TestSetCtrlSubmitDone(uint32_t submit, uint32_t done);
+extern "C" uint32_t RasterBackend_MFGPU_TestCtrlRead(int qw);
+extern "C" void     RasterBackend_MFGPU_TestSetPollHook(void (*hook)(void));
+extern "C" void     RasterBackend_MFGPU_TestClearShutdown(void);
+extern "C" void     RasterBackend_MFGPU_Shutdown(void);
+
+// Does the host write C_DONE anywhere in the trace it just produced? It must not:
+// C_DONE is written by the fabric and polled by us, and the memset's worst single
+// property was that it wrote it. (The oracle's stand-in fabric sets shadow C_DONE
+// directly, NOT through mf_ctrl_wr, precisely so it never shows up here.)
+static int lc_trace_has_c_done(void) {
+    for (uint32_t i = 0; i < RasterBackend_MFGPU_TestTraceLen(); i++)
+        if (RasterBackend_MFGPU_TestTraceReg(i) == TC_DONE) return 1;
+    return 0;
+}
+// The doorbell is the last write and a barrier sits immediately before it — the
+// same contract publish obeys, and for the same reason: the fabric latches the
+// whole control block off one C_SUBMIT edge.
+static int lc_trace_doorbell_last(const char *who) {
+    const uint32_t n = RasterBackend_MFGPU_TestTraceLen();
+    if (n < 3) { printf("  FAIL %s: only %u control writes traced\n", who, n); return 0; }
+    if (RasterBackend_MFGPU_TestTraceReg(n - 1) != TC_SUBMIT) {
+        printf("  FAIL %s: doorbell is not the last control write (last is reg %d)\n",
+               who, RasterBackend_MFGPU_TestTraceReg(n - 1));
+        return 0;
+    }
+    if (RasterBackend_MFGPU_TestTraceReg(n - 2) != TC_BARRIER) {
+        printf("  FAIL %s: no barrier immediately before the doorbell (reg %d)\n",
+               who, RasterBackend_MFGPU_TestTraceReg(n - 2));
+        return 0;
+    }
+    return 1;
+}
+
+// Poll hook: play a fabric that finishes the batch it was left executing, after a
+// set number of idle polls. Without it the shadow never converges and the wait can
+// only ever be observed timing out.
+static uint32_t g_lc_poll_calls = 0, g_lc_polls_before_ack = 0;
+static void lc_poll_hook(void) {
+    if (++g_lc_poll_calls < g_lc_polls_before_ack) return;
+    const uint32_t sub = RasterBackend_MFGPU_TestCtrlRead(TC_SUBMIT);
+    RasterBackend_MFGPU_TestSetCtrlSubmitDone(sub, sub);   // ack whatever is outstanding
+}
+
+// A dead engine that finished its last batch. Bring-up must ADOPT its sequence and
+// count up from there rather than restarting at 0 — and must publish that adoption
+// without ever creating a C_DONE != C_SUBMIT edge of its own.
+static int case_bringup_adopts_the_fabric_sequence(void) {
+    const uint32_t stale = 0x0000023Eu;   // the C_DONE .62 was sitting on when it wedged
+    RasterBackend_MFGPU_TestSetCtrlSubmitDone(stale, stale);
+    RasterBackend_MFGPU_TestReinit(0);
+
+    if (!RasterBackend_MFGPU_TestHandshakeOk()) {
+        printf("  FAIL bringup-adopt: the startup probe was not acked\n");
+        return 0;
+    }
+    // The probe consumes exactly one sequence, so the base lands one past the stale
+    // value. The number that matters is that it is near `stale`, not near 0.
+    if (RasterBackend_MFGPU_TestBootSeqBase() != stale + 1) {
+        printf("  FAIL bringup-adopt: base is %u, expected %u (stale C_DONE + 1 probe)\n",
+               RasterBackend_MFGPU_TestBootSeqBase(), stale + 1);
+        return 0;
+    }
+    if (RasterBackend_MFGPU_TestEmitterSeq() != RasterBackend_MFGPU_TestBootSeqBase()) {
+        printf("  FAIL bringup-adopt: emitter starts at %u but the fabric is at %u — the "
+               "first await would poll for a sequence the fabric can never reach\n",
+               RasterBackend_MFGPU_TestEmitterSeq(), RasterBackend_MFGPU_TestBootSeqBase());
+        return 0;
+    }
+    if (lc_trace_has_c_done()) {
+        printf("  FAIL bringup-adopt: bring-up wrote C_DONE, which the fabric owns\n");
+        return 0;
+    }
+    if (!lc_trace_doorbell_last("bringup-adopt")) return 0;
+    // Every control word the fabric latches must have been written before the
+    // barrier, or the probe latches values we had not finished writing.
+    if (RasterBackend_MFGPU_TestTraceOverflow() != 0) {
+        printf("  FAIL bringup-adopt: control-write trace overflowed (%u dropped)\n",
+               RasterBackend_MFGPU_TestTraceOverflow());
+        return 0;
+    }
+
+    // ...and the first REAL frame publishes base+1, not 1. This is the assertion the
+    // wedge actually failed: with the emitter restarting at 0 the doorbell carried 1
+    // while C_DONE held 0x23E, mf_device_await burned its whole budget, and every
+    // frame after it dropped whole.
+    const uint32_t base = RasterBackend_MFGPU_TestBootSeqBase();
+    mf_test_drive_one_frame();
+    if (RasterBackend_MFGPU_TestLastPublishedSeq() != base + 1) {
+        printf("  FAIL bringup-adopt: first frame published seq=%u, expected %u\n",
+               RasterBackend_MFGPU_TestLastPublishedSeq(), base + 1);
+        return 0;
+    }
+    printf("  OK   bringup-adopt  stale C_DONE=%u adopted as base=%u, first frame "
+           "published %u, C_DONE never written by the host\n",
+           stale, base, base + 1);
+    return 1;
+}
+
+// A dead engine killed MID-batch: C_SUBMIT != C_DONE and the fabric is still reading
+// the ring. Bring-up must WAIT rather than clear underneath it — zeroing a ring an
+// executing batch is walking is the same corruption as a mid-flight re-emit.
+static int case_bringup_waits_out_a_busy_fabric(void) {
+    RasterBackend_MFGPU_TestSetCtrlSubmitDone(0x400u, 0x3FFu);   // one batch outstanding
+    g_lc_poll_calls = 0; g_lc_polls_before_ack = 3;
+    RasterBackend_MFGPU_TestSetPollHook(lc_poll_hook);
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetPollHook(NULL);
+
+    if (RasterBackend_MFGPU_TestQuiesceTimeouts() != 0) {
+        printf("  FAIL bringup-busy: the idle wait timed out on a fabric that did ack\n");
+        return 0;
+    }
+    // Vacuity guard: if it never looped, "it waited" is not what was tested.
+    if (RasterBackend_MFGPU_TestQuiescePolls() < g_lc_polls_before_ack) {
+        printf("  FAIL bringup-busy: only %u idle polls, expected >= %u — the wait did "
+               "not actually block on the busy fabric\n",
+               RasterBackend_MFGPU_TestQuiescePolls(), g_lc_polls_before_ack);
+        return 0;
+    }
+    if (RasterBackend_MFGPU_TestBootSeqBase() != 0x401u) {
+        printf("  FAIL bringup-busy: base is %u, expected 0x401 (0x400 acked + 1 probe)\n",
+               RasterBackend_MFGPU_TestBootSeqBase());
+        return 0;
+    }
+    if (RasterBackend_MFGPU_TestBringupAttempts() != 1) {
+        printf("  FAIL bringup-busy: %u attempts, expected 1 — waiting is not retrying\n",
+               RasterBackend_MFGPU_TestBringupAttempts());
+        return 0;
+    }
+    printf("  OK   bringup-busy  waited %u polls for the in-flight batch, then adopted "
+           "0x400 and probed to 0x401\n", RasterBackend_MFGPU_TestQuiescePolls());
+    return 1;
+}
+
+// A fabric that never answers. Bring-up retries, then SOFT-fails: the engine must
+// still come up (the submit-timeout and whole-frame-drop machinery already handles a
+// dead fabric) and the operator must get told, because "the fabric never acked" is
+// the diagnosis the wedge used to hide behind a black screen.
+static int case_bringup_retries_then_soft_fails(void) {
+    setenv("GMLOADER_MFGPU_QUIESCE_MS", "1", 1);      // don't spend real time here
+    setenv("GMLOADER_MFGPU_BRINGUP_TRIES", "2", 1);
+    RasterBackend_MFGPU_TestSetCtrlSubmitDone(0x500u, 0x500u);
+    RasterBackend_MFGPU_TestSetHandshakeAck(0);       // the fabric goes silent
+    RasterBackend_MFGPU_TestReinit(0);
+    RasterBackend_MFGPU_TestSetHandshakeAck(1);
+    unsetenv("GMLOADER_MFGPU_QUIESCE_MS");
+    unsetenv("GMLOADER_MFGPU_BRINGUP_TRIES");
+
+    int ok = 1;
+    if (RasterBackend_MFGPU_TestHandshakeOk()) {
+        printf("  FAIL bringup-softfail: reported ok against a fabric that never acked\n");
+        ok = 0;
+    }
+    else if (RasterBackend_MFGPU_TestBringupAttempts() != 2 ||
+             RasterBackend_MFGPU_TestHandshakeProbes() != 2) {
+        printf("  FAIL bringup-softfail: %u attempts / %u probes, expected 2 / 2\n",
+               RasterBackend_MFGPU_TestBringupAttempts(),
+               RasterBackend_MFGPU_TestHandshakeProbes());
+        ok = 0;
+    }
+    // The second attempt opens on the first attempt's unanswered doorbell, so it must
+    // also record an idle-wait timeout — that is the path that has to clear and park
+    // anyway rather than block startup forever.
+    else if (RasterBackend_MFGPU_TestQuiesceTimeouts() == 0) {
+        printf("  FAIL bringup-softfail: no idle-wait timeout recorded, so the "
+               "clear-and-park-anyway path was never taken\n");
+        ok = 0;
+    }
+    // Soft, not fatal: the emitter is still bound and still counting from a sequence
+    // the fabric could distinguish if it came back.
+    else if (RasterBackend_MFGPU_TestEmitterSeq() != RasterBackend_MFGPU_TestBootSeqBase()) {
+        printf("  FAIL bringup-softfail: emitter (%u) and base (%u) diverged, so the "
+               "soft-fail path did not leave a usable engine\n",
+               RasterBackend_MFGPU_TestEmitterSeq(), RasterBackend_MFGPU_TestBootSeqBase());
+        ok = 0;
+    }
+    if (ok) printf("  OK   bringup-softfail  2 attempts, 2 unanswered probes, engine still "
+                   "came up at base=%u\n", RasterBackend_MFGPU_TestBootSeqBase());
+    // Leave the shadow consistent for whatever runs next.
+    RasterBackend_MFGPU_TestSetCtrlSubmitDone(0x600u, 0x600u);
+    RasterBackend_MFGPU_TestReinit(0);
+    return ok;
+}
+
+// Teardown: wait for the ack, zero the ring, park the block idle, exactly once — and
+// then stop the frame loop from re-arming what was just torn down.
+static int case_teardown_parks_the_window_idle(void) {
+    RasterBackend_MFGPU_TestSetCtrlSubmitDone(0x700u, 0x700u);
+    RasterBackend_MFGPU_TestReinit(0);
+    mf_test_drive_one_frame();                    // leave a real batch in the window
+    const uint32_t pub0  = RasterBackend_MFGPU_TestPublishCount();
+
+    RasterBackend_MFGPU_Shutdown();
+    RasterBackend_MFGPU_Shutdown();               // atexit + a signal must not double-run it
+
+    int ok = 1;
+    if (RasterBackend_MFGPU_TestTeardownRuns() != 1) {
+        printf("  FAIL teardown-park: ran %u times, expected exactly 1\n",
+               RasterBackend_MFGPU_TestTeardownRuns());
+        ok = 0;
+    }
+    else if (RasterBackend_MFGPU_TestCtrlRead(TC_SUBMIT) !=
+             RasterBackend_MFGPU_TestCtrlRead(TC_DONE)) {
+        printf("  FAIL teardown-park: left C_SUBMIT=%u C_DONE=%u — the next engine "
+               "inherits a live doorbell over a zeroed ring\n",
+               RasterBackend_MFGPU_TestCtrlRead(TC_SUBMIT),
+               RasterBackend_MFGPU_TestCtrlRead(TC_DONE));
+        ok = 0;
+    }
+    else if (RasterBackend_MFGPU_TestCtrlRead(TC_CMDCOUNT) != 0) {
+        printf("  FAIL teardown-park: left C_CMDCOUNT=%u, expected 0 so a spurious "
+               "new-work edge executes nothing\n", RasterBackend_MFGPU_TestCtrlRead(TC_CMDCOUNT));
+        ok = 0;
+    }
+    else if (RasterBackend_MFGPU_TestRingCleared() == 0) {
+        printf("  FAIL teardown-park: the command rings were not zeroed\n");
+        ok = 0;
+    }
+    // The heap is deliberately NOT cleared on the way out: ~14.75 MiB of memset on a
+    // process-death path, and bring-up clears it anyway.
+    else if (RasterBackend_MFGPU_TestHeapCleared() != 0) {
+        printf("  FAIL teardown-park: teardown cleared %u heap bytes; that belongs to "
+               "bring-up, not to the exit path\n", RasterBackend_MFGPU_TestHeapCleared());
+        ok = 0;
+    }
+    else if (lc_trace_has_c_done()) {
+        printf("  FAIL teardown-park: teardown wrote C_DONE, which the fabric owns\n");
+        ok = 0;
+    }
+    else if (!lc_trace_doorbell_last("teardown-park")) ok = 0;
+
+    // And nothing may publish afterwards: teardown owns the ring from here, so a frame
+    // that re-fills it and rings a doorbell nobody will wait on rebuilds the exact
+    // state teardown exists to prevent.
+    // (Not asserted via TestDropCount: that counter belongs to the in-flight-batch
+    // guard, which throttles its own log every 60 frames. The publish count is the
+    // load-bearing observable — the doorbell is what the next engine inherits.)
+    if (ok) {
+        mf_test_drive_one_frame();
+        if (RasterBackend_MFGPU_TestPublishCount() != pub0) {
+            printf("  FAIL teardown-park: a frame published after teardown "
+                   "(publish %u -> %u)\n", pub0, RasterBackend_MFGPU_TestPublishCount());
+            ok = 0;
+        }
+        if (RasterBackend_MFGPU_TestCtrlRead(TC_SUBMIT) !=
+            RasterBackend_MFGPU_TestCtrlRead(TC_DONE)) {
+            printf("  FAIL teardown-park: the post-teardown frame moved the doorbell "
+                   "(C_SUBMIT=%u C_DONE=%u)\n", RasterBackend_MFGPU_TestCtrlRead(TC_SUBMIT),
+                   RasterBackend_MFGPU_TestCtrlRead(TC_DONE));
+            ok = 0;
+        }
+    }
+    if (ok) printf("  OK   teardown-park  ran once, rings zeroed, C_SUBMIT==C_DONE==%u, "
+                   "C_CMDCOUNT=0, no post-teardown publish\n",
+                   RasterBackend_MFGPU_TestCtrlRead(TC_SUBMIT));
+    RasterBackend_MFGPU_TestClearShutdown();   // release the latch for whatever runs next
+    RasterBackend_MFGPU_TestReinit(0);
+    return ok;
+}
+
 static int case_mfgpu_trace_capture(void) {
     const char *path = "/tmp/rbt_mftrace.txt";
     unlink(path);
@@ -3485,6 +3771,16 @@ int main(void){
     else printf("raster_backend mfgpu-batch-midframe-clear OK\n");
     if (!case_batch_flushes_before_end_of_frame_clear_discharge()) { printf("FAIL mfgpu-batch-end-of-frame-clear\n"); ok = 0; }
     else printf("raster_backend mfgpu-batch-end-of-frame-clear OK\n");
+    // [fabric lifecycle] bring-up + teardown over the DDR window the fabric shares
+    // with whatever engine ran before this one.
+    if (!case_bringup_adopts_the_fabric_sequence()) { printf("FAIL mfgpu-bringup-adopt\n"); ok = 0; }
+    else printf("raster_backend mfgpu-bringup-adopt OK\n");
+    if (!case_bringup_waits_out_a_busy_fabric()) { printf("FAIL mfgpu-bringup-busy\n"); ok = 0; }
+    else printf("raster_backend mfgpu-bringup-busy OK\n");
+    if (!case_bringup_retries_then_soft_fails()) { printf("FAIL mfgpu-bringup-softfail\n"); ok = 0; }
+    else printf("raster_backend mfgpu-bringup-softfail OK\n");
+    if (!case_teardown_parks_the_window_idle()) { printf("FAIL mfgpu-teardown-park\n"); ok = 0; }
+    else printf("raster_backend mfgpu-teardown-park OK\n");
     // Deliberately registered LAST, after every other case has already called
     // backend_mfgpu.draw() many times over: proves RasterBackend_MFGPU_TestTraceReset()
     // actually makes this case position-independent rather than merely untested at

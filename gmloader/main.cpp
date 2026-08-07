@@ -588,6 +588,19 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx)
 #if defined(__arm__)
     crash_stack_scan(uc->uc_mcontext.arm_sp);
 #endif
+#ifdef MISTER_NATIVE_VIDEO
+    // Park the fabric before we die. The blitter's DDR window at 0x3B000000 outlives
+    // this process — load_core does not clear it and the kernel never owned it — so a
+    // crash that leaves a live doorbell over a half-written command ring hands the
+    // NEXT engine a fabric already executing a batch nobody submitted. That is the
+    // frame-1 wedge, and it is indistinguishable from a bad bitstream once you are
+    // looking at a black screen. Deliberately LAST, after the backtrace and the stack
+    // scan: this call can spend up to its teardown budget waiting for the in-flight
+    // batch to ack, and the crash diagnostics must not be delayed behind it. It is
+    // async-signal-safe and idempotent, so the atexit registration cannot double-run
+    // it and the SIGABRT-from-inside-free() path cannot deadlock on it.
+    RasterBackend_MFGPU_Shutdown();
+#endif
     signal(sig, SIG_DFL);
     raise(sig);
 }

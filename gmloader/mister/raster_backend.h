@@ -48,6 +48,22 @@ void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
  * /dev/mem, or the mapping not yet established) — 0 leaves the outputs
  * untouched and obliges the caller to fall back rather than wait on it. */
 int RasterBackend_MFGPU_ScanoutRead(uint32_t *frame_cnt, uint32_t *period_cyc);
+
+/* mfgpu back-end only: quiesce the fabric and leave its DDR window in a state the
+ * NEXT engine can start from. Waits (bounded) for the in-flight batch to be acked,
+ * zeroes the command rings, and parks the control block idle without ever writing
+ * the fabric-owned C_DONE.
+ *
+ * The window at 0x3B000000 outlives the process — load_core does not clear it and
+ * neither does the kernel — so an engine that dies without running this leaves a
+ * stale ring and a live doorbell behind, which is the frame-1 wedge the next engine
+ * used to inherit. The back-end already runs this from atexit() and from its own
+ * SIGTERM/SIGINT/SIGHUP/SIGQUIT handler; main.cpp calls it from the crash handler,
+ * which owns SIGSEGV/SIGABRT/SIGBUS and must not have those hooked twice.
+ *
+ * Async-signal-safe, idempotent (runs at most once per process), and a no-op on a
+ * host build, when backend_sw is selected, or when the DDR window was never mapped. */
+void RasterBackend_MFGPU_Shutdown(void);
 #ifdef __cplusplus
 }
 #endif
