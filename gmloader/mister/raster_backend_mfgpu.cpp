@@ -80,6 +80,10 @@ extern "C" {
 #endif
 #include <time.h>     // [Phase 1 B2] clock_gettime for the publish timestamp, which is
                       // recorded in BOTH builds (mf_device_publish is not device-only)
+#include <signal.h>   // [fabric lifecycle] sig_atomic_t + the SIGTERM/SIGINT teardown hook
+#include <unistd.h>   // [fabric lifecycle] write(2): the only async-signal-safe way to log
+                      // from inside that hook (fprintf is not AS-safe, and the hook runs
+                      // on the path that a heap-corruption SIGABRT takes)
 
 // The mfgpu backend scans the fabric FB out as the display verbatim — the two
 // geometry roots must be identical (native-288x216 single-source rule).
@@ -1059,7 +1063,13 @@ static bool mf_ddr_map(void) {
     g_dev_ring = (uint8_t *)(g_dev_base + MF_DEV_RING_OFF);
     g_dev_ring_b = (uint8_t *)(g_dev_base + MF_DEV_RING_B_OFF);   // [Phase 1 B1]
     g_dev_src  = (uint8_t *)(g_dev_base + MF_DEV_SRC_OFF);
-    memset((void *)g_dev_ctrl, 0, MF_DEV_RING_OFF);   // zero the control block
+    // NO memset OF THE CONTROL BLOCK HERE — it used to be exactly this line, and it
+    // was the frame-1 wedge. Zeroing all eight control qwords byte-wise, in
+    // unspecified order, over a handshake whose entire idle predicate is
+    // "C_DONE == C_SUBMIT" hands the fabric a mismatched pair mid-memset and it
+    // executes the DEAD engine's ring; it also writes C_DONE, which the fabric owns.
+    // Bring-up is a sequenced protocol, not a memset: see mf_fabric_bringup(), which
+    // mf_init_once runs once the emitter is bound.
     g_dev_ok = true;
     return true;
 }
@@ -1466,6 +1476,15 @@ static void mf_device_publish(void) {
     mf_publish_delay();                         // [W3 Stage A] probe: delay the doorbell
     mf_ctrl_barrier();                          // data before doorbell (traced)
     mf_ctrl_wr(MF_C_SUBMIT, g_e.submit_seq);    // doorbell LAST
+#ifndef MISTER_NATIVE_VIDEO
+    // [fabric lifecycle] Host oracle: ack the doorbell, because off-device blt_execute
+    // IS the fabric and it is synchronous — mf_fabric_still_busy() already answers
+    // "never in flight" here for exactly that reason. Without this the shadow control
+    // block drifts (C_SUBMIT climbing, C_DONE frozen), which is a state the real fabric
+    // cannot be in, and the bring-up quiesce would then be reading a fiction rather
+    // than the protocol. Nothing else off-device reads shadow C_DONE.
+    g_ctrl_shadow[MF_C_DONE] = g_e.submit_seq;
+#endif
     g_last_published_seq = g_e.submit_seq;      // [Phase 2 host lever] seam witness
     clock_gettime(CLOCK_MONOTONIC, &g_publish_t0);
     // [Phase 4 Stage A] Close the previous frame's seam sample. g_publish_t0 is
@@ -1576,6 +1595,340 @@ static void mf_device_await(void) {
     // mf_frame_begin where g_fabric_pending is cleared, identically to the device path.
 }
 
+// ── FABRIC LIFECYCLE: bring-up (quiesce/clear/handshake) and cleanup on exit ─
+//
+// WHAT THIS FIXES. The blitter's control block, its two command rings and its
+// ~14.75 MiB SRC heap all live in a FIXED DDR window (0x3B000000). Nothing clears
+// that window between engine runs: `load_core` reconfigures the FPGA, not DDR; the
+// kernel never owned the range (it is outside System RAM, which is why /dev/mem
+// hands it to us at all); and the engine had no teardown of any kind. So when a
+// gmloader dies — killed by a script, by the OOM killer, or by the glibc
+// heap-corruption abort — every byte it wrote is still there for the next one, and
+// the fabric is still polling the same control block it was polling before.
+//
+// blitter_top.sv's idle predicate is ONE comparison, in S_CHK_NEW:
+//     C_DONE == C_SUBMIT  ->  idle, keep polling
+//     C_DONE != C_SUBMIT  ->  NEW WORK: latch C_CMDCOUNT/C_TARGET/C_CLEAR/C_FLAGS/
+//                             C_SRCSEL and execute cmd_count commands from the ring.
+// It has no notion of a host restart, and cannot have one: that inequality IS the
+// protocol.
+//
+// Startup used to open with `memset(ctrl, 0, 0x40)` — a byte-wise zero of all eight
+// control qwords, in unspecified order, on top of a live handshake:
+//
+//   1. C_SUBMIT and C_DONE reach zero at different instants. In the window between
+//      them the fabric reads a MISMATCHED pair and takes the new-work branch —
+//      against the dead engine's cmd_count, the dead engine's ring, and the dead
+//      engine's textures. It executes a batch nobody submitted.
+//   2. The memset WRITES C_DONE, which is fabric-owned. A fabric that was mid-frame
+//      overwrites our zero with the sequence it latched, the pair is mismatched
+//      again, and 1 repeats.
+//   3. The emitter then starts its sequence at 0 and publishes 1 while C_DONE holds
+//      an arbitrary leftover. mf_device_await polls for 1, never sees it, burns the
+//      200 ms budget, sets g_fabric_pending — and from there every frame drops
+//      whole (the in-flight-batch guard, working exactly as designed). C_SUBMIT
+//      stays pinned and openbor_video_reader.sv's stale-frame watchdog blanks to
+//      black.
+//
+// Shape 3 is the "frame-1 wedge" measured on .62: C_SUBMIT stuck, nothing ever
+// acked, and from the outside indistinguishable from a bad bitstream.
+//
+// THE FIX IS TWO HALVES AND BOTH ARE LOAD-BEARING:
+//
+//  (a) TEARDOWN — mf_fabric_teardown(). Let the in-flight batch ack, zero the rings
+//      so no stale command list outlives us, and park the control block idle. Runs
+//      from atexit() and from a SIGTERM/SIGINT/SIGHUP/SIGQUIT handler;
+//      main.cpp's crash handler calls it on the SIGSEGV/SIGABRT/SIGBUS paths.
+//  (b) BRING-UP — mf_fabric_bringup(). SIGKILL cannot be caught and neither can a
+//      power cut, so (a) is best-effort BY CONSTRUCTION and startup must still treat
+//      the window as hostile: wait for idle, clear the rings and the heap, park the
+//      control block, then prove the fabric with a zero-command probe batch before
+//      the first real frame is ever built.
+//
+// THE RULE BOTH HALVES OBEY: the host NEVER writes C_DONE, and never writes
+// C_SUBMIT a value that differs from the C_DONE it last read unless the ring behind
+// it is valid. Rather than forcing the sequence back to zero — which is what
+// manufactured the mismatch — we ADOPT the fabric's current C_DONE as our base and
+// count up from it. Equality holds at every instant, so the fabric is never handed
+// work we did not submit. Sequence numbers are compared for equality only (both in
+// the RTL and in mf_device_await), so any base is as good as zero.
+//
+// SELF-HEALING EVEN WHEN QUIESCE TIMES OUT. If the fabric never reaches idle within
+// the budget we clear and park anyway, against the freshest C_DONE we read. Suppose
+// the fabric is genuinely mid-frame on the dead engine's batch S_old while we park
+// C_SUBMIT at D_old: it finishes, writes C_DONE = S_old, the pair mismatches, and it
+// takes the new-work branch — but by then the ring is zeroed and C_CMDCOUNT is 0, so
+// S_FETCH takes its `cmd_idx >= cmd_count` exit immediately and it writes
+// C_DONE = D_old. Two fabric frames, no commands executed, idle. That ordering is
+// why the rings are cleared BEFORE the control block is touched, in both halves.
+enum {
+    MF_QUIESCE_MS_DEFAULT   = 500,   // bring-up: budget for a dead engine's batch to finish
+    MF_TEARDOWN_MS_DEFAULT  = 250,   // exit: same wait, but we are holding up process death
+    MF_BRINGUP_TRIES_DEFAULT = 3,    // clear+probe attempts before giving up (soft-fail)
+    MF_IDLE_NAP_US          = 200,   // between idle polls; this path is not latency-critical
+};
+static long mf_env_long(const char *name, long dflt) {
+    const char *e = getenv(name);
+    if (!e || !*e) return dflt;
+    long v = atol(e);
+    return (v > 0) ? v : dflt;
+}
+static long mf_quiesce_ms(void)  { return mf_env_long("GMLOADER_MFGPU_QUIESCE_MS",  MF_QUIESCE_MS_DEFAULT); }
+static long mf_teardown_ms(void) { return mf_env_long("GMLOADER_MFGPU_TEARDOWN_MS", MF_TEARDOWN_MS_DEFAULT); }
+static long mf_bringup_tries(void) { return mf_env_long("GMLOADER_MFGPU_BRINGUP_TRIES", MF_BRINGUP_TRIES_DEFAULT); }
+// Escape hatches. The probe costs one fabric frame at startup and the heap clear
+// costs one ~14.75 MiB memset (~18 ms write-combined, ~184 ms strongly-ordered) —
+// both are cheap, both are once, and both are the first thing to switch off when
+// bisecting a startup problem this block could plausibly have caused.
+static bool mf_no_handshake(void)  { const char *e = getenv("GMLOADER_MFGPU_NO_HANDSHAKE");  return e && *e; }
+static bool mf_no_heap_clear(void) { const char *e = getenv("GMLOADER_MFGPU_NO_HEAP_CLEAR"); return e && *e; }
+
+// Sequence base adopted from the fabric at bring-up. The emitter counts up from
+// here instead of from 0 (see the rule above).
+static uint32_t g_boot_seq_base = 0;
+// Set the instant teardown begins, and checked by mf_frame_end: once teardown owns
+// the ring, a frame that publishes into it re-creates the exact corruption teardown
+// exists to prevent. volatile sig_atomic_t because the writer may be a signal handler.
+static volatile sig_atomic_t g_fabric_shutdown = 0;
+// Bring-up witnesses (test hooks + the startup log line).
+static uint32_t g_quiesce_polls     = 0;   // idle polls across all attempts
+static uint32_t g_quiesce_timeouts  = 0;   // attempts whose idle wait ran out of budget
+static uint32_t g_bringup_attempts  = 0;   // clear+probe attempts actually run
+static uint32_t g_handshake_probes  = 0;   // probe batches published
+static bool     g_handshake_ok      = false;
+static uint32_t g_ring_cleared      = 0;   // bytes zeroed by the last clear
+static uint32_t g_heap_cleared      = 0;
+static uint32_t g_teardown_runs     = 0;   // must never exceed 1
+// Host-oracle steering. Both are inert on device: the poll hook is never installed
+// and the ack flag is only read by the oracle's stand-in fabric.
+static void (*g_test_poll_hook)(void) = nullptr;
+static int    g_test_handshake_ack    = 1;
+
+static double mf_now_ms(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
+}
+static void mf_idle_nap(void) {
+    struct timespec ts = { 0, (long)MF_IDLE_NAP_US * 1000L };
+    nanosleep(&ts, NULL);   // async-signal-safe, unlike usleep on some libcs
+}
+// Async-signal-safe logging. The teardown path can be entered from a SIGABRT raised
+// inside glibc's allocator, where fprintf may re-enter the very lock that aborted.
+static void mf_sig_log(const char *s) {
+    (void)!write(STDERR_FILENO, s, strlen(s));
+}
+
+// Poll until the fabric is idle, i.e. until it has acked everything it was asked
+// for. Reads C_SUBMIT first and C_DONE second — the same order blitter_top.sv reads
+// them (S_POLL_SUBMIT -> S_POLL_DONE) — and the equality is stable once observed
+// because the host is the only writer of C_SUBMIT and is not writing it here.
+// Sets g_boot_seq_base to the observed sequence on success. Returns false on budget
+// exhaustion, having left g_boot_seq_base at the freshest C_DONE it saw (see the
+// self-healing note above: parking against that value is still the right move).
+static bool mf_wait_fabric_idle(long budget_ms) {
+    const double t0 = mf_now_ms();
+    for (;;) {
+        const uint32_t sub = mf_ctrl_rd(MF_C_SUBMIT);
+        const uint32_t don = mf_ctrl_rd(MF_C_DONE);
+        g_quiesce_polls++;
+        if (sub == don) { g_boot_seq_base = don; return true; }
+        // Hook first, deadline second: a zero budget must still give the host
+        // oracle's stand-in fabric one chance to answer, or the timeout path is the
+        // only path that is ever testable off-device.
+        if (g_test_poll_hook) g_test_poll_hook();
+        if (mf_now_ms() - t0 >= (double)budget_ms) { g_boot_seq_base = don; return false; }
+        mf_idle_nap();
+    }
+}
+
+// Zero the stale command rings, and (unless switched off) the stale texture heap.
+// MUST run before the control block is touched — see the self-healing note.
+static void mf_clear_stale_dram(bool clear_heap) {
+    g_ring_cleared = 0; g_heap_cleared = 0;
+#ifdef MISTER_NATIVE_VIDEO
+    // Ring A and ring B are contiguous: [RING_OFF, SRC_OFF) is both of them, 512 KiB
+    // less the 64 bytes the control block occupies ahead of ring A.
+    const uint32_t ring_bytes = MF_DEV_SRC_OFF - MF_DEV_RING_OFF;
+    memset(g_dev_ring, 0, ring_bytes);
+    g_ring_cleared = ring_bytes;
+    if (clear_heap) {
+        memset(g_dev_src, 0, MF_DEV_SRC_CAP);
+        g_heap_cleared = MF_DEV_SRC_CAP;
+    }
+#else
+    // Host oracle: the same two regions, in the arrays the emitter binds to there.
+    memset(g_ring[0], 0, sizeof g_ring[0]);
+    memset(g_ring[1], 0, sizeof g_ring[1]);
+    g_ring_cleared = (uint32_t)(sizeof g_ring[0] + sizeof g_ring[1]);
+    if (clear_heap) {
+        memset(g_srcdram, 0, sizeof g_srcdram);
+        g_heap_cleared = (uint32_t)sizeof g_srcdram;
+    }
+#endif
+}
+
+// Park the control block on `seq`, which MUST be a value C_DONE already holds.
+// Writes the payload words first, then the barrier, then the doorbell — the same
+// order and for the same reason as mf_device_publish, because the fabric latches the
+// whole block off one C_SUBMIT edge. C_DONE is not written: it is not ours.
+static void mf_park_ctrl_idle(uint32_t seq) {
+    mf_ctrl_wr(MF_C_CMDCOUNT, 0);       // empty batch: RTL S_FETCH exits on cmd_idx>=cmd_count
+    mf_ctrl_wr(MF_C_TARGET,   0);
+    mf_ctrl_wr(MF_C_CLEAR,    0);
+    mf_ctrl_wr(MF_C_FLAGS,    0);       // cfg_flags[0]==0 -> no framebuffer clear pass
+    // C_SRCSEL is read-modify-write for the same reason it is in publish: bits 15:8
+    // are the f2h write throttle and are not ours to drop. Only the ring-select bit
+    // is forced, back to arena 0, which is where mf_init_once sets g_arena.
+    mf_ctrl_wr(MF_C_SRCSEL, mf_ctrl_rd(MF_C_SRCSEL) & ~(1u << 2));
+    mf_ctrl_barrier();
+    mf_ctrl_wr(MF_C_SUBMIT, seq);       // == C_DONE, so the fabric stays in S_POLL_SUBMIT
+}
+
+// Publish one zero-command batch and wait for the ack. This is the handshake: it
+// proves the fabric is configured, polling, and completing frames BEFORE the engine
+// builds a real one, which turns "the game renders black forever" into one log line
+// and a retry. It is invisible on screen — cmd_count 0 emits nothing and flags 0
+// skips the clear pass, so the frame only walks the prologue and the snap.
+static bool mf_fabric_probe(long budget_ms) {
+    const uint32_t seq = g_boot_seq_base + 1u;
+    g_handshake_probes++;
+    mf_ctrl_wr(MF_C_CMDCOUNT, 0);
+    mf_ctrl_wr(MF_C_FLAGS,    0);
+    mf_ctrl_barrier();
+    mf_ctrl_wr(MF_C_SUBMIT,   seq);
+#ifndef MISTER_NATIVE_VIDEO
+    // Host oracle: stand in for the fabric, exactly as mf_fabric_still_busy() does
+    // off-device (blt_execute is synchronous there, so nothing is ever in flight).
+    // g_test_handshake_ack = 0 models a fabric that never answers — the only way to
+    // reach the retry and soft-fail paths without hardware.
+    if (g_test_handshake_ack) g_ctrl_shadow[MF_C_DONE] = seq;
+#endif
+    const double t0 = mf_now_ms();
+    for (;;) {
+        if (mf_ctrl_rd(MF_C_DONE) == seq) { g_boot_seq_base = seq; return true; }
+        if (g_test_poll_hook) g_test_poll_hook();
+        if (mf_now_ms() - t0 >= (double)budget_ms) return false;
+        mf_idle_nap();
+    }
+}
+
+// The whole bring-up. Returns true if the fabric acked the probe. A false return is
+// deliberately NOT fatal: the engine still runs, the existing submit-timeout and
+// whole-frame-drop machinery still applies, and the operator gets a log line that
+// says the fabric never answered — which is the diagnosis the wedge used to hide.
+static bool mf_fabric_bringup(void) {
+#ifdef MISTER_NATIVE_VIDEO
+    if (!g_dev_ok) return false;   // no mapping: nothing to quiesce, nothing to clear
+#endif
+    g_quiesce_polls = 0; g_quiesce_timeouts = 0; g_bringup_attempts = 0;
+    g_handshake_probes = 0; g_handshake_ok = false;
+    g_fabric_shutdown = 0;   // a TestReinit after a teardown must not stay latched
+
+    const long budget = mf_quiesce_ms();
+    const long tries  = mf_bringup_tries();
+    const uint32_t sub0 = mf_ctrl_rd(MF_C_SUBMIT), don0 = mf_ctrl_rd(MF_C_DONE);
+
+    for (long attempt = 0; attempt < tries; attempt++) {
+        g_bringup_attempts++;
+        mf_trace_reset();   // one attempt = one trace, so a host case can read the last
+        if (!mf_wait_fabric_idle(budget)) g_quiesce_timeouts++;
+        mf_clear_stale_dram(!mf_no_heap_clear());
+        mf_park_ctrl_idle(g_boot_seq_base);
+        if (mf_no_handshake()) { g_handshake_ok = true; break; }
+        if (mf_fabric_probe(budget)) { g_handshake_ok = true; break; }
+        fprintf(stderr, "backend_mfgpu: fabric did not ack the startup probe "
+                        "(seq=%u done=%u status=%u) — attempt %ld/%ld\n",
+                g_boot_seq_base + 1u, mf_ctrl_rd(MF_C_DONE), mf_ctrl_rd(MF_C_STATUS),
+                attempt + 1, tries);
+    }
+    fprintf(stderr, "backend_mfgpu: fabric bring-up %s — found submit=%u done=%u, "
+                    "base=%u, cleared ring=%uKiB heap=%uKiB, attempts=%u polls=%u "
+                    "quiesce_to=%u\n",
+            g_handshake_ok ? "ok" : "SOFT-FAILED (fabric never acked; frames will drop)",
+            sub0, don0, g_boot_seq_base, g_ring_cleared >> 10, g_heap_cleared >> 10,
+            g_bringup_attempts, g_quiesce_polls, g_quiesce_timeouts);
+    return g_handshake_ok;
+}
+
+// ── TEARDOWN ────────────────────────────────────────────────────────────────
+// Idempotent and async-signal-safe: no fprintf, no malloc, no locks. Runs at most
+// once, which is what makes it safe to wire to atexit() AND to a signal handler AND
+// to main.cpp's crash handler without any of them having to know about the others.
+static volatile sig_atomic_t g_teardown_ran = 0;   // the once-only latch; see below
+static void mf_fabric_teardown(void) {
+    if (g_teardown_ran) return;
+    g_teardown_ran = 1;
+    g_fabric_shutdown = 1;   // stop mf_frame_end publishing into a ring we are about to zero
+#ifdef MISTER_NATIVE_VIDEO
+    if (!g_dev_ok) return;
+#endif
+    g_teardown_runs++;
+    // 1. Let the batch in flight finish. The fabric is reading the ring RIGHT NOW;
+    //    zeroing it underneath an executing batch is the same corruption as a
+    //    mid-flight re-emit, and this is the one moment we can cheaply avoid it.
+    const bool idle = mf_wait_fabric_idle(mf_teardown_ms());
+    // 2. Zero the rings, so the next engine cannot be handed ~8190 stale commands.
+    //    The heap is deliberately NOT cleared here: it is ~14.75 MiB of memset on a
+    //    process-death path, and bring-up clears it anyway.
+    mf_clear_stale_dram(/*clear_heap=*/false);
+    // 3. Park the block idle against the sequence the fabric last reported.
+    mf_trace_reset();   // no-op on device; off-device it keeps the park's trace standalone
+    mf_park_ctrl_idle(g_boot_seq_base);
+    mf_sig_log(idle ? "backend_mfgpu: fabric parked idle on exit\n"
+                    : "backend_mfgpu: fabric still busy at exit — parked anyway\n");
+}
+
+#ifdef MISTER_NATIVE_VIDEO
+// SIGTERM/SIGINT/SIGHUP/SIGQUIT are the signals that actually kill this engine in
+// the field: launch.sh's restart, an operator's Ctrl-C over SSH, the SSH session
+// dropping, and deploy.py's cleanup sweep. None of them were handled, so all four
+// left the DDR window exactly as the wedge needs it. SIGSEGV/SIGABRT/SIGBUS/SIGILL/
+// SIGFPE are NOT taken here — main.cpp already owns those (its crash handler prints
+// the backtrace this project's intermittent heap-corruption crash is diagnosed
+// from), and it calls RasterBackend_MFGPU_Shutdown() itself rather than have two
+// handlers fight over the same signal.
+static const int MF_TERM_SIGS[] = { SIGTERM, SIGINT, SIGHUP, SIGQUIT };
+enum { MF_TERM_SIG_N = (int)(sizeof MF_TERM_SIGS / sizeof MF_TERM_SIGS[0]) };
+static struct sigaction g_prev_sa[MF_TERM_SIG_N];
+
+static void mf_term_handler(int sig) {
+    mf_fabric_teardown();
+    // Put back whatever was there before us and re-raise, so the process still dies
+    // of the signal it was sent: the exit status, and therefore launch.sh's and the
+    // shell's view of why it died, must not change because we hooked the signal.
+    for (int i = 0; i < MF_TERM_SIG_N; i++)
+        if (MF_TERM_SIGS[i] == sig) { sigaction(sig, &g_prev_sa[i], NULL); break; }
+    raise(sig);
+}
+
+static void mf_install_exit_hooks(void) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    atexit(mf_fabric_teardown);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = mf_term_handler;
+    sigemptyset(&sa.sa_mask);
+    for (int i = 0; i < MF_TERM_SIG_N; i++) {
+        // Never override an inherited SIG_IGN: a parent that ignored a signal on our
+        // behalf (launch.sh, nohup) means the process is not going to die of it, and
+        // installing a handler would both tear the fabric down and then re-raise into
+        // a disposition that no longer ignores it.
+        struct sigaction old;
+        if (sigaction(MF_TERM_SIGS[i], NULL, &old) == 0 && old.sa_handler == SIG_IGN) {
+            g_prev_sa[i] = old;
+            continue;
+        }
+        sigaction(MF_TERM_SIGS[i], &sa, &g_prev_sa[i]);
+    }
+}
+#endif // MISTER_NATIVE_VIDEO
+
+// Public entry point, for main.cpp's crash handler and for anything else that knows
+// the process is ending. See mf_fabric_teardown for the signal-safety contract.
+extern "C" void RasterBackend_MFGPU_Shutdown(void) { mf_fabric_teardown(); }
+
 static void mf_init_once(void) {
     if (g_inited) return;
 #ifdef MISTER_NATIVE_VIDEO
@@ -1619,6 +1972,24 @@ static void mf_init_once(void) {
     g_batch.valid = false; g_batch_merged = 0;
     g_tl_groups = 0; g_tl_cmds = 0; g_tl_tris = 0;
     g_tl_groups_pub = 0; g_tl_cmds_pub = 0; g_tl_tris_pub = 0;
+    // [fabric lifecycle] LAST, and after blt_emitter_init rather than before it, for
+    // two reasons: blt_emitter_init memsets the emitter (including submit_seq), so a
+    // base adopted earlier would be thrown away; and the bring-up zeroes the rings and
+    // the heap the emitter has just been bound to, which is only safe once nothing has
+    // been emitted into them. blt_emitter_init/blt_alloc_init/blt_vtx_buf_init write
+    // no ring or heap bytes of their own, so the order is not merely tolerable — the
+    // regions are untouched at this point by construction.
+    mf_fabric_bringup();
+    // Count up from the sequence the fabric actually reports, never from 0. Publishing
+    // 1 against a C_DONE the previous engine left at (say) 0x23E is an await that can
+    // never be satisfied — the frame-1 wedge in one line.
+    g_e.submit_seq   = g_boot_seq_base;
+    g_pending_seq    = g_boot_seq_base;
+    g_last_published_seq = g_boot_seq_base;
+    g_last_awaited_seq   = g_boot_seq_base;
+#ifdef MISTER_NATIVE_VIDEO
+    if (g_dev_ok) mf_install_exit_hooks();   // only worth arming once the map exists
+#endif
     g_inited = true;
 }
 
@@ -3268,7 +3639,14 @@ static void mf_frame_end(void) {
     // strictly before the submit. Safe only because the ring and vertex buffer are
     // double-buffered (B1) and textures are pinned for two frames (B3) — without both, this
     // is the corruption cascade documented at the in-flight-batch guard below.
-    if (g_dev_ok) {
+    // [fabric lifecycle] Teardown has taken the ring: it waited for the ack, zeroed
+    // it and parked the control block. Publishing now re-fills the ring and rings a
+    // doorbell the dying process will never wait on — precisely the state the next
+    // engine's bring-up has to dig out of.
+    if (g_fabric_shutdown) {
+        g_frame_dropped = true;
+    }
+    else if (g_dev_ok) {
         // [Phase 2 host lever] Barrier immediately before the control-block writes, not at
         // frame start. A false return means the previous batch never acked; publishing would
         // stomp it, so drop this frame's batch and leave the ring intact.
@@ -3307,6 +3685,9 @@ static void mf_frame_end(void) {
     // picture holds. Blanking here would make the oracle report a black frame where the
     // device reports an unchanged one -- and "did the dropped frame execute anyway?" is
     // exactly what case_inflight_drop asks by comparing framebuffers.
+    // [fabric lifecycle] Same guard as the device path above, so "teardown stops the
+    // frame loop from re-arming the ring" is a property the oracle can assert.
+    if (g_fabric_shutdown) { g_frame_dropped = true; return; }
     if (!mf_publish_barrier()) {
         g_frame_dropped = true;
         return;
@@ -3641,6 +4022,42 @@ extern "C" uint32_t RasterBackend_MFGPU_TestTrilistCommandCount(void) {
     }
     return n;
 }
+// [fabric lifecycle] Bring-up / teardown introspection and steering. The oracle has
+// no fabric, so the only things that can be observed off-device are the PROTOCOL
+// decisions — which sequence was adopted, what was written and in what order, what
+// was never written (C_DONE), how many attempts ran, and whether teardown left the
+// block idle. Those are exactly the properties the wedge violated.
+extern "C" uint32_t RasterBackend_MFGPU_TestBootSeqBase(void)   { return g_boot_seq_base; }
+extern "C" uint32_t RasterBackend_MFGPU_TestBringupAttempts(void){ return g_bringup_attempts; }
+extern "C" uint32_t RasterBackend_MFGPU_TestQuiescePolls(void)  { return g_quiesce_polls; }
+extern "C" uint32_t RasterBackend_MFGPU_TestQuiesceTimeouts(void){ return g_quiesce_timeouts; }
+extern "C" uint32_t RasterBackend_MFGPU_TestHandshakeProbes(void){ return g_handshake_probes; }
+extern "C" int      RasterBackend_MFGPU_TestHandshakeOk(void)   { return g_handshake_ok ? 1 : 0; }
+extern "C" uint32_t RasterBackend_MFGPU_TestRingCleared(void)   { return g_ring_cleared; }
+extern "C" uint32_t RasterBackend_MFGPU_TestHeapCleared(void)   { return g_heap_cleared; }
+extern "C" uint32_t RasterBackend_MFGPU_TestTeardownRuns(void)  { return g_teardown_runs; }
+extern "C" int      RasterBackend_MFGPU_TestShutdownFlag(void)  { return g_fabric_shutdown ? 1 : 0; }
+// Model a fabric that never answers the startup probe (drives retry + soft-fail).
+extern "C" void RasterBackend_MFGPU_TestSetHandshakeAck(int ack) { g_test_handshake_ack = ack ? 1 : 0; }
+extern "C" uint32_t RasterBackend_MFGPU_TestCtrlRead(int qw) { return mf_ctrl_rd(qw); }
+// Installed for the duration of one bring-up so a case can converge the shadow's
+// C_DONE onto C_SUBMIT after N polls — i.e. play the fabric finishing its batch.
+extern "C" void RasterBackend_MFGPU_TestSetPollHook(void (*hook)(void)) { g_test_poll_hook = hook; }
+// Release the once-only teardown latch so more than one case can exercise teardown.
+// Deliberately host-only: teardown running twice on device is a bug, and this latch
+// is what prevents it — there must be no way to unlatch it in a shipping build.
+#ifndef MISTER_NATIVE_VIDEO
+// Seed the oracle's control-block shadow the way a dead engine would have left it:
+// a submit the fabric has not acked yet, so bring-up has something to quiesce.
+extern "C" void RasterBackend_MFGPU_TestSetCtrlSubmitDone(uint32_t submit, uint32_t done) {
+    g_ctrl_shadow[MF_C_SUBMIT] = submit;
+    g_ctrl_shadow[MF_C_DONE]   = done;
+}
+extern "C" void RasterBackend_MFGPU_TestClearShutdown(void) {
+    g_fabric_shutdown = 0; g_teardown_ran = 0; g_teardown_runs = 0;
+}
+#endif
+
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
     g_inited = false; g_frame_active = false;
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap
