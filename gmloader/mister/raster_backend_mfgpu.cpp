@@ -64,6 +64,7 @@
 // real per-texel alpha is a future RTL item.
 #include "raster_backend.h"
 #include "raster_backend_convert.h"
+#include "mf_vtx_clip.h"   // guard-band screen clip (int16 12.4 wrap)
 #include "fps_overlay.h"   // [OSD-fps] clamp + 7-seg digit table (Solarus port)
 #include "mf_seam_stat.h"   // [Phase 4 Stage A] submit-seam decomposition
 #include "mf_pending_clear.h"   // [Phase 4 Stage B] deferred full-screen clear
@@ -509,6 +510,14 @@ static uint32_t g_tl_groups = 0, g_tl_cmds = 0, g_tl_tris = 0;
 static uint32_t g_tl_groups_pub = 0, g_tl_cmds_pub = 0, g_tl_tris_pub = 0;
 // Run total of groups absorbed into an already-open command (= commands saved).
 static uint32_t g_batch_merged = 0;
+
+// [guard-band clip] How often mf_emit_group had to clip a group because a vertex
+// reached outside the int16 12.4 wire range (mf_vtx_clip.h). PROCESS-CUMULATIVE
+// and deliberately not reset per frame: the failure this guards against is rare
+// and transient -- an object crossing y ~= 2048 for a single frame -- so a
+// per-frame counter would be zero every time it was read. Non-zero after a run
+// is the direct witness that the smear geometry was present and was caught.
+static uint32_t g_vtx_clip_groups = 0, g_vtx_clip_tris_in = 0, g_vtx_clip_tris_out = 0;
 
 static inline uint16_t mf_rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
@@ -2808,6 +2817,49 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
                 nt, MF_MAX_VERTS);
         return;
     }
+    // ── guard-band screen clip, AHEAD of the fixed-point pack ────────────────
+    // The wire vertex is int16 12.4, so bvtx_to_blt cannot represent a screen
+    // coordinate past +/-2047.94 px and used to wrap it modulo 4096 -- the
+    // full-height texel-row smear documented in mf_vtx_clip.h. Every vertex the
+    // fabric path will ever pack passes through the loop below, so this is the
+    // one place the range invariant has to hold.
+    //
+    // Placed before EVERYTHING else in this function on purpose: the batch key,
+    // the deferred-clear cover test (mf_pc_is_cover, via `verts`/`nt`) and the
+    // coverage estimator must all see the same geometry the fabric will execute.
+    // A clipped group can change nt, and mf_pc_is_cover only recognises nt == 2 --
+    // that direction is safe, it just emits a fill it might have elided.
+    //
+    // The check is a compare over the vertices and nothing else: real draws never
+    // leave the guard band, so the normal path is untouched and byte-identical.
+    static BVtx g_clipscratch[MF_MAX_VERTS];
+    if (mf_vtx_needs_clip(verts, nverts)) {
+        const int clipped_nt = mf_vtx_clip_group(verts, nt, g_clipscratch, MF_MAX_VERTS);
+        g_vtx_clip_groups++;
+        g_vtx_clip_tris_in  += nt;
+        g_vtx_clip_tris_out += clipped_nt;
+        // Log the first few, with the offending extent and the texture page, so a
+        // device run names the culprit object instead of merely proving one exists.
+        // Rate-limited hard: a stretched primitive can trip this every frame.
+        if (g_vtx_clip_groups <= 8) {
+            float mnx = verts[0].x, mxx = verts[0].x, mny = verts[0].y, mxy = verts[0].y;
+            for (int i = 1; i < nverts; i++) {
+                if (verts[i].x < mnx) mnx = verts[i].x;
+                if (verts[i].x > mxx) mxx = verts[i].x;
+                if (verts[i].y < mny) mny = verts[i].y;
+                if (verts[i].y > mxy) mxy = verts[i].y;
+            }
+            fprintf(stderr, "backend_mfgpu: [vtxclip] frame=%lu out-of-range group "
+                            "x=[%.1f..%.1f] y=[%.1f..%.1f] tris %d->%d "
+                            "tex_off=0x%x %dx%d (page %dx%d)\n",
+                    (unsigned long)g_frame_no, mnx, mxx, mny, mxy, nt, clipped_nt,
+                    (unsigned)tex.off, tw, th, (int)tex.w, (int)tex.h);
+        }
+        if (clipped_nt <= 0) return;   // wholly outside the guard rect: draws nothing
+        verts  = g_clipscratch;
+        nt     = clipped_nt;
+        nverts = nt * 3;
+    }
     float min_vtx_a = 1.0f;
     for (int i = 0; i < nverts; i++) {
         g_vtxscratch[i] = bvtx_to_blt(&verts[i], tw, th);
@@ -4010,6 +4062,14 @@ extern "C" void RasterBackend_MFGPU_TestEnvReset(void) { g_defer_clear_v = -1; g
 extern "C" uint32_t RasterBackend_MFGPU_TestTrilistCmds(void)   { return g_tl_cmds; }
 extern "C" uint32_t RasterBackend_MFGPU_TestTrilistGroups(void) { return g_tl_groups; }
 extern "C" uint32_t RasterBackend_MFGPU_TestBatchMerged(void)   { return g_batch_merged; }
+// [guard-band clip] host-test + device-diagnostic readouts. Cumulative; see the
+// declaration for why they are never reset.
+extern "C" uint32_t RasterBackend_MFGPU_ClipGroups(void)   { return g_vtx_clip_groups; }
+extern "C" uint32_t RasterBackend_MFGPU_ClipTrisIn(void)   { return g_vtx_clip_tris_in; }
+extern "C" uint32_t RasterBackend_MFGPU_ClipTrisOut(void)  { return g_vtx_clip_tris_out; }
+extern "C" void     RasterBackend_MFGPU_ClipReset(void) {
+    g_vtx_clip_groups = 0; g_vtx_clip_tris_in = 0; g_vtx_clip_tris_out = 0;
+}
 // Count BLT_OP_TRILIST entries actually in the ring, independent of the counters
 // above -- a counter can only witness the emitter if something checks it against
 // the ring it claims to describe.

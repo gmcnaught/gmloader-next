@@ -255,6 +255,15 @@ mf-cov-clip-test:
 	  $(MFGPU_SRC) \
 	  -lm -o /tmp/mcct && /tmp/mcct
 
+# Guard-band screen clip for the fabric vertex path (mf_vtx_clip.h): proves the
+# int16 12.4 wrap smear and the clip that stops it. Header-only and pure, so
+# unlike the two above it needs NO link set -- just the test driver.
+.PHONY: mf-vtx-clip-test
+mf-vtx-clip-test:
+	c++ -std=c++17 -Igmloader/mister $(MFGPU_INC) \
+	  gmloader/mister/mf_vtx_clip_test.cpp \
+	  -lm -o /tmp/mvct && /tmp/mvct
+
 .PHONY: blitter-raster-test
 # Host test for the GL-free software rasterizer + surface clear
 # (blitter_raster.cpp). The file predates this target and was unreachable from
