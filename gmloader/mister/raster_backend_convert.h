@@ -38,10 +38,32 @@ static inline float rbc_clampf(float x, float lo, float hi) {
 // lroundf() gives round-half-away-from-zero, the exact rounding the brief
 // specifies ("lround(v->x*16)"); the BLT_RGBA channel order is confirmed against
 // the packing macro in blitter_ref.h (r | g<<8 | b<<16 | a<<24).
+// Saturating narrow to the wire's int16 12.4 screen coordinate. A BARE
+// (int16_t)lroundf(x*16) cast is what shipped here originally, and past
+// +/-2047.9375 px it WRAPS modulo 4096 px: a triangle straddling that boundary
+// grows ~4000 px tall and rasterizes as a full-height column of one texel row
+// (see mf_vtx_clip.h for the full mechanism and the device evidence).
+//
+// mf_vtx_clip.h's guard band is the real fix and runs ahead of this, so by the
+// time a vertex reaches here it is already in range. This clamp is the backstop
+// for a path that forgets to call it: saturating parks the vertex at the edge of
+// a coordinate space 7x the framebuffer, where it contributes nothing visible,
+// instead of teleporting it into the middle of the screen.
+static inline int16_t rbc_pack_fx(float px) {
+    // NaN is tested on the INPUT, not on lroundf's result: lroundf(NaN) returns an
+    // unspecified value (0 on this toolchain), which would sail through a range
+    // check and pack as a legitimate on-screen 0.
+    if (!(px == px)) return (int16_t)-32768;
+    const float fx = px * 16.0f;
+    if (!(fx > -32768.0f)) return (int16_t)-32768;   // the !(>) form also catches -inf
+    if (fx > 32767.0f)     return (int16_t)32767;
+    return (int16_t)lroundf(fx);
+}
+
 static inline blt_vtx_t bvtx_to_blt(const BVtx *v, int tex_w, int tex_h) {
     blt_vtx_t o;
-    o.x = (int16_t)lroundf(v->x * 16.0f);
-    o.y = (int16_t)lroundf(v->y * 16.0f);
+    o.x = rbc_pack_fx(v->x);
+    o.y = rbc_pack_fx(v->y);
     o.u = (uint16_t)lroundf(rbc_clampf(v->u, 0.0f, 1.0f) * (float)tex_w * 16.0f);
     o.v = (uint16_t)lroundf(rbc_clampf(v->v, 0.0f, 1.0f) * (float)tex_h * 16.0f);
     o.rgba = BLT_RGBA(lroundf(v->r * 255.0f), lroundf(v->g * 255.0f),
