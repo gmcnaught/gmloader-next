@@ -2,6 +2,7 @@
 #include "so_util.h"
 #include "thunk_gen.h"
 #include <stdio.h>
+#include <stdlib.h>
 template<typename D, typename R, typename... Args>
 struct ThunkFloatImplPtr;
 
@@ -75,6 +76,46 @@ uintptr_t select_either_ptr(void *fn, const char *symname)
     return (uintptr_t)T::func;
 }
 
+/* Per-symbol reporting for the resolver below, off by default.
+ *
+ * WHY IT IS GATED. This used to fprintf one line per unresolved symbol,
+ * unconditionally, in every build. Mesa does not provide ~679 of the extension
+ * entry points glad asks for, so every launch wrote 679 lines — and on the
+ * MiSTer those go to stderr, which launch.sh redirects to a log on the exFAT
+ * SD card. stderr is unbuffered, so that is 679 write syscalls at ~1.3 ms
+ * each. Measured on .81 2026-08-22: 1400 log writes cost 1.837 s to
+ * /media/fat vs 0.019 s to tmpfs, and moving the whole log to tmpfs took the
+ * core's time-to-first-drawn-frame from 14.5 s to 10.2 s. Roughly half of that
+ * log volume was this one fprintf.
+ *
+ * The information is still worth having — it is how you find which GL entry
+ * points Mesa cannot supply — so it is a runtime switch rather than a deletion:
+ * set GMLOADER_DBG_THUNKS=1 to get the per-symbol lines back. Unset, you still
+ * get the one-line count from thunk_resolve_report(), which costs one write. */
+inline bool thunk_dbg_enabled()
+{
+    static const bool on = [] {
+        const char *v = getenv("GMLOADER_DBG_THUNKS");
+        return v && *v && *v != '0';
+    }();
+    return on;
+}
+
+inline int &thunk_unresolved_count()
+{
+    static int n = 0;
+    return n;
+}
+
+/* One line instead of hundreds. Call after a resolver pass. */
+inline void thunk_resolve_report(const char *what)
+{
+    fprintf(stderr, "GL thunks (%s): %d symbol(s) unresolved%s\n", what,
+            thunk_unresolved_count(),
+            thunk_dbg_enabled() ? "" : " (set GMLOADER_DBG_THUNKS=1 to list them)");
+    thunk_unresolved_count() = 0;
+}
+
 template <auto F>
 void *resolve_thunked(const char *symbol, int &index, DynLibFunction tab[], void *(*resolve)(const char *symbol))
 {
@@ -83,8 +124,10 @@ void *resolve_thunked(const char *symbol, int &index, DynLibFunction tab[], void
         tab[index++] = (DynLibFunction){symbol, select_either_ptr<F>(f, symbol)};
         tab[index] = {NULL};
     } else {
-        // Only log first 256 chars of symbol to avoid log flood for long extension names
-        fprintf(stderr, "DBG resolve NULL: %.64s\n", symbol);
+        thunk_unresolved_count()++;
+        // Only log first 64 chars of symbol to avoid log flood for long extension names
+        if (thunk_dbg_enabled())
+            fprintf(stderr, "DBG resolve NULL: %.64s\n", symbol);
     }
 
     return f;

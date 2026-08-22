@@ -188,4 +188,6 @@ void load_egl_funcs()
     glad_eglUnbindWaylandDisplayWL = (PFNEGLUNBINDWAYLANDDISPLAYWLPROC)PTR_RESOLVE(eglUnbindWaylandDisplayWL);
     glad_eglQueryWaylandBufferWL = (PFNEGLQUERYWAYLANDBUFFERWLPROC)PTR_RESOLVE(eglQueryWaylandBufferWL);
     glad_eglCreateWaylandBufferFromImageWL = (PFNEGLCREATEWAYLANDBUFFERFROMIMAGEWLPROC)PTR_RESOLVE(eglCreateWaylandBufferFromImageWL);
+
+    thunk_resolve_report("egl");
 }
