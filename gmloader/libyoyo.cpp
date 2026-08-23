@@ -403,6 +403,12 @@ void patch_libyoyo(so_module *mod)
     // present, so old runners are left untouched.
     bool runner_needs_dedup =
         so_symbol(mod, "_Z12Function_AddPKcPFvR6RValueP9CInstanceS4_iPS1_Eib") != 0;
+    // [EXPERIMENT] Cursed Castilla EX disproves the mangling-as-generation proxy:
+    // its 2017 GMS1.4 runner (runtime 1.0.0.1760, bytecode 15) exports the
+    // const-char* Function_Add, so the check above calls it "modern" and the
+    // rehook SIGILLs on the first Function_Add -- the exact failure the comment
+    // above predicts for old runners. Forced off to confirm causation.
+    if (getenv("GMLOADER_NO_FUNCADD_REHOOK")) runner_needs_dedup = false;
     if (runner_needs_dedup && Function_Add && !Original_Function_Add)
     {
         Original_Function_Add = Function_Add;
