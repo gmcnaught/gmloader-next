@@ -997,4 +997,6 @@ void load_gles2_funcs()
 	// Terminate the symbol table
 	symtable_gles2[symtable_gles2_index].symbol = NULL;
 	symtable_gles2[symtable_gles2_index].func   = (uintptr_t)NULL;
+
+	thunk_resolve_report("gles2");
 }
