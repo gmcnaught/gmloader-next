@@ -253,6 +253,7 @@ void mat4_mul_vec4(const float *m, const float *v, float *out) {
 
 const char* blend_name() {
     if (!g_blendEnabled) return "NONE";
+    if (g_blendSrc == GL_ONE && g_blendDst == GL_ZERO) return "NONE";  // replace
     if (g_blendSrc == GL_SRC_ALPHA && g_blendDst == GL_ONE_MINUS_SRC_ALPHA) return "ALPHA";
     if (g_blendSrc == GL_ONE && g_blendDst == GL_ONE_MINUS_SRC_ALPHA) return "PREMULT";
     if ((g_blendSrc == GL_ONE && g_blendDst == GL_ONE) ||
@@ -316,6 +317,13 @@ void read_attrib(const Attrib &a, int i, float *out) {
 // Map current GL blend state to an RBlend; false if unsupported.
 bool get_rblend(RBlend *out) {
     if (!g_blendEnabled) { *out = RB_NONE; return true; }
+    // Blending ENABLED with ONE/ZERO is dst = src*1 + dst*0 -- a plain replace,
+    // identical to blending disabled. Cursed Castilla EX drives every draw this
+    // way; without this case get_rblend() returned false, which short-circuits
+    // the caller's `if (get_render_target() && get_rblend())` and SILENTLY drops
+    // the draw before submission (trace shows rast=0 with cull=-), producing a
+    // black screen while the fabric still ticks over on clear/present batches.
+    if (g_blendSrc == GL_ONE && g_blendDst == GL_ZERO)                      { *out = RB_NONE; return true; }
     if (g_blendSrc == GL_SRC_ALPHA && g_blendDst == GL_ONE_MINUS_SRC_ALPHA) { *out = RB_ALPHA; return true; }
     if (g_blendSrc == GL_ONE && g_blendDst == GL_ONE_MINUS_SRC_ALPHA)       { *out = RB_PREMULT; return true; }
     if ((g_blendSrc == GL_ONE && g_blendDst == GL_ONE) ||
