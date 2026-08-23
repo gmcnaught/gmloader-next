@@ -2808,6 +2808,79 @@ static bool mf_batch_clear_relevant(uint8_t extra_flags) {
     return false;
 }
 
+// ── [C2 magenta band] colorkey-vs-const-alpha census ─────────────────────────
+// mf_emit_group can only pick ONE of BLT_BLEND_COLORKEY and BLT_BLEND_CONST_ALPHA
+// (a TRILIST header carries one blend mode), so a KEYED texture drawn at less
+// than fully-opaque vertex alpha falls back to CONST_ALPHA -- and the colorkey
+// sentinel MF_COLORKEY (0xF81F) is then written as a visible MAGENTA pixel
+// instead of being culled. That is the documented hole at the top of this file
+// ("real per-texel alpha is a future RTL item").
+//
+// The observable that makes this worth measuring rather than assuming: on .62
+// the magenta band flickers to transparent for a moment roughly every 7s. That
+// is exactly what the threshold predicts -- when min_vtx_a momentarily reaches
+// >= 254/255 the branch flips to COLORKEY, the sentinel culls, and the band
+// disappears for those frames.
+//
+// Bounded two ways so this can be left on: a line only when a given staged page
+// CHANGES blend mode (steady state prints nothing, the flip prints once), plus
+// a periodic census. tex.off + tw x th identifies the staged page -- 512x256
+// would be one of the app-surface FBO attachments, which would also tie this to
+// the frozen frame.
+struct MfKeyStat { uint32_t off; int tw, th; uint8_t last_ck; uint32_t n_ck, n_fb;
+                   float amin, amax; };
+static MfKeyStat g_keystat[16];
+static int       g_keystat_n = 0;
+static int       g_keytrace_lines = 0;
+static void mf_key_trace(uint32_t off, int tw, int th, float min_a, bool colorkeyed,
+                         bool has_key, const BVtx *verts, int nverts, int nt) {
+    // Only a KEYED page can paint the sentinel, so an un-keyed draw taking the
+    // non-colorkey branch is completely normal and must not be labelled as
+    // writing magenta -- mislabelling it would send a later reader chasing every
+    // ordinary CONST_ALPHA draw in the frame.
+    if (!has_key) return;
+    MfKeyStat *e = nullptr;
+    for (int i = 0; i < g_keystat_n; i++)
+        if (g_keystat[i].off == off && g_keystat[i].tw == tw && g_keystat[i].th == th)
+            { e = &g_keystat[i]; break; }
+    if (!e) {
+        if (g_keystat_n >= (int)(sizeof(g_keystat)/sizeof(g_keystat[0]))) return;
+        e = &g_keystat[g_keystat_n++];
+        *e = MfKeyStat{ off, tw, th, (uint8_t)(colorkeyed ? 1 : 0), 0, 0, 1.0f, 0.0f };
+        e->last_ck = 0xFF;   // force the first observation to print
+    }
+    if (colorkeyed) e->n_ck++; else e->n_fb++;
+    if (min_a < e->amin) e->amin = min_a;
+    if (min_a > e->amax) e->amax = min_a;
+
+    uint8_t ck = colorkeyed ? 1 : 0;
+    if (e->last_ck != ck && g_keytrace_lines < 200) {
+        g_keytrace_lines++;
+        float mnx = verts[0].x, mxx = verts[0].x, mny = verts[0].y, mxy = verts[0].y;
+        for (int i = 1; i < nverts; i++) {
+            if (verts[i].x < mnx) mnx = verts[i].x;
+            if (verts[i].x > mxx) mxx = verts[i].x;
+            if (verts[i].y < mny) mny = verts[i].y;
+            if (verts[i].y > mxy) mxy = verts[i].y;
+        }
+        fprintf(stderr, "MFKEY f=%lu off=%08X %dx%d min_a=%.5f -> %s "
+                "rect=[%.0f,%.0f..%.0f,%.0f] nt=%d\n",
+                (unsigned long)g_frame_no, (unsigned)off, tw, th, min_a,
+                ck ? "COLORKEY(culls)" : "CONST_ALPHA(WRITES MAGENTA)",
+                mnx, mny, mxx, mxy, nt);
+    }
+    e->last_ck = ck;
+}
+static void mf_key_census(void) {
+    for (int i = 0; i < g_keystat_n; i++) {
+        MfKeyStat &e = g_keystat[i];
+        fprintf(stderr, "MFKEYSTAT f=%lu off=%08X %dx%d colorkey=%u fallback=%u "
+                "min_a=[%.5f..%.5f]\n",
+                (unsigned long)g_frame_no, (unsigned)e.off, e.tw, e.th,
+                e.n_ck, e.n_fb, e.amin, e.amax);
+    }
+}
+
 static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
                           const BVtx *verts, int nt, RBlend bl,
                           bool has_key, uint8_t extra_flags) {
@@ -2872,10 +2945,36 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
     // the reorder is inert. The push itself now happens inside each branch.
     uint8_t blend_mode;
     uint16_t colorkey;
-    if (has_key && min_vtx_a * 255.0f >= 254.0f) {
+    // [C2 magenta band] COLORKEY culls the sentinel; the alternative for a keyed
+    // page does not, and MF_COLORKEY (0xF81F) is then WRITTEN as visible magenta.
+    //
+    // The vertex-alpha test is only meaningful when the fallback would actually
+    // USE the alpha. It doesn't for RB_NONE: rblend_to_blt(RB_NONE) is
+    // BLT_BLEND_COPY, whose refmodel case is `*dp = src` -- vertex alpha plays
+    // no part in the result at all (blt_tint565 modulates by the vertex RGB, not
+    // its alpha). COLORKEY differs from COPY on exactly one class of texel, the
+    // sentinel, which is precisely the texel that must not be written. So for a
+    // COPY blend, COLORKEY is strictly MORE correct than COPY at ANY alpha, and
+    // gating it on alpha gates it on a quantity that cannot change the output.
+    //
+    // Measured on Cursed Castilla EX (.62, 2026-08-23): every EX draw is an
+    // enabled GL_ONE/GL_ZERO replace, i.e. RB_NONE, and the game pulses the
+    // title logo's vertex alpha. The old condition therefore took the fallback
+    // ~86% of the time (off=0009E8C8: colorkey=352 fallback=2196), painting the
+    // logo and the band behind it magenta, and flipped to COLORKEY only for the
+    // few frames per cycle where alpha touched 1.0 -- the ~7s "flickers to
+    // transparent" that made this findable.
+    //
+    // RB_ALPHA/PREMULT keep the old threshold: their fallback IS CONST_ALPHA,
+    // which really does use the alpha, and colorkey + const-alpha cannot be
+    // combined in one TRILIST header. That remains the documented RTL hole at
+    // the top of this file.
+    if (has_key && (bl == RB_NONE || min_vtx_a * 255.0f >= 254.0f)) {
         blend_mode = BLT_BLEND_COLORKEY;
         colorkey = MF_COLORKEY;
+        mf_key_trace(tex.off, tw, th, min_vtx_a, /*colorkeyed=*/true, has_key, verts, nverts, nt);
     } else {
+        mf_key_trace(tex.off, tw, th, min_vtx_a, /*colorkeyed=*/false, has_key, verts, nverts, nt);
         blend_mode = rblend_to_blt(bl);
         // A fully-opaque ALPHA draw over a source with no per-texel alpha IS a copy, and
         // the difference is not free on the fabric. BLT_BLEND_CONST_ALPHA sets the RTL's
@@ -3661,6 +3760,7 @@ static void mf_frame_end(void) {
             last = g_dup_skipped;
             fprintf(stderr, "MFCLEAR frames=%u clears_dropped=%u clears_emitted=%u defer=%d\n",
                     nf, g_pc_dropped_total, g_pc_emitted_total, mf_defer_clear_on());
+            mf_key_census();   // [C2 magenta band] see mf_key_trace
         }
     }
 #endif
