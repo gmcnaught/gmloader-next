@@ -209,12 +209,47 @@ bool fg_window() {
 // thunk vs. go straight to Mesa via eglGetProcAddress (RTLD_GLOBAL bypass).
 uint32_t g_nVap=0, g_nBindBuf=0, g_nBufData=0, g_nGetULoc=0, g_nUniMat=0, g_nEnVap=0, g_nUseProg=0;
 
+// Bounded report of what an upload produced -- see the call sites in
+// store_texture(). Every upload is logged for the first TEXLOG_FIRST calls;
+// after that only uploads that leave the texture invalid are, so a texture
+// created mid-run (a room transition, a surface recreation) still reports.
+const int TEXLOG_FIRST = 64;   // log every upload for this many calls
+const int TEXLOG_BAD   = 32;   // ...then this many invalid-result uploads
+void texnew_log(GLuint id, int w, int h, GLenum fmt, GLenum type,
+                bool px_null, int valid) {
+    static int n_all = 0, n_bad = 0;
+    bool want = (n_all < TEXLOG_FIRST) || (!valid && n_bad < TEXLOG_BAD);
+    n_all++;
+    if (!valid) n_bad++;
+    if (!want) return;
+    fprintf(stderr, "TEXNEW id=%u %dx%d fmt=0x%04X type=0x%04X px=%s -> valid=%d%s\n",
+            id, w, h, (unsigned)fmt, (unsigned)type, px_null ? "null" : "data", valid,
+            valid ? "" : (px_null ? "  [DROPS DRAWS: no pixels, awaiting TexSubImage2D]"
+                                  : "  [DROPS DRAWS: unsupported upload format]"));
+}
+
 // Convert an uploaded texture to an RGBA8888 CPU copy (common GM formats only).
 void store_texture(GLuint id, int w, int h, GLenum fmt, GLenum type, const void *px) {
     Tex &t = g_textures[id];
     free(t.rgba); t.rgba = nullptr; t.valid = 0; t.packed = 0; t.opaque = 0;
     t.w = w; t.h = h; t.fmt = fmt; t.type = type;
-    if (!px || w <= 0 || h <= 0) return;            // allocated-but-unfilled (FBO target)
+    // TEXNEW: what this upload actually produced. A texture that ends up with
+    // rgba==nullptr samples as valid=0 at draw time, and handle_draw's
+    // `tex.valid` gate then drops the draw -- so this line is the difference
+    // between "the draw did nothing" and "the draw was rejected, here's why".
+    // Two distinct paths land there, and they need different fixes:
+    //   px==NULL          -> allocated-but-unfilled; the pixels arrive later via
+    //                        glTexSubImage2D, which is not wired up (see
+    //                        Blitter_OnTexSubImage2D).
+    //   fmt/type != RGBA8 -> unsupported upload format, falls through to the
+    //                        "leave invalid" default at the end of this function.
+    // Bounded: the first TEXLOG_FIRST uploads, plus any upload that produces an
+    // invalid texture (capped separately, so a mid-run upload still reports).
+    const bool _px_null = (px == nullptr);
+    if (!px || w <= 0 || h <= 0) {                  // allocated-but-unfilled (FBO target)
+        texnew_log(id, w, h, fmt, type, _px_null, t.valid);
+        return;
+    }
     if (type == GL_UNSIGNED_BYTE && (fmt == GL_RGBA)) {
         size_t n = (size_t)w * h;
         uint64_t _t0 = g_prof ? bl_now_ns() : 0;
@@ -243,6 +278,7 @@ void store_texture(GLuint id, int w, int h, GLenum fmt, GLenum type, const void 
     }
     // other formats (RGB, LUMINANCE, compressed) -> leave invalid; such draws
     // will fall back to GL. The log reports the format so we know what to add.
+    texnew_log(id, w, h, fmt, type, _px_null, t.valid);
 }
 
 // column-major mat4 (GL default) times vec4
@@ -346,7 +382,13 @@ bool get_render_target(RSurface *out) {
     auto fit = g_fboColorTex.find(g_curFBO);
     if (fit == g_fboColorTex.end()) return false;
     Tex &t = g_textures[fit->second];
-    if (t.w <= 0 || t.h <= 0) return false;
+    if (t.w <= 0 || t.h <= 0) {
+        static int _warned = 0;
+        if (_warned < 8) { _warned++;
+            fprintf(stderr, "RTDROP fbo=%u attachtex=%u recorded=%dx%d -- no dimensions, "
+                            "draw dropped\n", g_curFBO, fit->second, t.w, t.h); }
+        return false;
+    }
     // A render target must be a full RGBA8888 surface (the rasterizer writes 4
     // bpp). If this texture was uploaded as packed RGBA4444, drop it and back the
     // target with a fresh 8888 buffer — never alias a 2 bpp buffer as 4 bpp.
@@ -452,6 +494,11 @@ void Blitter_OnBindFramebuffer(GLenum, GLuint fbo) {
 void Blitter_OnFramebufferTexture2D(GLenum, GLuint tex) {
     if (!g_enabled) return;
     g_fboColorTex[g_curFBO] = tex;   // attach to currently-bound FBO
+    {   static int _n = 0;
+        if (_n < 16) { _n++;
+            Tex &at = g_textures[tex];
+            fprintf(stderr, "RTATTACH fbo=%u tex=%u recorded=%dx%d\n",
+                    g_curFBO, tex, at.w, at.h); } }
     if (fg_window()) fprintf(stderr, "FG f=%d attachTex fbo=%u tex=%u\n", g_frameNo, g_curFBO, tex);
 }
 
@@ -578,12 +625,28 @@ static int handle_draw(const char *kind, GLenum mode, int count,
     // Rasterize into our surfaces (owning mode only).
     int rast = 0;
     const char *cullReason = nullptr;   // non-null => skipped as provably invisible
+    // Why nothing was rasterized, when it was NOT an overdraw cull. Every gate
+    // between here and the draw() call used to fail silently, reporting rast=0
+    // paired with cull=- -- which reads as "nothing happened" rather than
+    // "rejected, here is the gate". That signature hid a black screen for a
+    // whole debugging session (get_rblend() returning false on an enabled
+    // ONE/ZERO replace blend short-circuited the draw before the cull logic
+    // could record anything). Kept separate from cullReason so the g_pf_culled
+    // profiling counter keeps counting culls only.
+    const char *dropReason = nullptr;
+    int texval = -1;                    // -1 = never reached the texture gate
     if (g_own && decoded == count && mode == GL_TRIANGLES && count >= 3) {
         RSurface rt; RBlend blend;
-        if (get_render_target(&rt) && get_rblend(&blend)) {
+        bool okRT = get_render_target(&rt);
+        bool okBL = okRT && get_rblend(&blend);   // short-circuit as before
+        if (!okRT)                    dropReason = "nortarget";
+        else if (!okBL)               dropReason = "noblend";
+        else {
             RTexture tex; get_rtexture(&tex);
             if (g_notex) tex.valid = 0;   // probe: skip texture fetch -> samples white
-            if (tex.valid || g_notex) {
+            texval = tex.valid;
+            if (!(tex.valid || g_notex)) dropReason = "notex";
+            else {
                 // ---- overdraw culling (env GMLOADER_BLITTER_CULL, default on) ----
                 // Cheap per-draw short-circuits that drop draws which provably can't
                 // change a visible pixel of the render target. The bbox is in the
@@ -628,16 +691,26 @@ static int handle_draw(const char *kind, GLenum mode, int count,
                 }
             }
         }
+    } else {
+        dropReason = !g_own ? "notown"
+                   : (decoded != count) ? "undecoded"
+                   : (mode != GL_TRIANGLES) ? "notri" : "degenerate";
     }
+
+    // One reason field for the whole path: a cull if it got that far, otherwise
+    // the gate that rejected it. Never "-" while rast=0.
+    const char *whyNot = cullReason ? cullReason : dropReason;
 
     bool fg_win = fg_window();
     if (g_drawNo <= LOG_FIRST) {
         Tex *bt = g_textures.count(g_boundTex2D) ? &g_textures[g_boundTex2D] : nullptr;
         fprintf(stderr, "BLIT draw#%llu %s rt=%s tex=%u(%dx%d val=%d) blend=%s "
-                "decoded=%d/%d rast=%d cull=%s screen=[%.0f,%.0f..%.0f,%.0f]\n",
+                "decoded=%d/%d rast=%d cull=%s mode=0x%04X blendraw=%s/0x%04X/0x%04X "
+                "screen=[%.0f,%.0f..%.0f,%.0f]\n",
                 (unsigned long long)g_drawNo, kind, g_curFBO ? "FBO" : "DEF",
                 g_boundTex2D, bt?bt->w:0, bt?bt->h:0, bt?bt->valid:0, blend_name(),
-                decoded, count, rast, cullReason ? cullReason : "-",
+                decoded, count, rast, whyNot ? whyNot : "-", (unsigned)mode,
+                g_blendEnabled ? "on" : "off", (unsigned)g_blendSrc, (unsigned)g_blendDst,
                 decoded?minx:0, decoded?miny:0, decoded?maxx:0, decoded?maxy:0);
     }
     // Full-frame draw-graph dump (GMLOADER_FRAMEGRAPH): every draw in the
@@ -647,9 +720,12 @@ static int handle_draw(const char *kind, GLenum mode, int count,
     if (fg_win) {
         GLuint fbotex = g_curFBO ? g_fboColorTex[g_curFBO] : 0;
         fprintf(stderr, "FG f=%d d#%llu fbo=%u fbotex=%u srctex=%u prog=%u blend=%s "
+                "rast=%d texval=%d why=%s mode=0x%04X nv=%d "
                 "vp=[%d,%d,%d,%d] scr=[%.0f,%.0f..%.0f,%.0f]\n",
                 g_frameNo, (unsigned long long)g_drawNo, g_curFBO, fbotex, g_boundTex2D,
-                g_curProgram, blend_name(), g_vpX, g_vpY, g_vpW, g_vpH,
+                g_curProgram, blend_name(),
+                rast, texval, whyNot ? whyNot : "-", (unsigned)mode, count,
+                g_vpX, g_vpY, g_vpW, g_vpH,
                 decoded?minx:0, decoded?miny:0, decoded?maxx:0, decoded?maxy:0);
     }
 
