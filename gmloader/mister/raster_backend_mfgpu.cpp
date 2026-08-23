@@ -3247,6 +3247,17 @@ static void mf_uvlog(const char *tag, const BVtx *v, int triCount, int tw, int t
             v_at_ymin, v_at_ymax, verdict);
 }
 
+// [default-surface Y flip] A/B knob so the flip can be turned off on device
+// without a rebuild -- this reconciles two conventions and the failure mode of
+// getting it wrong is a whole inverted frame, which is exactly the kind of thing
+// worth being able to bisect in place. On by default.
+static int mf_defsurf_yflip(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_MFGPU_DEFSURF_YFLIP");
+                 v = (e && *e) ? atoi(e) : 1; }
+    return v;
+}
+
 static void mf_draw(RSurface *d, const BVtx *v, int triCount,
                     const RTexture *t, RBlend bl, float ar, uint32_t tex_key) {
     mf_ensure_frame();
@@ -3417,6 +3428,48 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         for (int i = 0; i < nverts; i++) { compscratch[i] = v[i]; compscratch[i].v = vsum - v[i].v; }
         mf_emit_group(tex, tw, th, compscratch, triCount, bl, /*has_key=*/false, BLT_F_SRC_SURFACE);
         return;
+    }
+
+    // ── screen-space Y flip for draws that reach the DEFAULT surface DIRECTLY ──
+    // blitter.cpp:674 builds screen Y in GL's BOTTOM-origin convention
+    //     bv.y = g_vpY + (ndcy*0.5f + 0.5f) * g_vpH;   // GL bottom-up
+    // and the fabric's surfaces are TOP-origin. This engine has exactly one
+    // place that reconciles the two: the app-surface composite just above,
+    // whose texture-space v flip was calibrated on a Maldita capture. Maldita
+    // renders its scene into the app surface and composites it, so every pixel
+    // takes that path and lands upright -- the internal content is stored
+    // inverted and un-inverted once, at the end.
+    //
+    // Cursed Castilla EX never composites the app surface. Measured on .62 with
+    // GMLOADER_MFGPU_UVLOG over 400 frames: composite=0, scene=0. It draws
+    // straight to fbo=0, so nothing ever undoes the bottom-up Y and the WHOLE
+    // FRAME is displayed upside down. The fabric is not involved:
+    // tools/fabric_probe.armhf, which bypasses the engine entirely, renders its
+    // apex-at-y=48 triangle upright on both HDMI and the analog CRT.
+    //
+    // The flip is POSITION-only and the UVs travel with the vertices, so this
+    // repositions content without mirroring any texture. It is placed AFTER the
+    // composite branch's return on purpose: a composite is already reconciled in
+    // texture space, and flipping it here too would double-flip Maldita.
+    //
+    // Scene->appsurf draws are deliberately NOT flipped: that content is stored
+    // inverted BY DESIGN, because the composite is what un-inverts it.
+    //
+    // Safety for Maldita, measured rather than assumed (.62, f=600..602): its
+    // steady state is exactly three fbo=0 draws per frame, ALL spanning
+    // scr=[0,0..288,216] -- two app-surface composites (srctex=4), which return
+    // above and never reach here, and one full-screen border (srctex=6), whose
+    // geometry maps onto itself under this flip.
+    if (mf_defsurf_yflip() && !dst_is_appsurf) {
+        int nv = triCount * 3;
+        if (nv > 0 && nv <= MF_MAX_VERTS) {
+            static BVtx s_yflip[MF_MAX_VERTS];
+            const float H = (d && d->h > 0) ? (float)d->h : (float)BLT_FB_HEIGHT;
+            for (int i = 0; i < nv; i++) { s_yflip[i] = v[i]; s_yflip[i].y = H - v[i].y; }
+            v = s_yflip;
+        }
+        // nv > MF_MAX_VERTS is left alone: mf_emit_group drops that draw with an
+        // explicit error, so there is nothing to correct.
     }
 
     // Scene draws INTO the app surface, for the same capture: if GM's
