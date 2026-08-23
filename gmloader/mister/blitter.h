@@ -90,6 +90,10 @@ void Blitter_OnUseProgram(GLuint program);
 void Blitter_OnShaderSource(GLuint shader, const char *src, unsigned long len);
 void Blitter_OnAttachShader(GLuint program, GLuint shader);
 void Blitter_OnGetUniformLocation(GLuint program, const char *name, GLint loc);
+// [alpha-test threshold] The scalar uniforms the alpha test rides on:
+// gm_AlphaRefValue (float) and gm_AlphaTestEnabled (bool -> glUniform1i).
+void Blitter_OnUniform1f(GLint loc, float v);
+void Blitter_OnUniform1i(GLint loc, int v);
 void Blitter_OnUniformMatrix4fv(GLint location, GLsizei count, const GLfloat *value);  // capture matrices
 void Blitter_OnBlendState(int enabled, GLenum src, GLenum dst);
 void Blitter_OnViewport(int x, int y, int w, int h);

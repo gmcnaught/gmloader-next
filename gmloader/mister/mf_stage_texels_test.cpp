@@ -20,6 +20,7 @@
 // of the vector width (the tail), sub-rect origins (the source is strided by
 // t->w while the destination is tightly packed by rw), and both texel formats.
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <vector>
@@ -63,6 +64,24 @@ static void check_int(const char *name, int got, int expect) {
 
 static const uint16_t KEY = 0xF81F;
 
+// The 1-bit alpha cut is a knob (GMLOADER_MFGPU_ALPHA_CUT, default 128). The
+// oracle stays INDEPENDENT of the production body -- it is still written from
+// the contract, not lifted from the implementation -- but it has to be
+// parameterised by the same number, or the differential sweep silently stops
+// checking anything the moment the cut is moved off its default. The sweep is
+// the only thing that proves the scalar and NEON staging paths still agree,
+// which is precisely the property a threshold knob puts at risk.
+static int oracle_cut(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_ALPHA_CUT");
+        v = (e && *e) ? atoi(e) : 128;
+        if (v < 1)   v = 1;
+        if (v > 255) v = 255;
+    }
+    return v;
+}
+
 static uint16_t oracle_texel(const RTexture *t, int x, int y, int *has_key) {
     int r, g, b, a;
     if (t->format == RTEX_RGBA4444) {
@@ -73,7 +92,7 @@ static uint16_t oracle_texel(const RTexture *t, int x, int y, int *has_key) {
         const uint8_t *p = t->rgba + ((size_t)y * t->w + x) * 4;
         r = p[0]; g = p[1]; b = p[2]; a = p[3];
     }
-    if (a < 128) { *has_key = 1; return KEY; }
+    if (a < oracle_cut()) { *has_key = 1; return KEY; }
     uint16_t px = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
     if (px == KEY) px ^= 0x0020;
     return px;
@@ -121,6 +140,9 @@ static void test_alpha_threshold() {
     uint16_t px; int hk, mo;
 
     stage_one_8888(0xFF, 0xFF, 0xFF, 127, &px, &hk, &mo);
+    // Boundary cases below are written for the DEFAULT cut of 128 and are
+    // meaningless at any other value; the differential sweep still covers those.
+    if (oracle_cut() == 128) {
     check_u16("alpha 127 -> colorkey", px, KEY);
     check_int("alpha 127 -> has_key", hk, 1);
     check_int("alpha 127 -> mask_only", mo, 1);      // the key is "dark" by definition
@@ -129,6 +151,7 @@ static void test_alpha_threshold() {
     check_u16("alpha 128 -> opaque white", px, 0xFFFF);
     check_int("alpha 128 -> no has_key", hk, 0);
     check_int("alpha 128 -> not mask_only", mo, 0);
+    }
 }
 
 // An opaque texel whose RGB565 lands exactly on the sentinel must be moved off
@@ -231,8 +254,10 @@ static void test_rgba4444_format() {
     t2.format = RTEX_RGBA4444;
     uint16_t o2[2]; int hk2, mo2;
     RasterBackend_MFGPU_TestStageTexels(&t2, 0, 0, 2, 1, o2, &hk2, &mo2);
-    check_u16("4444 a4=7 -> colorkey", o2[0], KEY);
-    check_u16("4444 a4=8 -> opaque white", o2[1], 0xFFFF);
+    if (oracle_cut() == 128) {
+        check_u16("4444 a4=7 -> colorkey", o2[0], KEY);
+        check_u16("4444 a4=8 -> opaque white", o2[1], 0xFFFF);
+    }
 }
 
 // Exhaustive dark-classification sweep over the whole RGB565 space.

@@ -542,6 +542,42 @@ static const uint16_t MF_COLORKEY = 0xF81F;
 //                              with MF_COLORKEY, nudge it off by one green LSB
 //                              so an opaque texel can never be mistaken for the
 //                              key (out_has_key still only set by real holes).
+// ── [glyph readability] the 1-bit alpha cut, as a knob ───────────────────────
+// Staging quantises the source alpha to 1 bit: below the cut a texel becomes
+// the MF_COLORKEY sentinel (culled by the fabric), at or above it becomes an
+// opaque RGB565 texel. The cut was hardcoded at 128 (50%).
+//
+// Measured on Cursed Castilla EX (.62, TEXALPHA histogram over the per-quad
+// staged regions): once the transparent padding is discounted, 40-50% of a
+// glyph's VISIBLE texels are antialiased edge. A cut of 128 deletes the 1..127
+// half of that and hardens the 128..254 half, which reads as "chunky" on the
+// 50-62px title glyphs and shreds the ~5px splash line into stroke-cores.
+//
+// Lowering the cut keeps the edge and hardens it instead of deleting it, which
+// is also closer to what EX's own GL_ONE/GL_ZERO replace blend does -- replace
+// writes a texel's RGB whatever its alpha. A cut of 1 discards only fully
+// transparent texels. The cost is that genuinely soft art (shadows, large
+// low-alpha regions) hardens into a halo rather than fading, so this is a knob
+// and not a new hardcoded number.
+//
+// Read once. It MUST NOT change mid-run: staged pages are cached in g_texcache
+// keyed by texture/region, so a mid-run change would leave pages staged under
+// the old cut in place. Clamped to 1..255 -- 0 would keep fully transparent
+// texels and paint their (usually black) RGB over everything behind them.
+static int mf_alpha_cut(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_ALPHA_CUT");
+        v = (e && *e) ? atoi(e) : 128;
+        if (v < 1)   v = 1;
+        if (v > 255) v = 255;
+        if (v != 128)
+            fprintf(stderr, "backend_mfgpu: alpha cut = %d (default 128) -- "
+                            "texels below this stage as the colorkey sentinel\n", v);
+    }
+    return v;
+}
+
 static inline uint16_t mf_texel565(const RTexture *t, int x, int y, bool *out_has_key) {
     uint8_t r, g, b, a;
     if (t->format == RTEX_RGBA4444) {
@@ -556,7 +592,7 @@ static inline uint16_t mf_texel565(const RTexture *t, int x, int y, bool *out_ha
         const uint8_t *p = t->rgba + ((size_t)y * t->w + x) * 4;  // RTEX_RGBA8888
         r = p[0]; g = p[1]; b = p[2]; a = p[3];
     }
-    if (a < 128) { *out_has_key = true; return MF_COLORKEY; }
+    if ((int)a < mf_alpha_cut()) { *out_has_key = true; return MF_COLORKEY; }
     uint16_t result = mf_rgb565(r, g, b);
     if (result == MF_COLORKEY) result ^= 0x0020;   // opaque texel must never == the key
     return result;
@@ -2550,7 +2586,8 @@ static inline bool mf_neon_all_set_u16(uint16x8_t v) {
 static inline void mf_stage8_rgba8888(const uint8_t *src, uint16_t *dst,
                                       uint16x8_t *acc_key, uint16x8_t *acc_dark) {
     uint8x8x4_t p = vld4_u8(src);                         // r, g, b, a
-    uint16x8_t keym = vcltq_u16(vmovl_u8(p.val[3]), vdupq_n_u16(128));
+    uint16x8_t keym = vcltq_u16(vmovl_u8(p.val[3]),
+                               vdupq_n_u16((uint16_t)mf_alpha_cut()));
 
     // (r & 0xF8) << 8  |  (g & 0xFC) << 3  |  b >> 3
     uint16x8_t r16 = vandq_u16(vshll_n_u8(p.val[0], 8), vdupq_n_u16(0xF800));
@@ -2634,6 +2671,54 @@ static void mf_stage_texels(const RTexture *t, int rx, int ry, int rw, int rh,
     *out_mask_only = mask_only;
 }
 
+// ── [glyph readability] source-alpha histogram of a texture being staged ─────
+// mf_texel565 folds every texel with alpha < 128 into the colorkey sentinel: a
+// hardcoded 1-BIT cut at 50%. That is only harmless if the source art is
+// hard-edged (alpha essentially 0 or 255). If a font atlas carries antialiased
+// edges, everything in 1..127 disappears and everything in 128..254 becomes
+// fully opaque -- which shreds small text into isolated stroke-cores, exactly
+// what Cursed Castilla EX's splash line looks like on device.
+//
+// This measures that instead of assuming it. Printed once per staged texture
+// (bounded), with the same tw x th the MFKEY trace reports so the two can be
+// cross-referenced to a specific on-screen draw.
+//
+// Reading it: mid[] near zero => the fold is innocent and the shredding is a
+// sampling/minification problem, not an alpha problem. mid[] carrying real mass
+// => the fold IS eating the glyphs.
+// Scans the SUB-REGION actually being staged (rx,ry,rw,rh), not the whole atlas
+// page: a font atlas is mostly empty, so a whole-page histogram would drown the
+// glyph in transparent padding and read as "hard-edged" no matter what.
+static void mf_alpha_histogram(const char *tag, const RTexture *t,
+                               int rx, int ry, int rw, int rh) {
+    if (!t || !t->rgba || t->w <= 0 || t->h <= 0 || rw <= 0 || rh <= 0) return;
+    static int n = 0;
+    if (n >= 40) return;
+    n++;
+    unsigned a0 = 0, lo = 0, hi = 0, a255 = 0;
+    size_t npx = 0;
+    for (int y = 0; y < rh; y++) {
+        int sy = ry + y; if (sy < 0 || sy >= t->h) continue;
+        for (int x = 0; x < rw; x++) {
+            int sx = rx + x; if (sx < 0 || sx >= t->w) continue;
+            size_t i = (size_t)sy * t->w + sx;
+            unsigned a = (t->format == RTEX_RGBA4444)
+                       ? (unsigned)((((const uint16_t *)t->rgba)[i] & 0xF) * 17)
+                       : (unsigned)t->rgba[i * 4 + 3];
+            if (a == 0) a0++; else if (a < 128) lo++; else if (a < 255) hi++; else a255++;
+            npx++;
+        }
+    }
+    if (!npx) return;
+    const double tot = (double)npx;
+    fprintf(stderr, "TEXALPHA %-6s page=%dx%d region=[%d,%d %dx%d] a=0:%.1f%%  "
+            "1..127:%.1f%%(DISCARDED)  128..254:%.1f%%(forced opaque)  255:%.1f%%  "
+            "partial=%.1f%%\n",
+            tag, t->w, t->h, rx, ry, rw, rh,
+            100.0 * a0 / tot, 100.0 * lo / tot, 100.0 * hi / tot, 100.0 * a255 / tot,
+            100.0 * (lo + hi) / tot);
+}
+
 static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *out_has_key) {
     // Whole-page entry: rect (0,0,tw,th). Untextured => 1x1 opaque-white page.
     int tw, th; bool textured = (t && t->valid && t->rgba);
@@ -2654,6 +2739,7 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
     // sub-region path for why a black+transparent-only page is interesting.
     bool mask_only = textured;
     if (textured) {
+        mf_alpha_histogram("page", t, 0, 0, tw, th);   // [glyph readability] see above
         mf_stage_texels(t, 0, 0, tw, th, g_texscratch, &has_key, &mask_only);
     } else {
         g_texscratch[0] = 0xFFFF;   // 1x1 opaque white
@@ -2719,6 +2805,7 @@ static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
     // dumps of its frames measure 100% black+colorkey with the black fraction ANIMATING
     // (4.7% -> 27.1% -> 38.2% -> 47.8%), i.e. a tube iris opening and closing over the image.
     bool mask_only = true;
+    mf_alpha_histogram("region", t, rx, ry, rw, rh);   // [glyph readability]
     mf_stage_texels(t, rx, ry, rw, rh, g_texscratch, &has_key, &mask_only);
     blt_surface_ref_t ref = mf_upload_and_cache(key, rw, rh, rx, ry, has_key, mask_only, "region");
     *out_has_key = ref.valid ? has_key : false;

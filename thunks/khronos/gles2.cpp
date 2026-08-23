@@ -104,6 +104,14 @@ static void GLUniformMatrix4fv_b(GLint loc, GLsizei count, GLboolean tr, const G
     glad_glUniformMatrix4fv(loc, count, tr, v);
     Blitter_OnUniformMatrix4fv(loc, count, v);
 }
+static void GLUniform1f_b(GLint loc, GLfloat v) { glad_glUniform1f(loc, v); Blitter_OnUniform1f(loc, v); }
+static void GLUniform1fv_b(GLint loc, GLsizei n, const GLfloat* v) {
+    glad_glUniform1fv(loc, n, v); if (n >= 1 && v) Blitter_OnUniform1f(loc, v[0]);
+}
+static void GLUniform1iv_b(GLint loc, GLsizei n, const GLint* v) {
+    glad_glUniform1iv(loc, n, v); if (n >= 1 && v) Blitter_OnUniform1i(loc, v[0]);
+}
+static void GLUniform1i_b(GLint loc, GLint v)   { glad_glUniform1i(loc, v); Blitter_OnUniform1i(loc, v); }
 static GLint GLGetUniformLocation_b(GLuint p, const GLchar* n) {
     GLint loc = glad_glGetUniformLocation(p, n);
     Blitter_OnGetUniformLocation(p, n, loc);
@@ -364,9 +372,21 @@ void load_gles2_funcs()
 	glad_glTexParameteriv = (PFNGLTEXPARAMETERIVPROC)PTR_RESOLVE(glTexParameteriv);
 	glad_glTexSubImage2D = (PFNGLTEXSUBIMAGE2DPROC)PTR_RESOLVE(glTexSubImage2D);
 	glad_glUniform1f = (PFNGLUNIFORM1FPROC)PTR_RESOLVE(glUniform1f);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLUniform1f_b;
+#endif
 	glad_glUniform1fv = (PFNGLUNIFORM1FVPROC)PTR_RESOLVE(glUniform1fv);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLUniform1fv_b;
+#endif
 	glad_glUniform1i = (PFNGLUNIFORM1IPROC)PTR_RESOLVE(glUniform1i);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLUniform1i_b;
+#endif
 	glad_glUniform1iv = (PFNGLUNIFORM1IVPROC)PTR_RESOLVE(glUniform1iv);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLUniform1iv_b;
+#endif
 	glad_glUniform2f = (PFNGLUNIFORM2FPROC)PTR_RESOLVE(glUniform2f);
 	glad_glUniform2fv = (PFNGLUNIFORM2FVPROC)PTR_RESOLVE(glUniform2fv);
 	glad_glUniform2i = (PFNGLUNIFORM2IPROC)PTR_RESOLVE(glUniform2i);

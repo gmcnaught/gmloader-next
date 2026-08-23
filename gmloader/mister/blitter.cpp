@@ -589,10 +589,69 @@ void Blitter_OnAttachShader(GLuint program, GLuint shader) {
     }
 }
 void Blitter_OnGetUniformLocation(GLuint program, const char *name, GLint loc) {
+    // The RECORD is deliberately not gated on g_enabled. GameMaker links its
+    // programs and queries their uniform locations during GR_D3D_Init /
+    // LoadGameData, which both run before Blitter_Init sets g_enabled -- so an
+    // early return here dropped every built-in uniform's location, including
+    // gm_AlphaRefValue, and alpha_test_ref() could only ever answer "unknown".
+    // (Same failure this file already hit with Blitter_OnShaderSource.) Only
+    // the hook-fired COUNTER stays gated, since it reports on the blitter's own
+    // active window.
+    if (name && loc >= 0) g_uniformLoc[program][name] = loc;
     if (!g_enabled) return;
     g_nGetULoc++;
-    if (name && loc >= 0) g_uniformLoc[program][name] = loc;
 }
+// ── [alpha-test threshold] capture gm_AlphaRefValue / gm_AlphaTestEnabled ────
+// mf_texel565 folds every texel with alpha < 128 into the colorkey sentinel --
+// a HARDCODED 1-bit cut at 50%. The game states its own cut: its shaders run
+//     if (gm_AlphaTestEnabled) { if (SrcColour.a <= gm_AlphaRefValue) discard; }
+// and, because Cursed Castilla EX draws with an enabled GL_ONE/GL_ZERO replace,
+// a texel that PASSES that test is written fully opaque. So the game's own
+// output is already 1-bit alpha and we are doing the right KIND of operation
+// with a threshold we invented.
+//
+// raster_backend.h's draw() has carried an `alphaRef` parameter for this all
+// along, but handle_draw passes a constant 0.0f and nothing captures the value:
+// glGetUniformLocation is hooked, glUniform1f is not. These two hooks close
+// that gap. Stored per (program, location) because a location is only
+// meaningful within its program.
+std::map<GLuint, std::map<GLint, float>> g_uniform1f;   // program -> loc -> value
+std::map<GLuint, std::map<GLint, int>>   g_uniform1i;   // program -> loc -> value
+
+// Not gated on g_enabled either, for the same reason as the location hook: a
+// uniform set before the blitter turns on is still the value in effect after.
+void Blitter_OnUniform1f(GLint loc, float v) {
+    if (loc < 0) return;
+    g_uniform1f[g_curProgram][loc] = v;
+}
+void Blitter_OnUniform1i(GLint loc, int v) {
+    if (loc < 0) return;
+    g_uniform1i[g_curProgram][loc] = v;
+}
+
+// Current alpha-test state for the bound program. Returns the threshold in
+// 0..1, or -1.0f when the game has alpha test off (or never told us), which
+// callers must treat as "keep the existing behaviour" rather than "threshold 0".
+static float alpha_test_ref(void) {
+    auto pit = g_uniformLoc.find(g_curProgram);
+    if (pit == g_uniformLoc.end()) return -1.0f;
+    auto lit = pit->second.find("gm_AlphaTestEnabled");
+    if (lit != pit->second.end()) {
+        auto vp = g_uniform1i.find(g_curProgram);
+        if (vp != g_uniform1i.end()) {
+            auto vv = vp->second.find(lit->second);
+            if (vv != vp->second.end() && vv->second == 0) return -1.0f;  // test off
+        }
+    }
+    auto rit = pit->second.find("gm_AlphaRefValue");
+    if (rit == pit->second.end()) return -1.0f;
+    auto vp = g_uniform1f.find(g_curProgram);
+    if (vp == g_uniform1f.end()) return -1.0f;
+    auto vv = vp->second.find(rit->second);
+    if (vv == vp->second.end()) return -1.0f;
+    return vv->second;
+}
+
 void Blitter_OnUniformMatrix4fv(GLint loc, GLsizei count, const GLfloat *value) {
     if (g_enabled) g_nUniMat++;
     if (!g_enabled || !value) return;
@@ -797,6 +856,37 @@ static int handle_draw(const char *kind, GLenum mode, int count,
         dropReason = !g_own ? "notown"
                    : (decoded != count) ? "undecoded"
                    : (mode != GL_TRIANGLES && !assembled) ? "notri" : "degenerate";
+    }
+
+    // [alpha-test threshold] Report the game's own alpha-test cut, once per
+    // (program, quantised ref). mf_texel565's hardcoded `a < 128` is only
+    // correct if this reports ~0.5; anything else means we are discarding a
+    // band of texels the game keeps (or keeping ones it discards).
+    {
+        float ar_now = alpha_test_ref();
+        static bool dumped = false;
+        if (!dumped) {   // one-shot: which uniforms did this program actually expose?
+            dumped = true;
+            auto pit = g_uniformLoc.find(g_curProgram);
+            if (pit == g_uniformLoc.end()) {
+                fprintf(stderr, "ALPHATEST prog=%u has NO recorded uniform locations\n",
+                        g_curProgram);
+            } else {
+                for (const auto &kv : pit->second)
+                    fprintf(stderr, "UNIFORM prog=%u %-28s loc=%d\n",
+                            g_curProgram, kv.first.c_str(), kv.second);
+            }
+        }
+        static int n = 0;
+        static GLuint last_prog = 0xFFFFFFFFu; static int last_q = -12345;
+        int q = (ar_now < 0.0f) ? -1 : (int)(ar_now * 255.0f + 0.5f);
+        if ((g_curProgram != last_prog || q != last_q) && n < 40) {
+            n++; last_prog = g_curProgram; last_q = q;
+            fprintf(stderr, "ALPHATEST f=%d prog=%u gm_AlphaRefValue=%.5f (=%d/255) "
+                    "%s | staging cut is HARDCODED a<128\n",
+                    g_frameNo, g_curProgram, ar_now, q,
+                    ar_now < 0.0f ? "[test OFF or unknown]" : "[test ON]");
+        }
     }
 
     // [strip the in-game CRT shader] Drop anything drawn under the CRT program.
