@@ -3338,6 +3338,25 @@ static void mf_uvlog(const char *tag, const BVtx *v, int triCount, int tw, int t
 // without a rebuild -- this reconciles two conventions and the failure mode of
 // getting it wrong is a whole inverted frame, which is exactly the kind of thing
 // worth being able to bisect in place. On by default.
+// [composite fit] Default OFF: Maldita's composite is already near 1:1
+// ([0,0..320,240]) and changing its framing is a visible change that needs its
+// own device check. EX needs it (3x oversize); turn it on there once verified.
+static int mf_composite_fit(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_MFGPU_COMPOSITE_FIT");
+                 v = (e && *e) ? atoi(e) : 0; }
+    return v;
+}
+
+static int mf_yflip_appsurf(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_MFGPU_YFLIP_APPSURF");
+                 v = (e && *e) ? atoi(e) : 0;
+                 if (v) fprintf(stderr, "backend_mfgpu: YFLIP_APPSURF=1 -- app-surface "
+                                        "draws are Y-flipped too (non-default)\n"); }
+    return v;
+}
+
 static int mf_defsurf_yflip(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("GMLOADER_MFGPU_DEFSURF_YFLIP");
@@ -3513,8 +3532,100 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         const float vsum = vmin + vmax;
         static BVtx compscratch[MF_MAX_VERTS];
         for (int i = 0; i < nverts; i++) { compscratch[i] = v[i]; compscratch[i].v = vsum - v[i].v; }
+
+        // ── [composite fit] map the composite quad onto the render target ────
+        // Measured on Cursed Castilla EX (.62 2026-08-23), every frame:
+        //   COMPOSITE(appsurf->screen) screen=[-288,-216..576,432] uv=[0,0..0.5625,0.8438]
+        // The UVs are correct -- 0.5625 x 0.8438 is exactly the 288x216 content
+        // inside the 512x256 padded page -- but the GEOMETRY is 864x648, i.e.
+        // 3x the 288x216 target, centred on it. The scanned-out window
+        // therefore shows only the middle third: the device symptom is the
+        // title art hugely zoomed, with a diagonal where the quad's 4-triangle
+        // split crosses the visible area.
+        //
+        // Maldita's same draw is screen=[0,0..320,240], near 1:1, which is why
+        // it looks right and EX does not. The difference tracks the forked
+        // gmloader.json (EX force_platform=os_windows vs Maldita os_android),
+        // which is what decides the runner's notional window size.
+        //
+        // The quad by construction spans the whole surface -- blitter.cpp only
+        // detects the app surface from a draw covering the full viewport -- so
+        // fitting its own bbox onto the target rect is exact and
+        // self-calibrating, the same argument the V-flip above uses for
+        // (vmin+vmax)-v. Degenerate extents collapse to identity.
+        if (mf_composite_fit()) {
+            float xmn = compscratch[0].x, xmx = compscratch[0].x;
+            float ymn = compscratch[0].y, ymx = compscratch[0].y;
+            for (int i = 1; i < nverts; i++) {
+                if (compscratch[i].x < xmn) xmn = compscratch[i].x;
+                if (compscratch[i].x > xmx) xmx = compscratch[i].x;
+                if (compscratch[i].y < ymn) ymn = compscratch[i].y;
+                if (compscratch[i].y > ymx) ymx = compscratch[i].y;
+            }
+            const float dw = (d && d->w > 0) ? (float)d->w : (float)BLT_FB_WIDTH;
+            const float dh = (d && d->h > 0) ? (float)d->h : (float)BLT_FB_HEIGHT;
+            const float sx = (xmx - xmn) > 0.0001f ? dw / (xmx - xmn) : 0.0f;
+            const float sy = (ymx - ymn) > 0.0001f ? dh / (ymx - ymn) : 0.0f;
+            if (sx > 0.0f && sy > 0.0f) {
+                static int shown = 0;
+                if (shown < 4 && (sx < 0.99f || sx > 1.01f || sy < 0.99f || sy > 1.01f)) {
+                    shown++;
+                    fprintf(stderr, "MFFIT f=%lu composite [%.0f,%.0f..%.0f,%.0f] -> "
+                            "[0,0..%.0f,%.0f]  scale %.3fx%.3f\n",
+                            (unsigned long)g_frame_no, xmn, ymn, xmx, ymx, dw, dh, sx, sy);
+                }
+                for (int i = 0; i < nverts; i++) {
+                    compscratch[i].x = (compscratch[i].x - xmn) * sx;
+                    compscratch[i].y = (compscratch[i].y - ymn) * sy;
+                }
+            }
+        }
         mf_emit_group(tex, tw, th, compscratch, triCount, bl, /*has_key=*/false, BLT_F_SRC_SURFACE);
         return;
+    }
+
+    // ── [oversized-draw trace] ───────────────────────────────────────────────
+    // Device symptom (EX, .62 2026-08-23): the second intro renders the title
+    // art hugely zoomed AND with a clean corner-to-corner diagonal, content on
+    // one side and black on the other. A quad drawn much larger than the
+    // 288x216 screen has its split diagonal crossing the visible area, so
+    // "over-scaled" and "half missing" are one draw, not two bugs.
+    //
+    // The suspected mechanism is that EX never composites its app surface
+    // (measured: UVLOG composite=0 over 400 frames), so scene content authored
+    // at app-surface scale (the attachments are 512x256) reaches the default
+    // surface without the composite's mapping and lands zoomed + clipped.
+    //
+    // Fires only when a draw's bbox materially overflows its target, so a
+    // normal frame prints nothing. Records mode/nv so it simultaneously settles
+    // whether the fan/strip assembly is producing the right triangle count.
+    {
+        int nv_all = triCount * 3;
+        if (nv_all > 0 && v) {
+            float mnx = v[0].x, mxx = v[0].x, mny = v[0].y, mxy = v[0].y;
+            float mnu = v[0].u, mxu = v[0].u, mnv = v[0].v, mxv = v[0].v;
+            for (int i = 1; i < nv_all; i++) {
+                if (v[i].x < mnx) mnx = v[i].x;  if (v[i].x > mxx) mxx = v[i].x;
+                if (v[i].y < mny) mny = v[i].y;  if (v[i].y > mxy) mxy = v[i].y;
+                if (v[i].u < mnu) mnu = v[i].u;  if (v[i].u > mxu) mxu = v[i].u;
+                if (v[i].v < mnv) mnv = v[i].v;  if (v[i].v > mxv) mxv = v[i].v;
+            }
+            const float W = (d && d->w > 0) ? (float)d->w : (float)BLT_FB_WIDTH;
+            const float H = (d && d->h > 0) ? (float)d->h : (float)BLT_FB_HEIGHT;
+            bool over = (mxx > W * 1.5f) || (mxy > H * 1.5f) ||
+                        (mnx < -W * 0.5f) || (mny < -H * 0.5f);
+            static int n = 0;
+            if (over && n < 96) {
+                n++;
+                fprintf(stderr, "MFBIG f=%lu tris=%d dst=%s %.0fx%.0f "
+                        "xy=[%.1f,%.1f..%.1f,%.1f] uv=[%.4f,%.4f..%.4f,%.4f] "
+                        "tex=%ux%d(page) key=%u\n",
+                        (unsigned long)g_frame_no, triCount,
+                        dst_is_appsurf ? "APPSURF" : "DEFAULT", W, H,
+                        mnx, mny, mxx, mxy, mnu, mnv, mxu, mxv,
+                        (unsigned)(t ? t->w : 0), t ? t->h : 0, tex_key);
+            }
+        }
     }
 
     // ── screen-space Y flip for draws that reach the DEFAULT surface DIRECTLY ──
@@ -3547,11 +3658,33 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
     // scr=[0,0..288,216] -- two app-surface composites (srctex=4), which return
     // above and never reach here, and one full-screen border (srctex=6), whose
     // geometry maps onto itself under this flip.
-    if (mf_defsurf_yflip() && !dst_is_appsurf) {
+    // GMLOADER_MFGPU_YFLIP_APPSURF=1 extends the flip to app-surface-destined
+    // draws. Default 0 = current behaviour, so Maldita is untouched: it stores
+    // scene content in the app surface INVERTED on purpose and un-inverts once
+    // at composite time, so flipping there would double-flip it.
+    //
+    // The reason this is a knob and not a decision: the claim "EX never
+    // composites, so its app-surface content is never un-inverted" rested on a
+    // UVLOG measurement over frames 1-400, and EX does not start using the app
+    // surface until ~frame 2763. That window could not have seen a composite,
+    // so it proved nothing. This knob lets the question be settled on the
+    // screen that actually shows the defect rather than by argument.
+    if (mf_defsurf_yflip() && (!dst_is_appsurf || mf_yflip_appsurf())) {
         int nv = triCount * 3;
         if (nv > 0 && nv <= MF_MAX_VERTS) {
             static BVtx s_yflip[MF_MAX_VERTS];
-            const float H = (d && d->h > 0) ? (float)d->h : (float)BLT_FB_HEIGHT;
+            // Flip about the CONTENT height, never the surface's height.
+            // d->w/d->h report the app surface's PADDED POT PAGE (512x256 on
+            // both cores -- see MFBIG "dst=APPSURF 512x256" and the composite's
+            // own note, page=512x256 content=288x216, uv 0.5625 x 0.8438 =
+            // 288/512 x 216/256). Mirroring about 256 instead of 216 would be
+            // off by 40px and would place content in the dead padding below the
+            // used region -- the same trap the composite's V-flip documents for
+            // a normalized 1-v. The default surface's height already IS the
+            // content height, so this is only load-bearing for APPSURF.
+            const float H = dst_is_appsurf
+                          ? (float)BLT_FB_HEIGHT
+                          : ((d && d->h > 0) ? (float)d->h : (float)BLT_FB_HEIGHT);
             for (int i = 0; i < nv; i++) { s_yflip[i] = v[i]; s_yflip[i].y = H - v[i].y; }
             v = s_yflip;
         }

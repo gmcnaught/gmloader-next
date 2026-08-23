@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <SDL2/SDL.h>
 #include <stdlib.h>
 #include <math.h>
@@ -190,6 +191,23 @@ ABI_ATTR void IO_Start_Step_hook()
 {
     if (g_MousePosX[0] < 0) g_MousePosX[0] = 0;
     if (g_MousePosY[0] < 0) g_MousePosY[0] = 0;
+    // [scale diagnosis] What does the RUNNER think the display is? These are
+    // bound straight to libyoyo.so's own exports (libyoyo.cpp:292-293) -- gmloader
+    // never sets them -- so they report the game's own belief about its display
+    // size. The app surface is sized from that belief, so if it disagrees with
+    // the 288x216 we scan out, every app-surface draw lands scaled wrong. Logged
+    // once, and again if it ever changes (a resize would matter as much as a
+    // wrong initial value).
+    {
+        static int last_w = -1, last_h = -1;
+        int dw = Graphics_DisplayWidth ? Graphics_DisplayWidth() : -1;
+        int dh = Graphics_DisplayHeight ? Graphics_DisplayHeight() : -1;
+        if (dw != last_w || dh != last_h) {
+            last_w = dw; last_h = dh;
+            fprintf(stderr, "DISPLAYSIZE runner reports %dx%d (we scan out %dx%d)\n",
+                    dw, dh, MISTER_WIDTH, MISTER_HEIGHT);
+        }
+    }
     if (g_MousePosX[0] > Graphics_DisplayWidth()) g_MousePosX[0] = Graphics_DisplayWidth();
     if (g_MousePosY[0] > Graphics_DisplayHeight()) g_MousePosY[0] = Graphics_DisplayHeight();
 
