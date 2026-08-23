@@ -66,6 +66,9 @@ static void GLViewport_trace(GLint x, GLint y, GLsizei w, GLsizei h) {
 // Blitter state-shadow hooks: mirror the GL state a stock draw consumes so the
 // blitter can rasterize it itself. Each calls the real driver then records.
 static void GLUseProgram_b(GLuint p) { glad_glUseProgram(p); Blitter_OnUseProgram(p); }
+static void GLAttachShader_b(GLuint prog, GLuint sh) {
+    glad_glAttachShader(prog, sh); Blitter_OnAttachShader(prog, sh);
+}
 static void GLBindAttribLocation_b(GLuint p, GLuint i, const GLchar* n) {
     glad_glBindAttribLocation(p, i, n); Blitter_OnBindAttribLocation(p, i, n);
 }
@@ -122,6 +125,20 @@ void glShaderSource_dump(
     const GLchar** strings,
     const GLint*  lengths
 ) {
+#ifdef MISTER_NATIVE_VIDEO
+	// [strip the in-game CRT shader] The blitter identifies the game's CRT pass
+	// by shader SOURCE, so it has to see every source -- including on the
+	// early-return path below, which is the normal one (shader dump/override is
+	// off unless explicitly configured).
+	{
+		std::string peek;
+		for (GLsizei i = 0; i < count; i++) {
+			if (lengths && lengths[i] >= 0) peek.append(strings[i], lengths[i]);
+			else                            peek.append(strings[i]);
+		}
+		Blitter_OnShaderSource(shader, peek.data(), peek.size());
+	}
+#endif
 	// shader dump/override are disabled.
 	if (shader_override_dir.empty()) {
 		glad_glShaderSource(shader, count, strings, lengths);
@@ -179,6 +196,9 @@ void load_gles2_funcs()
 {
     glad_glActiveTexture = (PFNGLACTIVETEXTUREPROC)PTR_RESOLVE(glActiveTexture);
 	glad_glAttachShader = (PFNGLATTACHSHADERPROC)PTR_RESOLVE(glAttachShader);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLAttachShader_b;
+#endif
 	glad_glBindAttribLocation = (PFNGLBINDATTRIBLOCATIONPROC)PTR_RESOLVE(glBindAttribLocation);
 #ifdef MISTER_NATIVE_VIDEO
 	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLBindAttribLocation_b;

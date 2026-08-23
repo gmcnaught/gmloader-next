@@ -13,6 +13,7 @@
 #include "blitter.h"
 #include "blitter_raster.h"
 #include "prim_assemble.h"   // GL_TRIANGLE_FAN/STRIP -> triangle list
+#include <set>
 #include "raster_backend.h"
 #include "configuration.h"   // gmloader_config.blitter (default level)
 
@@ -511,6 +512,82 @@ GLuint Blitter_AppSurfaceFBO(void) { return g_appSurfFbo; }
 GLuint Blitter_AppSurfaceTex(void) { return g_appSurfTex; }
 
 void Blitter_OnUseProgram(GLuint program) { if (g_enabled) { g_nUseProg++; g_curProgram = program; } }
+
+// ---- [strip the in-game CRT shader] ----------------------------------------
+// Cursed Castilla EX ships its own CRT simulation, and unlike Maldita's (which
+// is obj_old_tv drawing plain geometry over the app surface at ~70% alpha, and
+// is stripped by mf_strip_crt in raster_backend_mfgpu.cpp) EX's is a real GLSL
+// shader: a scanline + radial-distortion + corner-mask pass over the whole
+// screen. We never want it -- the output is driven either to a real CRT or
+// through the MiSTer framework's own CRT treatment, so the in-game version is
+// double-applied, and on Maldita the equivalent pass measured ~8ms of a ~31ms
+// frame because a screen-aligned quad is two triangles that EACH walk the full
+// screen bbox.
+//
+// It is identified by PROGRAM, not by geometry. That is a much tighter
+// signature than the alpha/self-draw heuristic mf_strip_crt has to use: GM
+// applies a custom shader only to the draws between shader_set and
+// shader_reset, so a program-scoped drop cannot swallow anything else. The
+// program is found by matching the shader SOURCE TEXT against identifiers that
+// GM's own default shaders never contain.
+//
+// Note EX's CRT shader does not even compile on this stack --
+//   0:52(16): error: initializer of global variable `aspect' must be a
+//   constant expression
+// because `vec2 aspect = vec2(u_crt_sizes.x/..., ...)` initializes a global
+// from a uniform, which GLSL ES forbids. So the pass may already be inert. The
+// PROGSTAT counters below say whether it ever runs; the strip costs nothing if
+// it doesn't, and catches it if a future runtime accepts the shader.
+static std::set<GLuint> g_crtShaders;    // shader ids whose source is the CRT pass
+static std::set<GLuint> g_crtPrograms;   // programs those shaders were attached to
+static uint64_t g_crtDrawsStripped = 0;
+static std::map<GLuint, uint64_t> g_progDraws;   // per-program draw counts (PROGSTAT)
+
+static int strip_game_crt(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GMLOADER_STRIP_GAME_CRT");
+        v = (e && *e) ? atoi(e) : 1;   // on by default, like GMLOADER_MFGPU_STRIP_CRT
+    }
+    return v;
+}
+
+void Blitter_OnShaderSource(GLuint shader, const char *src, unsigned long len) {
+    // Deliberately NOT gated on g_enabled. Shaders are compiled during
+    // LoadGameData() (Process Chunk: SHDR), which runs long before
+    // Blitter_Init sets g_enabled -- an earlier version of this guard read
+    // `!g_enabled` and the hook therefore never fired once, which made the
+    // shader half of the census silently empty while the program half looked
+    // fine. Recording a shader id costs nothing and the strip is still gated
+    // at the draw site.
+    if (!src || !len) return;
+    // Signature: identifiers that only a CRT shader carries. u_crt_sizes is
+    // EX's own uniform; scanlineWeights/radialDistortion are the standard
+    // cgwg/Lottes CRT function names, so this also catches a re-spelled port.
+    std::string s(src, len);
+    bool crt = s.find("u_crt_sizes")      != std::string::npos
+            || s.find("scanlineWeights")  != std::string::npos
+            || s.find("radialDistortion") != std::string::npos;
+    if (crt) g_crtShaders.insert(shader);
+    // Cap generously: GM compiles ~30 default shader variants during
+    // GR_D3D_Init BEFORE it reaches the game's own SHDR chunk, so a cap of 32
+    // hid the one shader this census exists to find. (The g_crtShaders insert
+    // above is deliberately NOT capped -- detection must not depend on how
+    // much we chose to print.)
+    static int n = 0;
+    if (n < 256) { n++;
+        fprintf(stderr, "SHADER id=%u len=%lu crt=%d\n", shader, len, (int)crt); }
+}
+
+void Blitter_OnAttachShader(GLuint program, GLuint shader) {
+    // Same reasoning as Blitter_OnShaderSource: linking happens before
+    // g_enabled is set, so gating here loses the shader->program mapping.
+    if (g_crtShaders.count(shader)) {
+        g_crtPrograms.insert(program);
+        fprintf(stderr, "PROGCRT program=%u (crt shader %u attached) strip=%d\n",
+                program, shader, strip_game_crt());
+    }
+}
 void Blitter_OnGetUniformLocation(GLuint program, const char *name, GLint loc) {
     if (!g_enabled) return;
     g_nGetULoc++;
@@ -722,8 +799,21 @@ static int handle_draw(const char *kind, GLenum mode, int count,
                    : (mode != GL_TRIANGLES && !assembled) ? "notri" : "degenerate";
     }
 
+    // [strip the in-game CRT shader] Drop anything drawn under the CRT program.
+    // Placed AFTER the block above so it overrides whatever that recorded: the
+    // reason we want in the trace is "we chose to drop this", not an incidental
+    // gate it would also have hit. Counted so the strip's effect is measurable
+    // rather than assumed.
+    g_progDraws[g_curProgram]++;
+    if (strip_game_crt() && g_crtPrograms.count(g_curProgram)) {
+        rast = 0;
+        cullReason = nullptr;
+        dropReason = "crtshader";
+        g_crtDrawsStripped++;
+    }
+
     // One reason field for the whole path: a cull if it got that far, otherwise
-    // the gate that rejected it. Never "-" while rast=0.
+    // the gate that rejected it (or the CRT strip). Never "-" while rast=0.
     const char *whyNot = cullReason ? cullReason : dropReason;
 
     bool fg_win = fg_window();
@@ -774,6 +864,18 @@ int Blitter_TryDrawElements(GLenum mode, GLsizei count, GLenum type, const void 
 
 const uint8_t *Blitter_PresentDefault(void) {
     g_frameNo++;
+    // [strip the in-game CRT shader] Periodic per-program draw census. This is
+    // what says whether the CRT pass actually runs -- EX's CRT shader fails to
+    // compile, so the strip may be inert, and "we stripped it" must be a
+    // measurement, not an assumption.
+    if (g_enabled && g_frameNo % 600 == 0) {
+        for (const auto &kv : g_progDraws)
+            fprintf(stderr, "PROGSTAT f=%d prog=%u draws=%llu crt=%d\n",
+                    g_frameNo, kv.first, (unsigned long long)kv.second,
+                    (int)g_crtPrograms.count(kv.first));
+        fprintf(stderr, "PROGSTAT f=%d crt_draws_stripped=%llu\n",
+                g_frameNo, (unsigned long long)g_crtDrawsStripped);
+    }
     if (g_own) {
         // Route present through the seam. backend_sw's present is a no-op
         // today (see raster_backend_sw.cpp) — the real RGB565 conversion
