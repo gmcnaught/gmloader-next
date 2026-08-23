@@ -12,6 +12,7 @@
 
 #include "blitter.h"
 #include "blitter_raster.h"
+#include "prim_assemble.h"   // GL_TRIANGLE_FAN/STRIP -> triangle list
 #include "raster_backend.h"
 #include "configuration.h"   // gmloader_config.blitter (default level)
 
@@ -622,6 +623,29 @@ static int handle_draw(const char *kind, GLenum mode, int count,
             }
     }
 
+    // ---- primitive assembly -------------------------------------------------
+    // The rasterize path below consumes a flat triangle LIST. GameMaker draws
+    // quads as GL_TRIANGLE_FAN, and the gate below used to require
+    // mode == GL_TRIANGLES -- so every fan was dropped with rast=0 and no
+    // reason recorded. Measured on Cursed Castilla EX (.62, 2026-08-23): every
+    // rt=FBO app-surface draw is a 5-vertex fan (mode=0x0006), which is why the
+    // app surface never updated while the fbo=0 GL_TRIANGLES draws rendered
+    // fine. Expand fans and strips into a triangle list here.
+    //
+    // Nothing downstream is winding-sensitive -- blitter_raster.cpp picks its
+    // inside test from the sign of the signed area (`bool ccw = area > 0`) and
+    // blt_tri.c CCW-normalizes by swapping b/c -- so the expansion only has to
+    // preserve coverage. It emits GL's winding anyway (the odd-triangle swap
+    // for strips) so that a later backface test would see the right thing.
+    static std::vector<BVtx> s_tris;
+    const std::vector<BVtx> *prim = &s_verts;
+    int primCount = count;
+    const bool assembled = prim_needs_assembly((unsigned)mode);
+    if (assembled && decoded == count) {
+        int n = prim_assemble((unsigned)mode, s_verts.data(), count, s_tris);
+        if (n) { prim = &s_tris; primCount = n; }
+    }
+
     // Rasterize into our surfaces (owning mode only).
     int rast = 0;
     const char *cullReason = nullptr;   // non-null => skipped as provably invisible
@@ -635,7 +659,8 @@ static int handle_draw(const char *kind, GLenum mode, int count,
     // profiling counter keeps counting culls only.
     const char *dropReason = nullptr;
     int texval = -1;                    // -1 = never reached the texture gate
-    if (g_own && decoded == count && mode == GL_TRIANGLES && count >= 3) {
+    if (g_own && decoded == count && primCount >= 3 &&
+        (mode == GL_TRIANGLES || assembled)) {
         RSurface rt; RBlend blend;
         bool okRT = get_render_target(&rt);
         bool okBL = okRT && get_rblend(&blend);   // short-circuit as before
@@ -674,15 +699,15 @@ static int handle_draw(const char *kind, GLenum mode, int count,
                 if (!cullReason && g_opaque &&
                     (blend == RB_ALPHA || blend == RB_PREMULT) && tex.valid && tex.opaque) {
                     int vop = 1;
-                    for (int v = 0; v < count; v++) if (s_verts[v].a < 0.998f) { vop = 0; break; }
+                    for (int v = 0; v < decoded; v++) if (s_verts[v].a < 0.998f) { vop = 0; break; }
                     if (vop) blend = RB_NONE;
                 }
                 if (cullReason) {
                     if (g_prof) g_pf_culled++;
                 } else {
                     uint64_t _t0 = g_prof ? bl_now_ns() : 0;
-                    RasterBackend_Select()->draw(&rt, &s_verts[0], count / 3, &tex, blend, 0.0f, g_boundTex2D);
-                    if (g_prof) { g_pf_raster += bl_now_ns() - _t0; g_pf_draws++; g_pf_tris += count/3; }
+                    RasterBackend_Select()->draw(&rt, &(*prim)[0], primCount / 3, &tex, blend, 0.0f, g_boundTex2D);
+                    if (g_prof) { g_pf_raster += bl_now_ns() - _t0; g_pf_draws++; g_pf_tris += primCount/3; }
                     // Coverage estimate (Task 4) is NOT accumulated here — see the
                     // note near the top of this file. draw() reaching this line only
                     // means the triangles were SUBMITTED to the selected backend, not
@@ -694,7 +719,7 @@ static int handle_draw(const char *kind, GLenum mode, int count,
     } else {
         dropReason = !g_own ? "notown"
                    : (decoded != count) ? "undecoded"
-                   : (mode != GL_TRIANGLES) ? "notri" : "degenerate";
+                   : (mode != GL_TRIANGLES && !assembled) ? "notri" : "degenerate";
     }
 
     // One reason field for the whole path: a cull if it got that far, otherwise
