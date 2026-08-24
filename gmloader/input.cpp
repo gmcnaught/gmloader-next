@@ -191,6 +191,34 @@ ABI_ATTR void IO_Start_Step_hook()
 {
     if (g_MousePosX[0] < 0) g_MousePosX[0] = 0;
     if (g_MousePosY[0] < 0) g_MousePosY[0] = 0;
+    // [controller db] One-shot census of every joystick SDL can see, with the
+    // GUID a gamecontrollerdb.txt entry is keyed on. SDL_CONTROLLERDEVICEADDED
+    // only fires for devices SDL ALREADY has a mapping for, so a pad with no db
+    // entry is invisible there -- which is exactly the case worth reporting.
+    // SDL_IsGameController() distinguishes the two, and SDL_GameControllerMapping
+    // ForGUID() shows which mapping (if any) was matched.
+    {
+        static bool done = false;
+        if (!done) {
+            done = true;
+            int n = SDL_NumJoysticks();
+            fprintf(stderr, "SDLJOY: %d joystick(s) visible to SDL\n", n);
+            for (int i = 0; i < n; i++) {
+                SDL_JoystickGUID g = SDL_JoystickGetDeviceGUID(i);
+                char guid[64] = {0};
+                SDL_JoystickGetGUIDString(g, guid, sizeof(guid));
+                const char *nm = SDL_JoystickNameForIndex(i);
+                bool isgc = SDL_IsGameController(i) == SDL_TRUE;
+                char *map = SDL_GameControllerMappingForGUID(g);
+                fprintf(stderr, "SDLJOY[%d] guid=%s name=\"%s\" is_gamecontroller=%d "
+                        "mapping=%s\n",
+                        i, guid, nm ? nm : "(null)", (int)isgc,
+                        map ? map : "(NONE -- needs a gamecontrollerdb entry)");
+                if (map) SDL_free(map);
+            }
+        }
+    }
+
     // [scale diagnosis] What does the RUNNER think the display is? These are
     // bound straight to libyoyo.so's own exports (libyoyo.cpp:292-293) -- gmloader
     // never sets them -- so they report the game's own belief about its display
