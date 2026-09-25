@@ -25,6 +25,10 @@
 FROM debian:bullseye-slim
 
 # armhf multiarch must be enabled before the :armhf packages resolve.
+# Pin apt to the image's own snapshot.debian.org archive (see
+# .github/scripts/apt_use_snapshot.sh): the live bullseye-security pool 404s.
+COPY .github/scripts/apt_use_snapshot.sh /tmp/apt_use_snapshot.sh
+RUN sh /tmp/apt_use_snapshot.sh
 RUN dpkg --add-architecture armhf \
  && apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends \

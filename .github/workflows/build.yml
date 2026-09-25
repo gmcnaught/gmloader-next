@@ -82,6 +82,14 @@ jobs:
     steps:
       - name: Install ${{ matrix.arch.name }} dependencies
         run: |
+          # Pin apt to the image's own snapshot.debian.org archive: the live
+          # bullseye-security pool now 404s files its index lists. Inline copy of
+          # .github/scripts/apt_use_snapshot.sh (the checkout that would provide it
+          # needs the git installed below).
+          sed -i -e 's|^deb |#live deb |' \
+                 -e 's|^# deb http://snapshot.debian.org/|deb [check-valid-until=no] http://snapshot.debian.org/|' \
+                 /etc/apt/sources.list
+          grep '^deb ' /etc/apt/sources.list
           dpkg --add-architecture ${{ matrix.arch.name }}
           apt update
           apt install -y --no-install-recommends python3 git dpkg-dev build-essential binutils python3-clang binutils-${{ matrix.arch.cross }} libstdc++-10-dev-${{ matrix.arch.name }}-cross linux-libc-dev-${{ matrix.arch.name }}-cross make linux-libc-dev-${{ matrix.arch.name }}-cross linux-libc-dev-${{ matrix.arch.name }}-cross gcc-${{ matrix.arch.cross }} g++-${{ matrix.arch.cross }} libsdl2-dev:${{ matrix.arch.name }} libzip-dev:${{ matrix.arch.name }} ca-certificates
