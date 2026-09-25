@@ -12,6 +12,7 @@
 #include "mister/joy_shm_reader.h"
 #include "mister/joy_ddr_reader.h"
 #include "mister/mister_joy_shm.h"
+#include "mister/dev_testing_mode.h"
 #endif
 
 int app_in_focus = 0;
@@ -326,6 +327,8 @@ int update_inputs(SDL_Window *win)
         for (int p = 0; p < MALDITA_JOY_MAX_PLAYERS; p++) {
             uint32_t mask = (g_joyshm_ready == 1) ? JoyShm_ReadMask(p)
                                                   : JoyDdr_ReadMask(p);
+            if (p == 0)
+                DevTestingMode_Step(&mask);
             unsigned char raw[16];
             JoyShm_MaskToButtons(mask, raw);
 
