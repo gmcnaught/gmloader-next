@@ -34,6 +34,7 @@
 #include "mister/raster_backend.h"
 #include "mister/mister_native_audio.h"
 #include "mister/bench_godmode.h"
+#include "mister/dev_testing_mode.h"
 #include "mister/cpu_isolate.h"
 // Global handle to bundled libGLES_sw.so — also used by egl.cpp and gles2.cpp via extern
 void* g_gles_handle = nullptr;
@@ -764,6 +765,7 @@ int main(int argc, char *argv[])
     patch_lua(libyoyo);
 #ifdef MISTER_NATIVE_VIDEO
     patch_bench_godmode(libyoyo);
+    patch_dev_testing_mode(libyoyo);
 #endif
     warning("DBG: all patches done\n");
 
