@@ -146,6 +146,9 @@ extern "C" void     RasterBackend_MFGPU_TestSetFpsOverlay(int on);
 // [W3 batching] consecutive same-state quad merging: the emitted-vs-merged
 // counts for the last closed frame, the run total of merges, and an independent
 // count of BLT_OP_TRILIST commands actually in the ring.
+extern "C" uint32_t RasterBackend_MFGPU_TestOccCulled(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestPresentSurf(void);
+extern "C" void RasterBackend_MFGPU_TestSetPresentSurfCap(int on);
 extern "C" uint32_t RasterBackend_MFGPU_TestTrilistCmds(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestTrilistGroups(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestBatchMerged(void);
@@ -3017,6 +3020,176 @@ static int mf_test_render_batch_scene(uint16_t *out) {
     return (int)RasterBackend_MFGPU_TestTrilistCmds();
 }
 
+// ── occlusion cull ──────────────────────────────────────────────────────────
+// Shape of the level_1_4 frame: a full-screen opaque background, then a grid of
+// keyed tiles whose sampled texels are all opaque (the region's 1-texel margin
+// reaches a transparent column, so they resolve to COLORKEY), with gaps and a
+// few genuinely holey tiles, then a holey sprite on top. With the cull on, the
+// background under the opaque tiles must go and the frame must not change.
+static const RTexture *mf_test_occ_tileset(void) {
+    static uint8_t tex[32*16*4];
+    for (int y = 0; y < 16; y++) for (int x = 0; x < 32; x++) {
+        uint8_t *p = &tex[(y*32+x)*4];
+        p[0] = (uint8_t)(20 + x*7); p[1] = (uint8_t)(40 + y*11); p[2] = (uint8_t)(x*y); p[3] = 255;
+        if (x >= 16 && ((x + y) & 1)) p[3] = 0;          // right half: checker holes
+    }
+    static RTexture t = { tex, 32, 16, 1, 1, /*RTEX_RGBA8888*/0, 0 };
+    return &t;
+}
+static const RTexture *mf_test_occ_bg(void) {
+    static uint8_t tex[8*8*4];
+    for (int i = 0; i < 64; i++) { tex[i*4+0] = (uint8_t)(i*3); tex[i*4+1] = 90; tex[i*4+2] = (uint8_t)(255-i*2); tex[i*4+3] = 255; }
+    static RTexture t = { tex, 8, 8, 1, 1, /*RTEX_RGBA8888*/0, 1 };
+    return &t;
+}
+static uint32_t mf_test_render_occ_scene(uint16_t *out) {
+    RasterBackend_MFGPU_TestReset();
+    RSurface d; mf_test_make_default_surface(&d);
+    BVtx q[6];
+    // Background tiled in 48x48 blocks (bck_cellars is a tiled background):
+    // blocks with no gap and no holey tile over them are what gets culled.
+    for (int by = 0; by * 48 < BH; by++) for (int bx = 0; bx * 48 < BW; bx++) {
+        mf_test_make_quad_at(q, 48.f * bx - 5.f, 48.f * by - 3.f, 48.f, 48.f, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, mf_test_occ_bg(), RB_NONE, 0.0f, 0x3101);
+    }
+    for (int ty = 0; ty * 16 < BH; ty++) for (int tx = 0; tx * 16 < BW; tx++) {
+        if ((tx * 7 + ty * 3) % 23 == 0) continue;                       // gap: background shows
+        const bool holey = ((tx + ty * 5) % 13 == 0);
+        mf_test_make_quad_at(q, 16.f * tx, 16.f * ty, 16.f, 16.f, 1.0f);
+        const float u0 = holey ? 0.5f : 0.0f;
+        for (int i = 0; i < 6; i++) q[i].u = u0 + q[i].u * 0.5f;
+        backend_mfgpu.draw(&d, q, 2, mf_test_occ_tileset(), RB_ALPHA, 0.0f, 0x3102);
+    }
+    mf_test_make_quad_at(q, 100.f, 60.f, 48.f, 48.f, 1.0f);
+    for (int i = 0; i < 6; i++) q[i].u = 0.5f + q[i].u * 0.5f;
+    backend_mfgpu.draw(&d, q, 2, mf_test_occ_tileset(), RB_ALPHA, 0.0f, 0x3102);
+    backend_mfgpu.present(&d);
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, out);
+    return RasterBackend_MFGPU_TestOccCulled();
+}
+static int case_occlusion_cull_is_bit_identical(void) {
+    static uint16_t fb_on[BW*BH], fb_off[BW*BH];
+    setenv("GMLOADER_MFGPU_OCCLUDE", "0", 1); RasterBackend_MFGPU_TestEnvReset();
+    uint32_t culled_off = mf_test_render_occ_scene(fb_off);
+    setenv("GMLOADER_MFGPU_OCCLUDE", "1", 1); RasterBackend_MFGPU_TestEnvReset();
+    uint32_t culled_on = mf_test_render_occ_scene(fb_on);
+    unsetenv("GMLOADER_MFGPU_OCCLUDE"); RasterBackend_MFGPU_TestEnvReset();
+    if (memcmp(fb_on, fb_off, sizeof fb_on) != 0) {
+        int first = -1, ndiff = 0;
+        for (int i = 0; i < BW*BH; i++)
+            if (fb_on[i] != fb_off[i]) { if (first < 0) first = i; ndiff++; }
+        printf("  FAIL occlude-identical  %d/%d pixels differ, first at (%d,%d) on=%04x off=%04x\n",
+               ndiff, BW*BH, first % BW, first / BW, fb_on[first], fb_off[first]);
+        return 0;
+    }
+    if (culled_off != 0 || culled_on == 0) {
+        printf("  FAIL occlude-identical  culled off=%u (want 0) on=%u (want >0)\n", culled_off, culled_on);
+        return 0;
+    }
+    printf("  OK   occlude-identical  framebuffer byte-identical, %u triangles culled\n", culled_on);
+    return 1;
+}
+// Gapless opaque tiles must take the whole background with them.
+static int case_occlusion_cull_drops_hidden_background(void) {
+    RasterBackend_MFGPU_TestReset();
+    RSurface d; mf_test_make_default_surface(&d);
+    BVtx q[6];
+    mf_test_make_quad_at(q, 0.f, 0.f, (float)BW, (float)BH, 1.0f);
+    backend_mfgpu.draw(&d, q, 2, mf_test_occ_bg(), RB_NONE, 0.0f, 0x3101);
+    int tiles = 0;
+    for (int ty = 0; ty * 16 < BH; ty++) for (int tx = 0; tx * 16 < BW; tx++) {
+        mf_test_make_quad_at(q, 16.f * tx, 16.f * ty, 16.f, 16.f, 1.0f);
+        for (int i = 0; i < 6; i++) q[i].u = q[i].u * 0.5f;
+        backend_mfgpu.draw(&d, q, 2, mf_test_occ_tileset(), RB_ALPHA, 0.0f, 0x3102);
+        tiles++;
+    }
+    backend_mfgpu.present(&d);
+    uint32_t culled = RasterBackend_MFGPU_TestOccCulled();
+    if (culled != 2) {
+        printf("  FAIL occlude-bg  culled=%u, want exactly the 2 background triangles (%d tiles)\n", culled, tiles);
+        return 0;
+    }
+    printf("  OK   occlude-bg  full-screen background under %d opaque keyed tiles culled\n", tiles);
+    return 1;
+}
+
+// ── present-from-surface ────────────────────────────────────────────────────
+// The steady-state frame: scene into the app surface, WORK cleared, then the
+// full-screen identity composite. With the RBF capability bit set the composite
+// must be deferred and presented via END.flags -- and the displayed picture
+// (blt_present_buffer) must be byte-identical to drawing it. `after` adds what
+// must force the composite back out: 1 = a WORK sprite drawn after it,
+// 2 = the FPS overlay, 3 = a draw into the app surface after it.
+static uint32_t mf_test_render_ps_scene(uint16_t *out, int cap, int after) {
+    const uint32_t FBO = 60, TEX = 61;
+    RasterBackend_MFGPU_SetAppSurface(0, 0);
+    RasterBackend_MFGPU_TestReset();
+    RasterBackend_MFGPU_TestSetPresentSurfCap(cap);
+    RasterBackend_MFGPU_SetAppSurface(FBO, TEX);
+    RSurface w; mf_test_make_default_surface(&w);
+    static uint8_t arg[BW*BH*4];
+    RSurface a; a.rgba = arg; a.w = BW; a.h = BH; a.fbo = FBO;
+    uint32_t presented = 0;
+    for (int f = 0; f < 3; f++) {
+        BVtx q[6];
+        backend_mfgpu.clear(&a, 30, 60, 90, 255);
+        for (int i = 0; i < 5; i++) {
+            mf_test_make_quad_at(q, 10.f + 40 * i + f * 3, 20.f + 11 * i, 30.f, 50.f, 1.0f);
+            backend_mfgpu.draw(&a, q, 2, mf_test_occ_tileset(), RB_ALPHA, 0.0f, 0x4101);
+        }
+        backend_mfgpu.clear(&w, 0, 0, 0, 255);
+        // GM's composite: full screen, bottom-origin v (v@top = 1).
+        BVtx c[6] = {
+            { 0.f, 0.f, 0.f,1.f, 1,1,1,1 }, { (float)BW, 0.f, 1.f,1.f, 1,1,1,1 }, { (float)BW,(float)BH, 1.f,0.f, 1,1,1,1 },
+            { 0.f, 0.f, 0.f,1.f, 1,1,1,1 }, { (float)BW,(float)BH, 1.f,0.f, 1,1,1,1 }, { 0.f,(float)BH, 0.f,0.f, 1,1,1,1 },
+        };
+        RTexture st = { nullptr, BW, BH, 1, 0, 0, 0 };
+        backend_mfgpu.draw(&w, c, 2, &st, RB_NONE, 0.0f, TEX);
+        if (after == 1) {
+            mf_test_make_quad_at(q, 100.f, 100.f, 20.f, 20.f, 1.0f);
+            backend_mfgpu.draw(&w, q, 2, mf_test_opaque_texture_b(), RB_NONE, 0.0f, 0x4102);
+        } else if (after == 4) {
+            backend_mfgpu.draw(&w, c, 2, &st, RB_NONE, 0.0f, TEX);   // duplicate present: elided, emits nothing
+        } else if (after == 3) {
+            mf_test_make_quad_at(q, 5.f, 5.f, 20.f, 20.f, 1.0f);
+            backend_mfgpu.draw(&a, q, 2, mf_test_opaque_texture_b(), RB_NONE, 0.0f, 0x4102);
+        }
+        if (after == 2) RasterBackend_MFGPU_TestSetFpsOverlay(1);
+        backend_mfgpu.present(&w);
+        if (after == 2) RasterBackend_MFGPU_TestSetFpsOverlay(0);
+        presented += RasterBackend_MFGPU_TestPresentSurf();
+    }
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, out);
+    RasterBackend_MFGPU_TestSetPresentSurfCap(0);
+    RasterBackend_MFGPU_SetAppSurface(0, 0);
+    return presented;
+}
+static int case_present_surf(void) {
+    static uint16_t fb_on[BW*BH], fb_off[BW*BH];
+    const char *names[5] = { "identity", "work-draw-after", "fps-overlay", "appsurf-draw-after", "dropped-draw-after" };
+    const uint32_t want[5] = { 3, 0, 0, 0, 3 };
+    for (int after = 0; after < 5; after++) {
+        uint32_t p_off = mf_test_render_ps_scene(fb_off, 0, after);
+        uint32_t p_on  = mf_test_render_ps_scene(fb_on, 1, after);
+        if (memcmp(fb_on, fb_off, sizeof fb_on) != 0) {
+            int first = -1, ndiff = 0;
+            for (int i = 0; i < BW*BH; i++)
+                if (fb_on[i] != fb_off[i]) { if (first < 0) first = i; ndiff++; }
+            printf("  FAIL present-surf %s  %d px differ, first (%d,%d) on=%04x off=%04x\n",
+                   names[after], ndiff, first % BW, first / BW, fb_on[first], fb_off[first]);
+            return 0;
+        }
+        if (p_off != 0 || p_on != want[after]) {
+            printf("  FAIL present-surf %s  surface-presented frames off=%u on=%u (want 0 / %u)\n",
+                   names[after], p_off, p_on, want[after]);
+            return 0;
+        }
+    }
+    printf("  OK   present-surf  identity composite presented from the surface (3/3 frames); "
+           "work draw / fps overlay / surface draw after it force it out, a dropped draw does not; all byte-identical\n");
+    return 1;
+}
+
 static int case_batch_output_is_bit_identical(void) {
     static uint16_t fb_on[BW*BH], fb_off[BW*BH];
 
@@ -3762,6 +3935,9 @@ int main(void){
     if (!case_batch_state_change_forces_a_flush()) { printf("FAIL mfgpu-batch-state-change\n"); ok = 0; }
     else printf("raster_backend mfgpu-batch-state-change OK\n");
     if (!case_batch_output_is_bit_identical()) { printf("FAIL mfgpu-batch-identical\n"); ok = 0; }
+    if (!case_occlusion_cull_is_bit_identical()) { printf("FAIL mfgpu-occlude-identical\n"); ok = 0; }
+    if (!case_occlusion_cull_drops_hidden_background()) { printf("FAIL mfgpu-occlude-bg\n"); ok = 0; }
+    if (!case_present_surf()) { printf("FAIL mfgpu-present-surf\n"); ok = 0; }
     else printf("raster_backend mfgpu-batch-identical OK\n");
     if (!case_batch_preserves_deferred_clear_drop()) { printf("FAIL mfgpu-batch-vs-defer-clear\n"); ok = 0; }
     else printf("raster_backend mfgpu-batch-vs-defer-clear OK\n");
