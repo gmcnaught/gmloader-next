@@ -10,6 +10,7 @@ set -e
 ARCH=arm-linux-gnueabihf
 
 echo "=== Installing build dependencies ==="
+sh .github/scripts/apt_use_snapshot.sh
 apt-get update -qq
 apt-get install -y -qq \
     build-essential \
