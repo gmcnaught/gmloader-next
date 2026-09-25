@@ -69,12 +69,14 @@
 #include "mf_seam_stat.h"   // [Phase 4 Stage A] submit-seam decomposition
 #include "mf_pending_clear.h"   // [Phase 4 Stage B] deferred full-screen clear
 #include "mf_pace.h"   // [fps-dip] scanout-locked doorbell pacer
+#include "mf_occlude.h"   // occlusion cull: triangles hidden under later opaque quads
 extern "C" {
 #include "blt_emitter.h"
 #include "blt_wire.h"
 #include "blitter_ref.h"
 }
 #include <string.h>
+#include <math.h>     // floor (occlusion cull texel range)
 #include <stdio.h>
 #include <stdlib.h>   // getenv (GMLOADER_MFGPU_HEAPLOG diagnostic, Task 9 bring-up)
 #if defined(__ARM_NEON)
@@ -84,6 +86,47 @@ extern "C" {
                       // recorded in BOTH builds (mf_device_publish is not device-only)
 #include <signal.h>   // [fabric lifecycle] sig_atomic_t + the SIGTERM/SIGINT teardown hook
 #include <unistd.h>   // [fabric lifecycle] write(2): the only async-signal-safe way to log
+
+// [present-from-surface] GMLOADER_MFGPU_PRESENT_SURF (default 1, and only when
+// the RBF advertises it in C_STATUS bit2). The per-frame app-surface -> WORK
+// composite is an identity copy on every steady-state frame (x==u, y==v, white,
+// COPY, full screen): instead of drawing it (62,208 px, ~3.8 ms of fabric time)
+// the host flags the frame's END with BLT_F_SRC_SURFACE and the frame-end DMA
+// copies the surface bank out for scanout. The composite is DEFERRED, not
+// dropped: anything emitted after it this frame (a draw, a clear, the FPS
+// overlay) first emits it for real, so the output never differs.
+static int  g_ps_v = -1;
+static bool g_ps_pending = false;
+static BVtx g_ps_verts[6];
+static blt_surface_ref_t g_ps_tex;
+static int  g_ps_tw = 0, g_ps_th = 0;
+static RBlend g_ps_bl;
+static uint32_t g_ps_frames_total = 0;   // frames presented from the surface
+static uint32_t g_ps_last = 0;           // last closed frame did (test hook)
+static void mf_ps_discharge(void);
+static uint32_t g_ps_why[5];   // discharges by site: 0 emit 1 clear 2 fps 3 pc-flush 4 2nd-composite
+
+// [occlusion cull] per-frame state; logic lives next to mf_batch_flush.
+static int g_occlude_v = -1;
+static int mf_occlude_on(void) {
+    if (g_occlude_v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_OCCLUDE");
+        g_occlude_v = (e && *e) ? atoi(e) : 1;
+    }
+    return g_occlude_v;
+}
+enum { MF_OCC_MAX_TRIS = 16384 };
+static MfOccTri g_occ_tris[MF_OCC_MAX_TRIS];
+static uint32_t g_occ_raw[MF_OCC_MAX_TRIS];   // byte offset of the tri's first vertex in vtx_buf
+static uint32_t g_occ_xy0[MF_OCC_MAX_TRIS];   // that vertex's packed x|y<<16 (no WC read-back)
+static uint8_t  g_occ_cull[MF_OCC_MAX_TRIS];
+static MfOccMask g_occ_mask;
+static int      g_occ_n = 0;
+static bool     g_occ_full = false;           // record overflowed: this frame is not culled
+static uint32_t g_occ_culled_frame = 0;       // last closed frame (test hook + log)
+static uint32_t g_occ_culled_total = 0;
+static uint32_t g_occ_occluders_frame = 0;
+
                       // from inside that hook (fprintf is not AS-safe, and the hook runs
                       // on the path that a heap-corruption SIGABRT takes)
 
@@ -2252,6 +2295,8 @@ static void mf_frame_begin(void) {
     g_frame_dropped = false;
     g_frame_ovf_cause = MF_OVF_UNKNOWN;   // [Phase 1 B3] per-frame: reset before staging
     g_last_draw.valid = false;   // [duplicate-draw elimination] never span frames
+    g_occ_n = 0; g_occ_full = false; g_occ_occluders_frame = 0;   // [occlusion cull] per frame
+    g_ps_pending = false;   // [present-from-surface] never spans frames
     g_appsurf_presented = false; // [strip CRT] the present must re-land every frame
     // Snapshot the pin floor for this frame: any g_texcache entry touched
     // (hit or staged) from here through mf_frame_end gets .lru > this value
@@ -2352,6 +2397,8 @@ static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     // emits takes the ring position it would have occupied here. Unconditional
     // (not just on a target switch): a same-target clear needs it just as much.
     mf_batch_flush();
+    if (g_ps_pending) g_ps_why[1]++;
+    mf_ps_discharge();   // [present-from-surface] no-op unless a composite is deferred
     mf_select_target(d->fbo);
     (void)a;   // fabric FILL writes opaque RGB565; no alpha channel on the wire
     int w = d->w < BLT_FB_WIDTH  ? d->w : BLT_FB_WIDTH;
@@ -2835,6 +2882,202 @@ static void mf_trace_group(const blt_surface_ref_t &tex, int tw, int th,
 // The batch is invalidated BEFORE the emit, so a failed blt_trilist -- which
 // means the ring overflowed and the whole frame is about to drop -- cannot leave
 // a command that a later flush would emit a second time.
+// ── [present-from-surface] ───────────────────────────────────────────────────
+static int mf_present_surf_on(void) {
+    if (g_ps_v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_PRESENT_SURF");
+        g_ps_v = (e && *e) ? atoi(e) : 1;
+    }
+    return g_ps_v;
+}
+// C_STATUS low32 bit2: the RBF has fb_dma_src_mux (blitter_top S_WR_STATUS
+// writes it as a constant 1). An older RBF writes 0 there, and would copy a
+// WORK buffer nobody composited into -- so without the bit, never skip.
+static bool mf_ps_capable(void) {
+#ifdef MISTER_NATIVE_VIDEO
+    if (!g_dev_ok) return false;
+#endif
+    return (mf_ctrl_rd(MF_C_STATUS) & 0x4u) != 0;
+}
+// The composite is an identity: two triangles covering exactly the 288x216
+// target, every vertex white/opaque with u == x and v == y in 12.4 (so pixel p
+// samples surface texel p), and a blend that resolves to COPY.
+static bool mf_ps_is_identity(const BVtx *cv, int nt, int tw, int th, RBlend bl) {
+    if (nt != 2 || (bl != RB_NONE && bl != RB_ALPHA)) return false;
+    int16_t xs[6], ys[6];
+    for (int i = 0; i < 6; i++) {
+        const blt_vtx_t o = bvtx_to_blt(&cv[i], tw, th);
+        if (o.rgba != 0xFFFFFFFFu) return false;
+        if (o.x < 0 || o.y < 0 || o.u != (uint16_t)o.x || o.v != (uint16_t)o.y) return false;
+        xs[i] = o.x; ys[i] = o.y;
+    }
+    MfOccRect r;
+    if (!mf_occ_quad_rect(xs, ys, &r)) return false;
+    int16_t mnx = xs[0], mxx = xs[0], mny = ys[0], mxy = ys[0];
+    for (int i = 1; i < 6; i++) {
+        if (xs[i] < mnx) mnx = xs[i]; if (xs[i] > mxx) mxx = xs[i];
+        if (ys[i] < mny) mny = ys[i]; if (ys[i] > mxy) mxy = ys[i];
+    }
+    return mnx == 0 && mny == 0 && mxx == BLT_FB_WIDTH * 16 && mxy == BLT_FB_HEIGHT * 16;
+}
+static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
+                          const BVtx *verts, int nt, RBlend bl,
+                          bool has_key, uint8_t extra_flags);
+static void mf_select_target(uint32_t fbo);
+// Something is about to be emitted after a deferred composite: emit it now, in
+// the ring position it would have had. Leaves the target on WORK; callers
+// select their own target afterwards.
+static void mf_ps_discharge(void) {
+    if (!g_ps_pending) return;
+    g_ps_pending = false;
+    mf_select_target(0);   // fbo 0 = WORK (the app surface FBO is never 0)
+    mf_emit_group(g_ps_tex, g_ps_tw, g_ps_th, g_ps_verts, 2, g_ps_bl,
+                  /*has_key=*/false, BLT_F_SRC_SURFACE);
+}
+
+// Emit-time variant: a draw that really reaches the ring after a deferred
+// composite. mf_draw has already selected ITS target, so restore it afterwards.
+// (Discharging at mf_draw entry instead would let a draw that is then dropped --
+// the stripped CRT bezel, a duplicate -- force the composite out for nothing.)
+static void mf_ps_discharge_keep_target(void) {
+    if (!g_ps_pending) return;
+    const int saved = g_cur_target;
+    g_ps_why[0]++;
+    mf_ps_discharge();
+    if (saved != g_cur_target) {
+        mf_batch_flush();
+        blt_set_target(&g_e, saved); g_cur_target = saved;
+    }
+}
+
+// ── Occlusion cull (mf_occlude.h) ────────────────────────────────────────────
+// GMLOADER_MFGPU_OCCLUDE (default 1). Every triangle mf_emit_group pushes is
+// recorded here; at frame end, before the doorbell, the ones every pixel of
+// which a later opaque quad overwrites are collapsed to zero area in the vertex
+// arena. The whole frame is written before the one doorbell (no mid-frame
+// submit), so rewriting vertices that are already in the arena is safe.
+// Opacity of the texels a keyed quad can sample. Set by mf_draw's textured
+// paths around each mf_emit_group call; (srx, sry) is the staged region's
+// origin in the RTexture, so staged texel (x, y) is RTexture texel
+// (srx + x, sry + y) -- the same mapping mf_stage_texels uses.
+static struct { const RTexture *t; int srx, sry; } g_occ_hint = { nullptr, 0, 0 };
+
+// Direct-mapped cache of "this texel rect has no hole". Cleared whenever the
+// staged-texture cache is invalidated (texture re-upload / reinit).
+struct MfOccOpq { const uint8_t *rgba; int16_t x0, y0, x1, y1; uint8_t valid, opaque; };
+static MfOccOpq g_occ_opq[256];
+static void mf_occ_opq_clear(void) { memset(g_occ_opq, 0, sizeof g_occ_opq); }
+
+static bool mf_occ_rect_opaque(const RTexture *t, int x0, int y0, int x1, int y1) {
+    if (!t || !t->valid || !t->rgba) return false;
+    if (x0 < 0 || y0 < 0 || x1 >= t->w || y1 >= t->h || x0 > x1 || y0 > y1) return false;
+    if ((long)(x1 - x0 + 1) * (y1 - y0 + 1) > 65536) return false;   // bound the scan
+    const uint32_t h = ((uint32_t)(uintptr_t)t->rgba >> 4) ^ (uint32_t)x0 * 7u ^ (uint32_t)y0 * 131u
+                     ^ (uint32_t)x1 * 2663u ^ (uint32_t)y1 * 40503u;
+    MfOccOpq &c = g_occ_opq[h & 255u];
+    if (c.valid && c.rgba == t->rgba && c.x0 == x0 && c.y0 == y0 && c.x1 == x1 && c.y1 == y1)
+        return c.opaque != 0;
+    bool hole = false;
+    for (int y = y0; y <= y1 && !hole; y++)
+        for (int x = x0; x <= x1 && !hole; x++)
+            (void)mf_texel565(t, x, y, &hole);
+    c.rgba = t->rgba; c.x0 = (int16_t)x0; c.y0 = (int16_t)y0; c.x1 = (int16_t)x1; c.y1 = (int16_t)y1;
+    c.valid = 1; c.opaque = hole ? 0 : 1;
+    return !hole;
+}
+
+// Record `nt` triangles just pushed at vtx_buf offset `raw` (packed vertices in
+// `pv`), drawn to g_cur_target with the resolved blend and flags.
+static void mf_occ_record(uint32_t raw, const blt_vtx_t *pv, int nt, int tw, int th,
+                          uint8_t blend_mode, uint8_t extra_flags) {
+    if (!mf_occlude_on() || g_occ_full) return;
+    if (g_occ_n + nt > MF_OCC_MAX_TRIS) { g_occ_full = true; return; }
+    const uint8_t tg = (g_cur_target == MF_TARGET_APPSURF) ? 1 : 0;
+    for (int i = 0; i < nt; i++) {
+        const blt_vtx_t *v = &pv[i * 3];
+        MfOccTri *t = &g_occ_tris[g_occ_n + i];
+        memset(t, 0, sizeof *t);
+        t->target = tg;
+        int16_t xs[3] = { v[0].x, v[1].x, v[2].x }, ys[3] = { v[0].y, v[1].y, v[2].y };
+        t->has_bbox = (uint8_t)mf_occ_tri_bbox(xs, ys, &t->bbox);
+        g_occ_raw[g_occ_n + i] = raw + (uint32_t)i * 3u * (uint32_t)sizeof(blt_vtx_t);
+        g_occ_xy0[g_occ_n + i] = (uint32_t)(uint16_t)v[0].x | ((uint32_t)(uint16_t)v[0].y << 16);
+    }
+    if (extra_flags & BLT_F_SRC_SURFACE) g_occ_tris[g_occ_n].reads_appsurf = 1;
+    // Occluders: each 2-triangle screen-aligned quad of a draw that writes every
+    // pixel it covers. COPY always does (the surface composite included);
+    // COLORKEY does iff no texel it can sample is the key.
+    const bool copy = (blend_mode == BLT_BLEND_COPY);
+    const bool keyed = (blend_mode == BLT_BLEND_COLORKEY) && g_occ_hint.t &&
+                       !(extra_flags & BLT_F_SRC_SURFACE);
+    if ((copy || keyed) && (nt % 2) == 0) {
+        for (int q = 0; q < nt / 2; q++) {
+            const blt_vtx_t *v = &pv[q * 6];
+            int16_t xs[6], ys[6];
+            for (int k = 0; k < 6; k++) { xs[k] = v[k].x; ys[k] = v[k].y; }
+            MfOccRect r;
+            if (!mf_occ_quad_rect(xs, ys, &r)) continue;
+            if (keyed) {
+                // Only the texels sampled at the occluder rect's pixel centres
+                // matter (that rect is all we claim). Require the UV map to be
+                // axis-aligned (u a function of x only, v of y only), take u,v
+                // at the outermost centres, and widen by 1/16 texel for divr's
+                // round-to-nearest; texel = floor(u>>4) clamped to [0,tw).
+                int16_t qx0 = xs[0], qx1 = xs[0], qy0 = ys[0], qy1 = ys[0];
+                for (int k = 1; k < 6; k++) {
+                    if (xs[k] < qx0) qx0 = xs[k]; if (xs[k] > qx1) qx1 = xs[k];
+                    if (ys[k] < qy0) qy0 = ys[k]; if (ys[k] > qy1) qy1 = ys[k];
+                }
+                int uA = -1, uB = -1, vA = -1, vB = -1; bool aligned = true;
+                for (int k = 0; k < 6 && aligned; k++) {
+                    int &uu = (v[k].x == qx0) ? uA : uB;
+                    int &vv = (v[k].y == qy0) ? vA : vB;
+                    if (uu < 0) uu = v[k].u; else if (uu != v[k].u) aligned = false;
+                    if (vv < 0) vv = v[k].v; else if (vv != v[k].v) aligned = false;
+                }
+                if (!aligned) continue;
+                const double sx = (double)(uB - uA) / (double)(qx1 - qx0);
+                const double sy = (double)(vB - vA) / (double)(qy1 - qy0);
+                const double ul = uA + ((r.x0 * 16 + 8) - qx0) * sx, ur = uA + ((r.x1 * 16 + 8) - qx0) * sx;
+                const double vt = vA + ((r.y0 * 16 + 8) - qy0) * sy, vb = vA + ((r.y1 * 16 + 8) - qy0) * sy;
+                const double umn = (ul < ur ? ul : ur) - 1.0, umx = (ul < ur ? ur : ul) + 1.0;
+                const double vmn = (vt < vb ? vt : vb) - 1.0, vmx = (vt < vb ? vb : vt) + 1.0;
+                int tx0 = (int)floor(umn / 16.0), tx1 = (int)floor(umx / 16.0);
+                int ty0 = (int)floor(vmn / 16.0), ty1 = (int)floor(vmx / 16.0);
+                if (tx0 < 0) tx0 = 0; if (ty0 < 0) ty0 = 0;
+                if (tx1 > tw - 1) tx1 = tw - 1; if (ty1 > th - 1) ty1 = th - 1;
+                if (tx0 > tw - 1) tx0 = tw - 1; if (ty0 > th - 1) ty0 = th - 1;
+                if (!mf_occ_rect_opaque(g_occ_hint.t, g_occ_hint.srx + tx0, g_occ_hint.sry + ty0,
+                                        g_occ_hint.srx + tx1, g_occ_hint.sry + ty1))
+                    continue;
+            }
+            MfOccTri *t = &g_occ_tris[g_occ_n + q * 2];
+            t->occ = r;
+            t->has_occ = 1;
+            g_occ_occluders_frame++;
+        }
+    }
+    g_occ_n += nt;
+}
+
+// Frame end, before blt_end_frame / the doorbell.
+static void mf_occ_apply(void) {
+    g_occ_culled_frame = 0;
+    if (!mf_occlude_on() || g_occ_full || g_occ_n == 0 || g_e.overflow) return;
+    const int n = mf_occ_resolve(g_occ_tris, g_occ_n, g_occ_cull, &g_occ_mask);
+    if (n == 0) return;
+    for (int i = 0; i < g_occ_n; i++) {
+        if (!g_occ_cull[i]) continue;
+        // Collapse to zero area: vertices 1 and 2 take vertex 0's position.
+        // x,y are the first 32-bit word of blt_vtx_t; u/v/rgba are left alone.
+        uint8_t *b = g_e.vtx_buf + g_occ_raw[i];
+        *(volatile uint32_t *)(b + 1 * sizeof(blt_vtx_t)) = g_occ_xy0[i];
+        *(volatile uint32_t *)(b + 2 * sizeof(blt_vtx_t)) = g_occ_xy0[i];
+    }
+    g_occ_culled_frame = (uint32_t)n;
+    g_occ_culled_total += (uint32_t)n;
+}
+
 static void mf_batch_flush(void) {
     if (!g_batch.valid) return;
     g_batch.valid = false;
@@ -2880,6 +3123,7 @@ static bool mf_batch_clear_relevant(uint8_t extra_flags) {
 static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
                           const BVtx *verts, int nt, RBlend bl,
                           bool has_key, uint8_t extra_flags) {
+    mf_ps_discharge_keep_target();   // [present-from-surface] a real emission follows it
     int nverts = nt * 3;
     if (nverts > MF_MAX_VERTS) {
         fprintf(stderr, "backend_mfgpu: %d tris exceed vertex scratch (%d verts) - draw dropped\n",
@@ -3009,6 +3253,7 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         } else {
             g_batch_merged++;   // one command saved
         }
+        mf_occ_record(raw, g_vtxscratch, nt, tw, th, blend_mode, extra_flags);
         g_batch.nt   += nt;
         g_batch.next_raw = raw + (uint32_t)nt * 3u * (uint32_t)sizeof(blt_vtx_t);
         g_tl_tris    += nt;
@@ -3095,6 +3340,8 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
     }
     g_tl_cmds++;
     g_tl_tris += nt;
+    mf_occ_record(eoff - (g_arena ? (uint32_t)MF_VTX_HALF : 0u), g_vtxscratch, nt, tw, th,
+                  blend_mode, extra_flags);
     // Drop only once the covering draw is actually in the ring: a failed
     // blt_trilist must leave the clear pending for a later draw or for frame end.
     if (pc_pending && pc_covers) mf_pc_drop(&g_pc, pc_target);
@@ -3385,6 +3632,19 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         const float vsum = vmin + vmax;
         static BVtx compscratch[MF_MAX_VERTS];
         for (int i = 0; i < nverts; i++) { compscratch[i] = v[i]; compscratch[i].v = vsum - v[i].v; }
+        if (g_ps_pending) g_ps_why[4]++;
+        mf_ps_discharge();   // a second composite in one frame: the first one is real
+        if (mf_present_surf_on() && mf_ps_capable() && !dst_is_appsurf &&
+            mf_ps_is_identity(compscratch, triCount, tw, th, bl)) {
+            // [present-from-surface] Defer. A pending full-screen WORK clear is
+            // dropped exactly as the composite's own cover proof would drop it.
+            const int ws = mf_pc_slot_of(MF_TARGET_WORK);
+            if (mf_pc_pending(&g_pc, ws)) mf_pc_drop(&g_pc, ws);
+            memcpy(g_ps_verts, compscratch, sizeof g_ps_verts);
+            g_ps_tex = tex; g_ps_tw = tw; g_ps_th = th; g_ps_bl = bl;
+            g_ps_pending = true;
+            return;
+        }
         mf_emit_group(tex, tw, th, compscratch, triCount, bl, /*has_key=*/false, BLT_F_SRC_SURFACE);
         return;
     }
@@ -3460,7 +3720,9 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
             fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
             return;
         }
+        g_occ_hint.t = t; g_occ_hint.srx = 0; g_occ_hint.sry = 0;
         mf_emit_group(tex, tex.w, tex.h, v, triCount, bl, has_key, /*extra_flags=*/0);
+        g_occ_hint.t = nullptr;
         return;
     }
 
@@ -3501,7 +3763,9 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
                 fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
                 return;
             }
+            g_occ_hint.t = t; g_occ_hint.srx = 0; g_occ_hint.sry = 0;
             mf_emit_group(tex, tex.w, tex.h, gv, 2, bl, has_key, /*extra_flags=*/0);
+            g_occ_hint.t = nullptr;
             continue;
         }
 
@@ -3545,7 +3809,9 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
             reb[i].u = (u_abs - srx) / (float)tex.w;
             reb[i].v = (v_abs - sry) / (float)tex.h;
         }
+        g_occ_hint.t = t; g_occ_hint.srx = srx; g_occ_hint.sry = sry;
         mf_emit_group(tex, tex.w, tex.h, reb, 2, bl, has_key, /*extra_flags=*/0);
+        g_occ_hint.t = nullptr;
     }
 }
 
@@ -3614,6 +3880,8 @@ static void mf_emit_fps_digit(int x, int y, int digit) {
 // bottom-right corner of the WORK buffer. Called from present() right before
 // mf_frame_end, so it overlays the game's own draws for this frame.
 static void mf_emit_fps_overlay_fills(void) {
+    if (g_ps_pending) g_ps_why[2]++;
+    mf_ps_discharge();   // [present-from-surface] the overlay paints over the composite
     // [W3 batching] FLUSH POINT 10: the overlay paints OVER the frame's draws, so
     // every pending triangle must already be in the ring. Redundant with
     // mf_present's own flush just above the call, and kept anyway -- this
@@ -3648,6 +3916,9 @@ static void mf_frame_end(void);   // forward decl: defined below, called from mf
 // mf_frame_end() keeps its own call as a backstop for callers that reach
 // frame-end without going through mf_present().
 static void mf_pc_flush_all(void) {
+    // [present-from-surface] a fill after the deferred composite: make it real first.
+    for (int slot = 0; slot < MF_PC_TARGETS; slot++)
+        if (mf_pc_pending(&g_pc, slot)) { if (g_ps_pending) g_ps_why[3]++; mf_ps_discharge(); break; }
     for (int slot = 0; slot < MF_PC_TARGETS; slot++) {
         int fw, fh; uint16_t fc;
         if (mf_pc_take(&g_pc, slot, &fw, &fh, &fc)) {
@@ -3715,6 +3986,9 @@ static void mf_frame_end(void) {
     // mf_present() (which already ran this above): idempotent, so if
     // mf_present() already discharged the pending fill this is a no-op.
     mf_pc_flush_all();
+    // [occlusion cull] Last point before blt_end_frame: every vertex of the frame
+    // is in the arena and nothing has been published.
+    mf_occ_apply();
     // [Task 9 bring-up diagnostic] Log BEFORE blt_end_frame touches anything --
     // g_lru_frame_floor (set in mf_frame_begin) still delimits exactly this
     // frame's pinned working set at this point.
@@ -3730,6 +4004,12 @@ static void mf_frame_end(void) {
             last = g_dup_skipped;
             fprintf(stderr, "MFCLEAR frames=%u clears_dropped=%u clears_emitted=%u defer=%d\n",
                     nf, g_pc_dropped_total, g_pc_emitted_total, mf_defer_clear_on());
+            fprintf(stderr, "MFOCC frames=%u on=%d culled_tris=%u last_frame=%u occluders=%u tris=%d\n",
+                    nf, mf_occlude_on(), g_occ_culled_total, g_occ_culled_frame,
+                    g_occ_occluders_frame, g_occ_n);
+            fprintf(stderr, "MFPRES frames=%u present_surf=%u on=%d cap=%d discharged emit=%u clear=%u fps=%u pcflush=%u second=%u\n",
+                    nf, g_ps_frames_total, mf_present_surf_on(), mf_ps_capable() ? 1 : 0,
+                    g_ps_why[0], g_ps_why[1], g_ps_why[2], g_ps_why[3], g_ps_why[4]);
         }
     }
 #endif
@@ -3744,7 +4024,11 @@ static void mf_frame_end(void) {
                 fprintf(stderr, "backend_mfgpu: cmd_count high-water %u (ring cap ~8190)\n", hw);
         }
     }
-    blt_end_frame(&g_e);
+    // [present-from-surface] Still deferred here = nothing was drawn after the
+    // identity composite: present the surface instead of drawing it.
+    g_ps_last = g_ps_pending ? 1u : 0u;
+    if (g_ps_pending) { g_ps_frames_total++; g_ps_pending = false; }
+    blt_end_frame_flags(&g_e, g_ps_last ? (uint8_t)BLT_F_SRC_SURFACE : (uint8_t)0);
 #ifdef MISTER_NATIVE_VIDEO
     // Device: the ring + heap are already resident in the mmap'd DDR (the emitter
     // was bound to g_dev_ring/g_dev_src). Publish the control block, ring the
@@ -3890,7 +4174,7 @@ extern "C" void RasterBackend_MFGPU_TestCopyFB565(int w, int h, uint16_t *out) {
     if (w > BLT_FB_WIDTH)  w = BLT_FB_WIDTH;
     if (h > BLT_FB_HEIGHT) h = BLT_FB_HEIGHT;
     for (int y = 0; y < h; y++)
-        memcpy(out + (size_t)y * w, g_fb565 + (size_t)y * BLT_FB_WIDTH,
+        memcpy(out + (size_t)y * w, blt_present_buffer(g_fb565) + (size_t)y * BLT_FB_WIDTH,
                (size_t)w * sizeof(uint16_t));
 }
 
@@ -4063,7 +4347,7 @@ extern "C" void RasterBackend_MFGPU_TestSetCtrlSrcsel(uint32_t v) {
 // sets, only ever read here), so this cannot be clobbered by frame logic.
 extern "C" void RasterBackend_MFGPU_TestSetFpsOverlay(int on) {
 #ifndef MISTER_NATIVE_VIDEO
-    g_ctrl_shadow[MF_C_STATUS] = on ? 0x2u : 0u;
+    g_ctrl_shadow[MF_C_STATUS] = (g_ctrl_shadow[MF_C_STATUS] & ~0x2u) | (on ? 0x2u : 0u);
 #else
     (void)on;
 #endif
@@ -4134,7 +4418,16 @@ extern "C" int RasterBackend_MFGPU_TestFillPrecedesTrilist(void) {
 // the first thing in the binary to call mf_defer_clear_on().
 // [W3 batching] GMLOADER_MFGPU_BATCH_TRILIST joins it for the same reason: an
 // A/B case that flips the knob mid-binary needs the cached read cleared.
-extern "C" void RasterBackend_MFGPU_TestEnvReset(void) { g_defer_clear_v = -1; g_batch_v = -1; }
+extern "C" void RasterBackend_MFGPU_TestEnvReset(void) { g_defer_clear_v = -1; g_batch_v = -1; g_occlude_v = -1; g_ps_v = -1; }
+extern "C" uint32_t RasterBackend_MFGPU_TestPresentSurf(void) { return g_ps_last; }
+extern "C" void RasterBackend_MFGPU_TestSetPresentSurfCap(int on) {
+#ifndef MISTER_NATIVE_VIDEO
+    g_ctrl_shadow[MF_C_STATUS] = (g_ctrl_shadow[MF_C_STATUS] & ~0x4u) | (on ? 0x4u : 0u);
+#else
+    (void)on;
+#endif
+}
+extern "C" uint32_t RasterBackend_MFGPU_TestOccCulled(void) { return g_occ_culled_frame; }
 // [W3 batching] Witnesses. TRILIST commands and pre-merge groups for the LAST
 // closed frame (valid after present()/frame_end), and the run total of groups
 // absorbed into an already-open command. Unbatched, cmds == groups and merged
@@ -4199,6 +4492,7 @@ extern "C" void RasterBackend_MFGPU_TestClearShutdown(void) {
 #endif
 
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes) {
+    mf_occ_opq_clear();
     g_inited = false; g_frame_active = false;
     g_tex_heap_cap = tex_heap_bytes;   // 0 => full heap
     mf_init_once();                    // re-wires emitter, clears cache + counter
@@ -4221,6 +4515,7 @@ extern "C" void RasterBackend_MFGPU_TestReset(void) { RasterBackend_MFGPU_TestRe
 // by blitter.cpp on TexImage2D re-upload and DeleteTexture — exactly when the SW
 // oracle's CPU pixels change, so the cache never diverges from SW.
 extern "C" void RasterBackend_MFGPU_InvalidateTex(uint32_t id) {
+    mf_occ_opq_clear();   // [occlusion cull] texel contents may change under the same pointer
     if (!g_inited) return;
     for (int i = 0; i < MF_TEX_CACHE_N; i++)
         if (g_texcache[i].used && g_texcache[i].key == id) {
