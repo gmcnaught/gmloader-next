@@ -34,6 +34,7 @@
 #include "mister/raster_backend.h"
 #include "mister/mister_native_audio.h"
 #include "mister/bench_godmode.h"
+#include "mister/cpu_isolate.h"
 // Global handle to bundled libGLES_sw.so — also used by egl.cpp and gles2.cpp via extern
 void* g_gles_handle = nullptr;
 
@@ -281,6 +282,12 @@ static void fcap_demote(const char *why) {
 static void fcap_wait(void) {
     fcap_resolve();
     if (g_fcap_mode == FCAP_OFF) return;
+    // [fps-dip] The mfgpu back-end paces the DOORBELL on the scanout counter
+    // (mf_pace.h). A second wait here, at the loop's end, would release the next
+    // frame's build at a boundary and put its doorbell ~5 ms into the period —
+    // the phase that cost 7.6 % repeated scanout frames. The resolve above still
+    // runs: GM's refresh rate comes from it.
+    if (RasterBackend_Select() == &backend_mfgpu && RasterBackend_MFGPU_PaceActive()) return;
     if (g_fcap_mode == FCAP_SCANOUT) {
         uint32_t cnt = 0;
         if (!fcap_scanout_read(&cnt, NULL)) {
@@ -1155,6 +1162,7 @@ int main(int argc, char *argv[])
         // clock. Design, fallbacks and GMLOADER_FPS semantics: see the
         // [Phase 3 Stage B] block near the top of this file.
         fcap_wait();
+        CpuIsolate_Sweep();   // [fps-dip] render thread alone on CPU0 (cpu_isolate.h)
 #else
         cont = RunnerJNILib::Process(env, 0, w, h, 0, 0, 0, 0, 0, 60);
         if (RunnerJNILib::canFlip(env, 0))

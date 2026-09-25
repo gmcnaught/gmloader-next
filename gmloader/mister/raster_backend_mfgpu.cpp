@@ -68,6 +68,7 @@
 #include "fps_overlay.h"   // [OSD-fps] clamp + 7-seg digit table (Solarus port)
 #include "mf_seam_stat.h"   // [Phase 4 Stage A] submit-seam decomposition
 #include "mf_pending_clear.h"   // [Phase 4 Stage B] deferred full-screen clear
+#include "mf_pace.h"   // [fps-dip] scanout-locked doorbell pacer
 extern "C" {
 #include "blt_emitter.h"
 #include "blt_wire.h"
@@ -2072,6 +2073,74 @@ static bool mf_drop_or_reclaim(void) {
     return false;
 }
 
+// [fps-dip] Scanout-locked doorbell pacer (mf_pace.h has the why). Runs after the
+// publish barrier — the previous batch is acked — and before mf_device_publish, so
+// the wait sits between a frame that is fully built and its doorbell.
+// GMLOADER_MFGPU_PACE=off disables it (main.cpp's fcap_wait then paces the loop
+// again, as before). GMLOADER_MFGPU_PACE_STAT=1 logs the wait every 600 doorbells.
+// Every wait is bounded: a counter that stops advancing for PACE_STALL_MS lets that
+// doorbell through, and PACE_STALL_MAX of those in a row turn the pacer off for good.
+enum { PACE_STALL_MS = 50, PACE_STALL_MAX = 20 };
+static int       g_pace_mode = -1;          // -1 unparsed, 0 off, 1 scanout
+static mf_pace_t g_pace;
+static int       g_pace_stall_run = 0;
+static int       g_pace_stat = 0;
+static uint32_t  g_pace_n = 0, g_pace_waits = 0, g_pace_stalls = 0;
+static double    g_pace_wait_ms = 0.0, g_pace_wait_max = 0.0;
+
+static bool mf_pace_on(void) {
+    if (g_pace_mode < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_PACE");
+        g_pace_mode = (e && (!strcmp(e, "off") || !strcmp(e, "0"))) ? 0 : 1;
+        const char *st = getenv("GMLOADER_MFGPU_PACE_STAT");
+        g_pace_stat = (st && *st && *st != '0') ? 1 : 0;
+    }
+    return g_pace_mode == 1;
+}
+
+__attribute__((unused)) static void mf_pace_gate(void) {
+    if (!mf_pace_on()) return;
+    uint32_t cnt = 0;
+    if (!RasterBackend_MFGPU_ScanoutRead(&cnt, NULL)) return;
+    if (!mf_pace_ready(&g_pace, cnt)) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        bool stalled = false;
+        for (;;) {
+            // A pure spin, like fcap_wait's: one uncached read is ~1.2 us, so the
+            // doorbell rings within microseconds of the boundary; a sleep would be
+            // rounded up by the timer slack into the fabric's window.
+            RasterBackend_MFGPU_ScanoutRead(&cnt, NULL);
+            if (mf_pace_ready(&g_pace, cnt)) break;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            if ((t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L
+                    >= PACE_STALL_MS) { stalled = true; break; }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                          (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+        g_pace_waits++; g_pace_wait_ms += ms;
+        if (ms > g_pace_wait_max) g_pace_wait_max = ms;
+        if (stalled) {
+            g_pace_stalls++;
+            if (++g_pace_stall_run >= PACE_STALL_MAX) {
+                g_pace_mode = 0;
+                fprintf(stderr, "backend_mfgpu: pacer: scanout counter stopped advancing - "
+                        "pacer off, frame-cap pacing resumes\n");
+            }
+        } else {
+            g_pace_stall_run = 0;
+        }
+    }
+    mf_pace_rang(&g_pace, cnt);
+    if (g_pace_stat && ++g_pace_n % 600u == 0u) {
+        fprintf(stderr, "MFPACE n=%u waited=%u avg_wait_ms=%.2f max_wait_ms=%.2f stalls=%u\n",
+                g_pace_n, g_pace_waits,
+                g_pace_waits ? g_pace_wait_ms / g_pace_waits : 0.0, g_pace_wait_max, g_pace_stalls);
+        g_pace_waits = 0; g_pace_wait_ms = 0.0; g_pace_wait_max = 0.0;
+    }
+}
+
 static bool mf_publish_barrier(void) {
     clock_gettime(CLOCK_MONOTONIC, &g_seam_be);
     g_seam_blocked = false;   // a frame that skips the await never blocked
@@ -3707,6 +3776,7 @@ static void mf_frame_end(void) {
             fprintf(stderr, "backend_mfgpu: publish barrier timed out on seq=%u - batch dropped\n",
                     g_pending_seq);
         } else {
+            mf_pace_gate();
             mf_device_publish();
             g_fabric_pending = true; g_pending_seq = g_e.submit_seq;
             g_pending_arena  = g_arena & 1u;
@@ -3783,6 +3853,16 @@ extern "C" const uint16_t *RasterBackend_MFGPU_GetFB565(int *w, int *h) {
 // load — no `devmem` process spawn. Read-only: the reader owns these words.
 // Returns 1 when the mapping is live (device + /dev/mem + fabric back-end), else 0
 // with the outputs untouched — callers MUST treat 0 as "no instrument" and fall back.
+// [fps-dip] True while the doorbell pacer paces the loop, so main.cpp's frame cap
+// must not wait as well (see fcap_wait).
+extern "C" int RasterBackend_MFGPU_PaceActive(void) {
+#ifdef MISTER_NATIVE_VIDEO
+    return g_dev_ok && mf_pace_on();
+#else
+    return 0;
+#endif
+}
+
 extern "C" int RasterBackend_MFGPU_ScanoutRead(uint32_t *frame_cnt, uint32_t *period_cyc) {
 #ifdef MISTER_NATIVE_VIDEO
     if (!g_dev_ok || !g_dev_base) return 0;

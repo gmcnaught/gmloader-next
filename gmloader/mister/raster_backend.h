@@ -49,6 +49,11 @@ void RasterBackend_MFGPU_InvalidateTex(uint32_t id);
  * untouched and obliges the caller to fall back rather than wait on it. */
 int RasterBackend_MFGPU_ScanoutRead(uint32_t *frame_cnt, uint32_t *period_cyc);
 
+/* mfgpu back-end only [fps-dip]: 1 while the back-end paces the doorbell on the
+ * scanout counter (GMLOADER_MFGPU_PACE, default on), in which case the frame loop
+ * must not add its own wait; 0 otherwise (host build, off, or demoted). */
+int RasterBackend_MFGPU_PaceActive(void);
+
 /* mfgpu back-end only: quiesce the fabric and leave its DDR window in a state the
  * NEXT engine can start from. Waits (bounded) for the in-flight batch to be acked,
  * zeroes the command rings, and parks the control block idle without ever writing
