@@ -421,8 +421,11 @@ int RunnerJNILib_MoveTaskToBackCalled = 0;
  * happens on every launch, glibc only notices some of the time. The path
  * "/media/fat/games/gmloader/saves/" is 32 chars — a 25-byte overflow.
  *
- * A real save directory cannot be that short, so hand the runner a short
- * SYMLINK and leave the data where it belongs. Candidates, shortest first:
+ * patch_libyoyo() now widens that buffer in place (libyoyo.cpp,
+ * fix_runner_load_game_buffer) on the runner build it recognises. This alias is
+ * the fallback for any other runner build. A real save directory cannot be 7
+ * chars, so hand the runner a short SYMLINK and leave the data where it
+ * belongs. Candidates, shortest first:
  *   "/s"     — needs a writable /. MiSTer's rootfs is a READ-ONLY ext4 loop
  *              mount, so this only works where the link already exists.
  *   "/tmp/s" — /tmp is tmpfs on MiSTer, always writable; "/tmp/s/" is exactly
@@ -474,8 +477,8 @@ static fs::path alias_save_dir(const fs::path &save_dir)
         if (link_save_alias(alias, target))
             return fs::path(alias) / "";   /* keep the trailing-separator convention */
 
-    warning("save_dir: no short alias available; using %s — the runner WILL overflow "
-            "its path buffer (heap corruption)\n", save_dir.c_str());
+    warning("save_dir: no short alias available; using %s — safe only if the "
+            "RunnerLoadGame path-buffer patch applied\n", save_dir.c_str());
     return save_dir;
 }
 
