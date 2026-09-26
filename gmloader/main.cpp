@@ -394,22 +394,69 @@ so_module *libyoyo = NULL;
 
 int RunnerJNILib_MoveTaskToBackCalled = 0;
 
-/* The GameMaker runner assembles "<save_dir><filename>" into a fixed ~34-byte
- * heap buffer. It is compiled with _FORTIFY_SOURCE, so it passes that size to
- * __strcpy_chk — but gmloader's fortify layer stubs the bounds check out
- * (thunks/libc/fortify.cpp: __check_buffer_access / __fortify_fatal are no-ops),
- * so the copy runs unbounded and silently smashes the next heap chunk. That is
- * the corruption behind the intermittent glibc "malloc(): invalid size" abort.
+/* The GameMaker runner overflows a heap buffer unless the save directory it is
+ * given is at most 7 characters long (trailing '/' included).
  *
- * Measured on device with ASan: a 3-char save path is clean and reaches the
- * render loop; 14, 19, 32 and 60 chars all overflow. A real save directory
- * cannot be that short ("/media/fat/" is 11 before you name anything), so hand
- * the runner a short SYMLINK and leave the actual data where it belongs.
+ * RunnerLoadGame (libyoyo.so, v1.4.1567) sizes the buffer for the game file
+ * with GetFilePrePend() — the constant "assets/", 7 chars — but fills it with
+ * LoadSave::_GetSaveFileName(), which strcpy's GetSavePrePend() — the save_dir
+ * we pass in over JNI — and strcat's the file name:
  *
- * The link lives on the RAM-overlay rootfs, so it is (re)created every launch.
- * Any failure is non-fatal: fall back to the real path and warn. */
-static const char *kSaveDirAlias  = "/s";
-static const size_t kSaveDirMaxLen = 8;   /* conservative: 14 already overflows */
+ *     buf = MemoryManager::Alloc(strlen("game.droid") + strlen("assets/") + 1);
+ *     LoadSave::_GetSaveFileName(buf, size, "game.droid");  // size is ignored
+ *
+ * So it writes strlen(save_dir) - 7 bytes past an 18-byte allocation (34 bytes
+ * with MemoryManager's 16-byte header — the "34-byte region" ASan reported)
+ * into the next heap chunk's header. That is the corruption behind the
+ * intermittent glibc "malloc(): invalid size (unsorted)" abort in
+ * RunnerLoadGame, and later "free(): invalid next size" aborts: the smash
+ * happens on every launch, glibc only notices some of the time. The path
+ * "/media/fat/games/gmloader/saves/" is 32 chars — a 25-byte overflow.
+ *
+ * patch_libyoyo() now widens that buffer in place (libyoyo.cpp,
+ * fix_runner_load_game_buffer) on the runner build it recognises. This alias is
+ * the fallback for any other runner build. A real save directory cannot be 7
+ * chars, so hand the runner a short SYMLINK and leave the data where it
+ * belongs. Candidates, shortest first:
+ *   "/s"     — needs a writable /. MiSTer's rootfs is a READ-ONLY ext4 loop
+ *              mount, so this only works where the link already exists.
+ *   "/tmp/s" — /tmp is tmpfs on MiSTer, always writable; "/tmp/s/" is exactly
+ *              7 chars, the largest length that does not overflow.
+ * A failure is non-fatal: fall back to the real path and warn. */
+static const char *const kSaveDirAliases[] = { "/s", "/tmp/s" };
+static const size_t kSaveDirMaxLen = 7;   /* strlen("assets/"); includes the trailing '/' */
+
+/* Point `alias` at `target`. True if the link exists and resolves to it. */
+static bool link_save_alias(const char *alias, const fs::path &target)
+{
+    struct stat st;
+    if (lstat(alias, &st) == 0) {
+        if (!S_ISLNK(st.st_mode)) {
+            warning("save_dir: %s exists and is not a symlink\n", alias);
+            return false;
+        }
+        /* Reuse a link that already points where we want: on a read-only / the
+         * unlink() and symlink() below both fail. */
+        char cur[512];
+        ssize_t n = readlink(alias, cur, sizeof(cur) - 1);
+        if (n > 0) {
+            cur[n] = '\0';
+            if (!strcmp(cur, target.c_str())) {
+                warning("save_dir: reusing existing %s -> %s\n", alias, cur);
+                return true;
+            }
+        }
+    }
+    unlink(alias);   /* stale link pointing elsewhere; ENOENT is fine */
+    if (symlink(target.c_str(), alias) != 0) {
+        warning("save_dir: could not link %s -> %s (%s)\n",
+                alias, target.c_str(), strerror(errno));
+        return false;
+    }
+    warning("save_dir: %s -> %s (short path for the runner's fixed path buffer)\n",
+            alias, target.c_str());
+    return true;
+}
 
 static fs::path alias_save_dir(const fs::path &save_dir)
 {
@@ -418,37 +465,13 @@ static fs::path alias_save_dir(const fs::path &save_dir)
     fs::path target = save_dir;
     if (target.filename().empty()) target = target.parent_path();
 
-    struct stat st;
-    if (lstat(kSaveDirAlias, &st) == 0) {
-        if (!S_ISLNK(st.st_mode)) {
-            warning("save_dir: %s exists and is not a symlink; using the long path "
-                    "(the runner may overflow its path buffer)\n", kSaveDirAlias);
-            return save_dir;
-        }
-        /* An existing link that already points where we want is the common case
-         * on MiSTer, where / is mounted READ-ONLY: unlink() and symlink() both
-         * fail there, so recreating it unconditionally made this fall back to
-         * the long path — silently reinstating the heap corruption this alias
-         * exists to prevent. Reuse it instead. */
-        char cur[512];
-        ssize_t n = readlink(kSaveDirAlias, cur, sizeof(cur) - 1);
-        if (n > 0) {
-            cur[n] = '\0';
-            if (!strcmp(cur, target.c_str())) {
-                warning("save_dir: reusing existing %s -> %s\n", kSaveDirAlias, cur);
-                return fs::path(kSaveDirAlias) / "";
-            }
-        }
-    }
-    unlink(kSaveDirAlias);   /* stale link pointing elsewhere; ENOENT is fine */
-    if (symlink(target.c_str(), kSaveDirAlias) != 0) {
-        warning("save_dir: could not link %s -> %s (%s); using the long path\n",
-                kSaveDirAlias, target.c_str(), strerror(errno));
-        return save_dir;
-    }
-    warning("save_dir: %s -> %s (short path for the runner's fixed path buffer)\n",
-            kSaveDirAlias, target.c_str());
-    return fs::path(kSaveDirAlias) / "";   /* keep the trailing-separator convention */
+    for (const char *alias : kSaveDirAliases)
+        if (link_save_alias(alias, target))
+            return fs::path(alias) / "";   /* keep the trailing-separator convention */
+
+    warning("save_dir: no short alias available; using %s — safe only if the "
+            "RunnerLoadGame path-buffer patch applied\n", save_dir.c_str());
+    return save_dir;
 }
 
 static fs::path get_absolute_path(const char* path, fs::path work_dir){

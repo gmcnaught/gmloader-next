@@ -274,6 +274,48 @@ ABI_ATTR long PrepareGame_hook()
     return ret;
 }
 
+/* Runner 1.4.1567 (Cursed Castilla's libyoyo.so) under-sizes the buffer that
+ * RunnerLoadGame builds the save-dir game path in:
+ *
+ *     size = strlen(name) + strlen(GetFilePrePend()) + 1;   // "assets/" = 7
+ *     buf  = MemoryManager::Alloc(size, ...);
+ *     LoadSave::_GetSaveFileName(buf, size, name);  // strcpy(save_dir); strcat(name)
+ *
+ * so any save_dir longer than 7 chars smashes the next heap chunk — the
+ * intermittent glibc "malloc(): invalid size (unsorted)" abort. Every other
+ * _GetSaveFileName caller passes a fixed 511..2048-byte buffer.
+ *
+ * Patch the final `add r9, r9, r3` (+1) to `add r9, r9, #256`, giving room for a
+ * save_dir of up to 262 chars. r3 (=1) is left alone: it is also Alloc's
+ * zero-fill flag. The instruction and its neighbours are checked first, so any
+ * other runner build is left untouched. main.cpp's short save-dir alias stays
+ * as the fallback for runners this does not match. */
+static void fix_runner_load_game_buffer(so_module *mod)
+{
+    uintptr_t fn = so_symbol(mod, "_Z14RunnerLoadGamev");
+    if (!fn || (fn & 1))
+        return;
+    uint32_t *p = (uint32_t *)(fn + 0x464);
+    static const uint32_t expect[] = {
+        0xE3A03001,   /* +0x464  mov  r3, #1                 */
+        0xE59F112C,   /* +0x468  ldr  r1, [pc, #0x12c]        */
+        0xE30024E6,   /* +0x46c  movw r2, #0x4e6              */
+        0xE08F1001,   /* +0x470  add  r1, pc, r1              */
+        0xE0899000,   /* +0x474  add  r9, r9, r0              */
+        0xE0899003,   /* +0x478  add  r9, r9, r3   <- patched */
+        0xE1A00009,   /* +0x47c  mov  r0, r9                  */
+    };
+    for (size_t i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
+        if (p[i] != expect[i]) {
+            warning("RunnerLoadGame: path-buffer patch not applied (unrecognised runner)\n");
+            return;
+        }
+    }
+    p[5] = 0xE2899C01;   /* add r9, r9, #256 */
+    __builtin___clear_cache((char *)&p[5], (char *)&p[6]);
+    warning("RunnerLoadGame: path buffer widened by 256 bytes\n");
+}
+
 void patch_libyoyo(so_module *mod)
 {
     // Load all of the native symbols referenced
@@ -364,6 +406,8 @@ void patch_libyoyo(so_module *mod)
         // hook_symbol(mod, "_Z20Extension_PrePreparev", (uintptr_t)&dont_init_extensions, 1);
         hook_symbol(mod, "_Z14Extension_LoadPhjS_", (uintptr_t)&dont_init_extensions, 1);
     }
+
+    fix_runner_load_game_buffer(mod);
 
     // Hook messages for debug
     hook_symbol(mod, "_Z11ShowMessagePKc", (uintptr_t)&show_message, 1);
