@@ -20,6 +20,7 @@
 // comparison to blend/interpolation rounding.
 #include "raster_backend.h"
 #include "blitter_raster.h"
+#include <math.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -3089,6 +3090,142 @@ static int case_occlusion_cull_is_bit_identical(void) {
     printf("  OK   occlude-identical  framebuffer byte-identical, %u triangles culled\n", culled_on);
     return 1;
 }
+// ── sparse keyed quads + transposed staging (level_2_3, the windmill room) ────
+extern "C" uint32_t RasterBackend_MFGPU_TestSparseRects(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestSparseEmpty(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestTransposed(void);
+// bck_rain_light's shape: a 252x214 page that is almost all transparent, with short
+// diagonal streaks, drawn 1:1 as a tiled full-screen layer over an opaque background.
+static const RTexture *mf_test_rain(void) {
+    enum { RW = 252, RH = 214 };
+    static uint8_t tex[RW * RH * 4];
+    static RTexture t = { tex, RW, RH, 1, 1, /*RTEX_RGBA8888*/0, 0 };
+    static bool made = false;
+    if (!made) {
+        made = true;
+        memset(tex, 0, sizeof tex);
+        unsigned seed = 7;
+        for (int n = 0; n < 60; n++) {
+            seed = seed * 1103515245u + 12345u; int x = (int)(seed >> 8) % RW;
+            seed = seed * 1103515245u + 12345u; int y = (int)(seed >> 8) % RH;
+            for (int k = 0; k < 6 && x < RW && y < RH; k++, y++, x += (k & 1)) {
+                uint8_t *px = &tex[(y * RW + x) * 4];
+                px[0] = (uint8_t)(150 + k * 15); px[1] = (uint8_t)(170 + k * 10); px[2] = 255; px[3] = 255;
+            }
+        }
+    }
+    return &t;
+}
+static uint32_t mf_test_render_rain_scene(uint16_t *out) {
+    RasterBackend_MFGPU_TestReset();
+    RSurface d; mf_test_make_default_surface(&d);
+    BVtx q[6];
+    mf_test_make_quad_at(q, 0.f, 0.f, (float)BW, (float)BH, 1.0f);
+    backend_mfgpu.draw(&d, q, 2, mf_test_occ_bg(), RB_NONE, 0.0f, 0x3201);
+    // scrolled tiling: pixel-aligned tiles hanging off every edge
+    for (int ty = -1; ty <= 1; ty++) for (int tx = -1; tx <= 1; tx++) {
+        mf_test_make_quad_at(q, 252.f * tx - 37.f, 214.f * ty + 11.f, 252.f, 214.f, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, mf_test_rain(), RB_ALPHA, 0.0f, 0x3202);
+    }
+    // off the pixel grid: must be left whole, and still match
+    mf_test_make_quad_at(q, 10.5f, 3.25f, 252.f, 214.f, 1.0f);
+    backend_mfgpu.draw(&d, q, 2, mf_test_rain(), RB_ALPHA, 0.0f, 0x3202);
+    backend_mfgpu.present(&d);
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, out);
+    return RasterBackend_MFGPU_TestSparseRects();
+}
+static int case_sparse_keyed_quads_are_bit_identical(void) {
+    static uint16_t fb_on[BW*BH], fb_off[BW*BH];
+    setenv("GMLOADER_MFGPU_SPARSE", "0", 1); RasterBackend_MFGPU_TestEnvReset();
+    uint32_t rects_off = mf_test_render_rain_scene(fb_off);
+    setenv("GMLOADER_MFGPU_SPARSE", "1", 1); RasterBackend_MFGPU_TestEnvReset();
+    uint32_t rects_on = mf_test_render_rain_scene(fb_on);
+    unsetenv("GMLOADER_MFGPU_SPARSE"); RasterBackend_MFGPU_TestEnvReset();
+    if (memcmp(fb_on, fb_off, sizeof fb_on) != 0) {
+        int first = -1, ndiff = 0;
+        for (int i = 0; i < BW*BH; i++)
+            if (fb_on[i] != fb_off[i]) { if (first < 0) first = i; ndiff++; }
+        printf("  FAIL sparse-identical  %d/%d pixels differ, first at (%d,%d) on=%04x off=%04x\n",
+               ndiff, BW*BH, first % BW, first / BW, fb_on[first], fb_off[first]);
+        return 0;
+    }
+    if (rects_off != 0 || rects_on == 0) {
+        printf("  FAIL sparse-identical  rects off=%u (want 0) on=%u (want >0)\n", rects_off, rects_on);
+        return 0;
+    }
+    printf("  OK   sparse-identical  framebuffer byte-identical, rain layer drawn as %u rects\n", rects_on);
+    return 1;
+}
+// spr_molino's shape: a 96x26 lattice (holes) inside a larger atlas, drawn as four
+// sails rotating about a hub, at many angles.
+static const RTexture *mf_test_sail_atlas(void) {
+    enum { AW = 160, AH = 64 };
+    static uint8_t tex[AW * AH * 4];
+    static RTexture t = { tex, AW, AH, 1, 1, /*RTEX_RGBA8888*/0, 0 };
+    static bool made = false;
+    if (!made) {
+        made = true;
+        for (int y = 0; y < AH; y++) for (int x = 0; x < AW; x++) {
+            uint8_t *p = &tex[(y * AW + x) * 4];
+            p[0] = (uint8_t)(x * 5); p[1] = (uint8_t)(y * 9); p[2] = (uint8_t)(x ^ y); p[3] = 255;
+            const int sx = x - 20, sy = y - 10;               // sail at (20,10) 96x26
+            if (sx >= 0 && sx < 96 && sy >= 0 && sy < 26 && (sx % 12) > 2 && (sy % 12) > 2) p[3] = 0;
+        }
+    }
+    return &t;
+}
+static uint32_t mf_test_render_sails(uint16_t *out, int step) {
+    RasterBackend_MFGPU_TestReset();
+    RSurface d; mf_test_make_default_surface(&d);
+    BVtx q[6];
+    mf_test_make_quad_at(q, 0.f, 0.f, (float)BW, (float)BH, 1.0f);
+    backend_mfgpu.draw(&d, q, 2, mf_test_occ_bg(), RB_NONE, 0.0f, 0x3301);
+    const float cx = 144.f, cy = 108.f, pi = 3.14159265f;
+    const float u0 = 20.f / 160.f, u1 = 116.f / 160.f, v0 = 10.f / 64.f, v1 = 36.f / 64.f;
+    uint32_t tr = 0;
+    for (int s = 0; s < 4; s++) {
+        const float a = (float)step * 0.13f + (float)s * pi / 2.f;
+        const float ca = cosf(a), sa = sinf(a);
+        // sail rect in its own frame: x along the arm (8..104), y across (-13..13)
+        const float lx[4] = { 8.f, 104.f, 104.f, 8.f }, ly[4] = { -13.f, -13.f, 13.f, 13.f };
+        const float uu[4] = { u0, u1, u1, u0 }, vv[4] = { v0, v0, v1, v1 };
+        BVtx c[4];
+        for (int k = 0; k < 4; k++)
+            c[k] = BVtx{ cx + lx[k] * ca - ly[k] * sa, cy + lx[k] * sa + ly[k] * ca, uu[k], vv[k], 1,1,1,1 };
+        q[0] = c[0]; q[1] = c[1]; q[2] = c[2]; q[3] = c[2]; q[4] = c[3]; q[5] = c[0];
+        backend_mfgpu.draw(&d, q, 2, mf_test_sail_atlas(), RB_ALPHA, 0.0f, 0x3302);
+        tr += RasterBackend_MFGPU_TestTransposed();
+    }
+    tr = RasterBackend_MFGPU_TestTransposed();
+    backend_mfgpu.present(&d);
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, out);
+    return tr;
+}
+static int case_transposed_staging_is_bit_identical(void) {
+    static uint16_t fb_on[BW*BH], fb_off[BW*BH];
+    uint32_t total = 0;
+    for (int step = 0; step < 48; step++) {
+        setenv("GMLOADER_MFGPU_TRANSPOSE", "0", 1); RasterBackend_MFGPU_TestEnvReset();
+        uint32_t tr_off = mf_test_render_sails(fb_off, step);
+        setenv("GMLOADER_MFGPU_TRANSPOSE", "1", 1); RasterBackend_MFGPU_TestEnvReset();
+        uint32_t tr_on = mf_test_render_sails(fb_on, step);
+        unsetenv("GMLOADER_MFGPU_TRANSPOSE"); RasterBackend_MFGPU_TestEnvReset();
+        if (tr_off != 0) { printf("  FAIL transpose-identical  step %d transposed %u with the knob off\n", step, tr_off); return 0; }
+        if (memcmp(fb_on, fb_off, sizeof fb_on) != 0) {
+            int first = -1, ndiff = 0;
+            for (int i = 0; i < BW*BH; i++)
+                if (fb_on[i] != fb_off[i]) { if (first < 0) first = i; ndiff++; }
+            printf("  FAIL transpose-identical  step %d: %d pixels differ, first at (%d,%d) on=%04x off=%04x\n",
+                   step, ndiff, first % BW, first / BW, fb_on[first], fb_off[first]);
+            return 0;
+        }
+        total += tr_on;
+    }
+    if (total == 0) { printf("  FAIL transpose-identical  no sail was ever transposed\n"); return 0; }
+    printf("  OK   transpose-identical  48 sail angles byte-identical, %u of 192 sails transposed\n", total);
+    return 1;
+}
+
 // Gapless opaque tiles must take the whole background with them.
 static int case_occlusion_cull_drops_hidden_background(void) {
     RasterBackend_MFGPU_TestReset();
@@ -3937,6 +4074,8 @@ int main(void){
     if (!case_batch_output_is_bit_identical()) { printf("FAIL mfgpu-batch-identical\n"); ok = 0; }
     if (!case_occlusion_cull_is_bit_identical()) { printf("FAIL mfgpu-occlude-identical\n"); ok = 0; }
     if (!case_occlusion_cull_drops_hidden_background()) { printf("FAIL mfgpu-occlude-bg\n"); ok = 0; }
+    if (!case_sparse_keyed_quads_are_bit_identical()) { printf("FAIL mfgpu-sparse-identical\n"); ok = 0; }
+    if (!case_transposed_staging_is_bit_identical()) { printf("FAIL mfgpu-transpose-identical\n"); ok = 0; }
     if (!case_present_surf()) { printf("FAIL mfgpu-present-surf\n"); ok = 0; }
     else printf("raster_backend mfgpu-batch-identical OK\n");
     if (!case_batch_preserves_deferred_clear_drop()) { printf("FAIL mfgpu-batch-vs-defer-clear\n"); ok = 0; }
