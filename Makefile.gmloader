@@ -308,6 +308,15 @@ mf-occlude-test:
 	  $(MFGPU_DIR)/refmodel/blt_tri.c $(MFGPU_DIR)/refmodel/blitter_ref.c \
 	  -lm -o /tmp/mfocc && /tmp/mfocc
 
+.PHONY: mf-sparse-test
+# Host test for the sparse keyed-quad split (mf_sparse.h), checked against the
+# golden rasterizer blt_tri.c.
+mf-sparse-test:
+	c++ -std=c++17 -O2 -Igmloader/mister $(MFGPU_INC) \
+	  gmloader/mister/mf_sparse_test.cpp \
+	  $(MFGPU_DIR)/refmodel/blt_tri.c $(MFGPU_DIR)/refmodel/blitter_ref.c \
+	  -lm -o /tmp/mfsparse && /tmp/mfsparse
+
 .PHONY: mf-pending-clear-test
 # TDD host test for the Phase 4 Stage B deferred full-screen clear
 # (mf_pending_clear.h). Like mf-seam-stat-test the header is dependency-free,

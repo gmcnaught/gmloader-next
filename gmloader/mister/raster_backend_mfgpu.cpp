@@ -70,6 +70,7 @@
 #include "mf_pending_clear.h"   // [Phase 4 Stage B] deferred full-screen clear
 #include "mf_pace.h"   // [fps-dip] scanout-locked doorbell pacer
 #include "mf_occlude.h"   // occlusion cull: triangles hidden under later opaque quads
+#include "mf_sparse.h"    // sparse keyed quads: emit only the rects that hold non-key texels
 extern "C" {
 #include "blt_emitter.h"
 #include "blt_wire.h"
@@ -200,9 +201,44 @@ static int           g_frame_no = 0;
 // rw=full-w, rh=full-h). Two draws of the same texture that sample different
 // sub-rects get distinct entries; invalidate frees every entry with a matching
 // key regardless of rect.
+// `tr`: the page holds the rect TRANSPOSED (page texel (x, y) = source texel (y, x)); see
+// mf_transpose_on. rw/rh are the SOURCE rect's size either way.
 struct MfTexEntry { uint32_t key; bool used; bool has_key; bool mask_only; blt_surface_ref_t ref; uint64_t lru;
-                    uint16_t rx, ry, rw, rh; };
+                    uint16_t rx, ry, rw, rh; bool tr; };
 static MfTexEntry g_texcache[MF_TEX_CACHE_N];
+// [sparse keyed quads] Per-slot mf_sp_build map of the page, built at upload from the
+// staged texels (g_sp_ok[i] says whether slot i's map belongs to its CURRENT page; every
+// insert into a slot rewrites it). Buffers are reused across pages, never freed.
+static uint8_t *g_sp_map[MF_TEX_CACHE_N];
+static int      g_sp_cap[MF_TEX_CACHE_N];
+static bool     g_sp_ok[MF_TEX_CACHE_N];
+static blt_vtx_t g_sp_out[MF_MAX_VERTS];
+static uint32_t g_sp_quads_frame = 0, g_sp_rects_frame = 0, g_sp_empty_frame = 0;   // MFSUBMIT
+static uint32_t g_tr_quads_frame = 0;                                            // MFSUBMIT
+static int g_sparse_v = -1;
+static int mf_sparse_on(void) {
+    if (g_sparse_v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_SPARSE");
+        g_sparse_v = (e && *e) ? atoi(e) : 1;
+    }
+    return g_sparse_v;
+}
+// [transposed staging] The fabric's texel caches (a 2 KB direct-mapped qword cache in
+// blitter_top, two 256 B SDRAM blocks behind it) are fed row by row. A rotated quad whose
+// screen-x step moves further along the texture's v than its u walks ACROSS texture rows,
+// missing on nearly every pixel: the windmill sails in level_2_3 cost 53 fabric cycles per
+// pixel against ~8 for everything else (RTL replay, 2026-09-26). Staging that quad's rect
+// transposed and swapping its u and v turns the walk back along rows. Exact: u and v are
+// interpolated with the same weights and clamped against the swapped page size, so the
+// fabric samples page (tv, tu) = source (tu, tv), the texel it sampled before.
+static int g_transpose_v = -1;
+static int mf_transpose_on(void) {
+    if (g_transpose_v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_TRANSPOSE");
+        g_transpose_v = (e && *e) ? atoi(e) : 1;
+    }
+    return g_transpose_v;
+}
 static uint64_t   g_lru_clock   = 0;
 static uint32_t   g_upload_count = 0;   // real blt_upload calls since reinit (test hook)
 static uint32_t   g_stage_count  = 0;   // BLT_OP_STAGE emits since reinit (FO Task 3 test hook)
@@ -2296,6 +2332,7 @@ static void mf_frame_begin(void) {
     g_frame_ovf_cause = MF_OVF_UNKNOWN;   // [Phase 1 B3] per-frame: reset before staging
     g_last_draw.valid = false;   // [duplicate-draw elimination] never span frames
     g_occ_n = 0; g_occ_full = false; g_occ_occluders_frame = 0;   // [occlusion cull] per frame
+    g_sp_quads_frame = g_sp_rects_frame = g_sp_empty_frame = g_tr_quads_frame = 0;
     g_ps_pending = false;   // [present-from-surface] never spans frames
     g_appsurf_presented = false; // [strip CRT] the present must re-land every frame
     // Snapshot the pin floor for this frame: any g_texcache entry touched
@@ -2532,14 +2569,17 @@ static void mf_texdump(uint32_t key, int w, int h, int rx, int ry, const char *w
     dumped++;
 }
 
+// `w` x `h` is the SOURCE rect; with `tr` the page in g_texscratch is its transpose
+// (h wide, w tall).
 static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
                                              int rx, int ry, bool has_key, bool mask_only,
-                                             const char *what) {
+                                             const char *what, bool tr = false) {
+    const int pw = tr ? h : w, ph = tr ? w : h;   // page dims as uploaded
     if (mf_texdump_on()) mf_texdump(key, w, h, rx, ry, what);
     bool ov_before = g_e.overflow;                    // preserve any overflow already set this frame
-    blt_surface_ref_t ref = blt_upload(&g_e, g_texscratch, w, h, w * 2);
+    blt_surface_ref_t ref = blt_upload(&g_e, g_texscratch, pw, ph, pw * 2);
     int evicted = 0;
-    while (!ref.valid && evict_one_lru()) { evicted++; ref = blt_upload(&g_e, g_texscratch, w, h, w * 2); }
+    while (!ref.valid && evict_one_lru()) { evicted++; ref = blt_upload(&g_e, g_texscratch, pw, ph, pw * 2); }
     if (!ref.valid) {
         if (mf_heaplog_on()) {
             fprintf(stderr, "HEAPLOG STAGE FAIL %s key=%u rect=%d,%d %dx%d(%zu bytes) evicted=%d "
@@ -2621,7 +2661,20 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
     if (g_texcache[slot].used)
         blt_emitter_free(&g_e, g_texcache[slot].ref.off, g_texcache[slot].ref.size);
     g_texcache[slot] = MfTexEntry{ key, true, has_key, mask_only, ref, ++g_lru_clock,
-                                   (uint16_t)rx, (uint16_t)ry, (uint16_t)w, (uint16_t)h };
+                                   (uint16_t)rx, (uint16_t)ry, (uint16_t)w, (uint16_t)h, tr };
+    // [sparse keyed quads] Only a keyed page big enough for a quad worth splitting.
+    g_sp_ok[slot] = false;
+    if (has_key && pw * ph >= MF_SP_MIN_PX) {
+        const int need = mf_sp_map_bytes(pw, ph);
+        if (g_sp_cap[slot] < need) {
+            uint8_t *m = (uint8_t *)realloc(g_sp_map[slot], (size_t)need);
+            if (m) { g_sp_map[slot] = m; g_sp_cap[slot] = need; }
+        }
+        if (g_sp_cap[slot] >= need) {
+            mf_sp_build(g_texscratch, pw, ph, MF_COLORKEY, g_sp_map[slot]);
+            g_sp_ok[slot] = true;
+        }
+    }
     return ref;
 }
 
@@ -2760,7 +2813,7 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
     for (int i = 0; i < MF_TEX_CACHE_N; i++)
         if (g_texcache[i].used && g_texcache[i].key == key &&
             g_texcache[i].rx == 0 && g_texcache[i].ry == 0 &&
-            g_texcache[i].rw == tw && g_texcache[i].rh == th) {
+            g_texcache[i].rw == tw && g_texcache[i].rh == th && !g_texcache[i].tr) {
             g_texcache[i].lru = ++g_lru_clock;
             *out_has_key = g_texcache[i].has_key;
             return g_texcache[i].ref;
@@ -2797,6 +2850,27 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
 // margin guards the fabric's +HALF-bias NEAREST edge; clamping rx1/ry1 to the
 // page (NOT page-1) keeps the max-edge texel w-1 inside the rect. Single-sourced
 // so stage_texture_region and mf_draw's near-full-page decision agree exactly.
+// [transposed staging] Would the rw x rh rect's transposed page give this quad better
+// texel locality? The fabric walks each triangle along screen rows, so the cost driver is
+// how far the texel ADDRESS moves per screen-x step: |2*du/dx + stride*dv/dx| bytes, with
+// stride = 2*rw for the normal page and 2*rh (u and v swapped) for the transposed one.
+// Measured on a replayed level_2_3 frame (four 96x26 sails): all four normal 327,680
+// cycles, all four transposed 172,104 -- and choosing by |dv/dx| > |du/dx| alone was
+// worse (221,440), because it ignores that the transposed page's rows are 3.5x shorter.
+// (Affine map of the first triangle, in texels of the full tw x th texture.)
+static bool mf_quad_prefers_transpose(const BVtx *gv, int tw, int th, int rw, int rh) {
+    const float x1 = gv[1].x - gv[0].x, y1 = gv[1].y - gv[0].y;
+    const float x2 = gv[2].x - gv[0].x, y2 = gv[2].y - gv[0].y;
+    const float d = x1 * y2 - x2 * y1;
+    if (fabsf(d) < 1e-6f) return false;
+    const float u1 = (gv[1].u - gv[0].u) * tw, u2 = (gv[2].u - gv[0].u) * tw;
+    const float v1 = (gv[1].v - gv[0].v) * th, v2 = (gv[2].v - gv[0].v) * th;
+    const float dudx = (u1 * y2 - u2 * y1) / d, dvdx = (v1 * y2 - v2 * y1) / d;
+    const float step_n = fabsf(2.0f * dudx + 2.0f * (float)rw * dvdx);
+    const float step_t = fabsf(2.0f * dvdx + 2.0f * (float)rh * dudx);
+    return step_t < step_n;
+}
+
 static void mf_crop_rect(const RTexture *t, float u0, float v0, float u1, float v1,
                          int *rx, int *ry, int *rw, int *rh) {
     int x0 = mf_clampi((int)floorf(u0 * t->w) - 1, 0, t->w - 1);
@@ -2808,17 +2882,24 @@ static void mf_crop_rect(const RTexture *t, float u0, float v0, float u1, float 
     *rh = (y1 - y0 < 1) ? 1 : y1 - y0;
 }
 
+// [transposed staging] largest rect staged transposed (the transpose needs a temp copy).
+enum { MF_TR_MAX_TEXELS = 256 * 256 };
+static uint16_t g_trscratch[MF_TR_MAX_TEXELS];
+
+// `tr`: stage the rect transposed (see mf_transpose_on); the caller keeps rw*rh within
+// MF_TR_MAX_TEXELS. The returned ref describes the page as staged (rh wide, rw tall).
 static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
                                               float u0, float v0, float u1, float v1,
                                               bool *out_has_key, int *out_rx, int *out_ry,
-                                              bool *out_mask_only) {
+                                              bool *out_mask_only, bool tr = false) {
     int rx, ry, rw, rh;
     mf_crop_rect(t, u0, v0, u1, v1, &rx, &ry, &rw, &rh);
     *out_rx = rx; *out_ry = ry;
+    if (tr && (size_t)rw * rh > MF_TR_MAX_TEXELS) tr = false;
     for (int i = 0; i < MF_TEX_CACHE_N; i++)
         if (g_texcache[i].used && g_texcache[i].key == key &&
             g_texcache[i].rx == rx && g_texcache[i].ry == ry &&
-            g_texcache[i].rw == rw && g_texcache[i].rh == rh) {
+            g_texcache[i].rw == rw && g_texcache[i].rh == rh && g_texcache[i].tr == tr) {
             g_texcache[i].lru = ++g_lru_clock;
             *out_has_key = g_texcache[i].has_key;
             if (out_mask_only) *out_mask_only = g_texcache[i].mask_only;
@@ -2836,7 +2917,14 @@ static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
     // (4.7% -> 27.1% -> 38.2% -> 47.8%), i.e. a tube iris opening and closing over the image.
     bool mask_only = true;
     mf_stage_texels(t, rx, ry, rw, rh, g_texscratch, &has_key, &mask_only);
-    blt_surface_ref_t ref = mf_upload_and_cache(key, rw, rh, rx, ry, has_key, mask_only, "region");
+    if (tr) {
+        memcpy(g_trscratch, g_texscratch, (size_t)rw * rh * 2);
+        for (int y = 0; y < rh; y++)
+            for (int x = 0; x < rw; x++)
+                g_texscratch[(size_t)x * rh + y] = g_trscratch[(size_t)y * rw + x];
+    }
+    blt_surface_ref_t ref = mf_upload_and_cache(key, rw, rh, rx, ry, has_key, mask_only,
+                                                tr ? "region-tr" : "region", tr);
     *out_has_key = ref.valid ? has_key : false;
     if (out_mask_only) *out_mask_only = ref.valid ? mask_only : false;
     return ref;
@@ -2961,6 +3049,8 @@ static void mf_ps_discharge_keep_target(void) {
 // origin in the RTexture, so staged texel (x, y) is RTexture texel
 // (srx + x, sry + y) -- the same mapping mf_stage_texels uses.
 static struct { const RTexture *t; int srx, sry; } g_occ_hint = { nullptr, 0, 0 };
+// [transposed staging] set by mf_draw around an mf_emit_group whose page is transposed.
+static bool g_tr_emit = false;
 
 // Direct-mapped cache of "this texel rect has no hole". Cleared whenever the
 // staged-texture cache is invalidated (texture re-upload / reinit).
@@ -3120,6 +3210,23 @@ static bool mf_batch_clear_relevant(uint8_t extra_flags) {
     return false;
 }
 
+// [sparse keyed quads] Split the 2-triangle quad in g_vtxscratch (addressing page `tex`)
+// into g_sp_out; returns mf_sp_split's result (-1 = emit the quad unchanged).
+static int mf_sp_try(const blt_surface_ref_t &tex) {
+    int32_t lx = g_vtxscratch[0].x, hx = lx, ly = g_vtxscratch[0].y, hy = ly;
+    for (int i = 1; i < 6; i++) {
+        const int32_t x = g_vtxscratch[i].x, y = g_vtxscratch[i].y;
+        if (x < lx) lx = x; if (x > hx) hx = x; if (y < ly) ly = y; if (y > hy) hy = y;
+    }
+    if ((int64_t)(hx - lx) * (hy - ly) < (int64_t)MF_SP_MIN_PX * 256) return -1;   // cheap reject
+    for (int i = 0; i < MF_TEX_CACHE_N; i++)
+        if (g_texcache[i].used && g_texcache[i].ref.off == tex.off) {
+            if (!g_sp_ok[i]) return -1;
+            return mf_sp_split(g_vtxscratch, tex.w, tex.h, g_sp_map[i], g_sp_out, MF_MAX_VERTS / 6);
+        }
+    return -1;
+}
+
 static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
                           const BVtx *verts, int nt, RBlend bl,
                           bool has_key, uint8_t extra_flags) {
@@ -3178,6 +3285,16 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         g_vtxscratch[i] = bvtx_to_blt(&verts[i], tw, th);
         if (verts[i].a < min_vtx_a) min_vtx_a = verts[i].a;
     }
+    // [transposed staging] `tex` holds the rect transposed: swap AFTER the 12.4 conversion,
+    // so the fabric interpolates exactly the integers it would have without the swap.
+    if (g_tr_emit) {
+        for (int i = 0; i < nverts; i++) {
+            const uint16_t u = g_vtxscratch[i].u;
+            g_vtxscratch[i].u = g_vtxscratch[i].v;
+            g_vtxscratch[i].v = u;
+        }
+        const int t = tw; tw = th; th = t;   // from here on: the page as the fabric samples it
+    }
     // [W3 batching] Blend resolution moved AHEAD of blt_push_tris: blend_mode and
     // colorkey are header fields, so the batch key -- and therefore the decision
     // whether to flush -- needs them before anything touches the emitter. The
@@ -3211,6 +3328,20 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         colorkey = 0;
     }
     g_last_trilist_blend = blend_mode;   // host-test hook (opaque-ALPHA -> COPY promotion)
+    // [sparse keyed quads] `verts` keeps describing the draw as submitted (nt_in triangles);
+    // g_vtxscratch/nt become what the fabric executes.
+    const int nt_in = nt;
+    if (blend_mode == BLT_BLEND_COLORKEY && nt == 2 && extra_flags == 0 && mf_sparse_on()) {
+        const int k = mf_sp_try(tex);
+        if (k == 0) { g_sp_empty_frame++; return; }   // only key texels in view: a no-op draw
+        if (k > 0) {
+            memcpy(g_vtxscratch, g_sp_out, (size_t)k * 6 * sizeof(blt_vtx_t));
+            nt = 2 * k;
+            nverts = nt * 3;
+            g_sp_quads_frame++;
+            g_sp_rects_frame += (uint32_t)k;
+        }
+    }
     // Counted here, before either path's vertex push, so `groups` means "groups
     // this frame tried to emit". The only way that differs from "groups emitted"
     // is a vertex-arena overflow, which sets g_e.overflow and drops the whole
@@ -3258,7 +3389,7 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         g_batch.next_raw = raw + (uint32_t)nt * 3u * (uint32_t)sizeof(blt_vtx_t);
         g_tl_tris    += nt;
         if (g_batch.nt >= (int)MF_BATCH_MAX_TRIS) mf_batch_flush();
-        mf_cov_add_group(verts, nt);
+        mf_cov_add_group(verts, nt_in);
         return;
     }
 
@@ -3318,7 +3449,7 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
     const int pc_pending = mf_pc_pending(&g_pc, pc_target);
     int pc_covers = 0;
     if (pc_pending) {
-        if (nt == 2) {
+        if (nt_in == 2) {
             float cxs[6], cys[6];
             for (int i = 0; i < 6; i++) { cxs[i] = verts[i].x; cys[i] = verts[i].y; }
             pc_covers = mf_pc_is_cover(blend_mode == BLT_BLEND_COPY, nt,
@@ -3347,7 +3478,7 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
     if (pc_pending && pc_covers) mf_pc_drop(&g_pc, pc_target);
     if (mf_trace_on() && mf_trace_in_window())
         mf_trace_group(tex, tw, th, blend_mode, colorkey, extra_flags, nt, g_vtxscratch);
-    mf_cov_add_group(verts, nt);
+    mf_cov_add_group(verts, nt_in);
 }
 
 // ── [Phase 3 Stage A] GMLOADER_MFGPU_TRACE ───────────────────────────────────
@@ -3770,8 +3901,10 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         }
 
         bool has_key = false; int srx = 0, sry = 0; bool mask_only = false;
+        const bool tr = mf_transpose_on() && (size_t)rw * rh <= MF_TR_MAX_TEXELS &&
+                        mf_quad_prefers_transpose(gv, t->w, t->h, rw, rh);
         blt_surface_ref_t tex = stage_texture_region(tex_key, t, u0, v0, u1, v1, &has_key, &srx, &sry,
-                                                    &mask_only);
+                                                    &mask_only, tr);
         // [strip in-game CRT simulation] obj_old_tv's CRT overlay: a FULL-SCREEN pass whose
         // staged region holds nothing but transparent and very dark texels -- the tube bezel
         // plus its SCANLINE shading -- drawn over the image
@@ -3801,16 +3934,23 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
             return;
         }
         // rebase this quad's UVs into the cropped page: cropped-page uv' =
-        // (clamp01(uv)*page - rect_origin) / crop_dim. (srx/sry == rx/ry.)
+        // (clamp01(uv)*page - rect_origin) / crop_dim. (srx/sry == rx/ry.) A transposed
+        // page is rh wide: rebase against the SOURCE rect and let mf_emit_group swap u/v.
+        const int cw = tr ? tex.h : tex.w, ch = tr ? tex.w : tex.h;
         BVtx reb[6];
         for (int i = 0; i < 6; i++) {
             float u_abs = mf_clamp01(gv[i].u) * t->w, v_abs = mf_clamp01(gv[i].v) * t->h;
             reb[i] = gv[i];
-            reb[i].u = (u_abs - srx) / (float)tex.w;
-            reb[i].v = (v_abs - sry) / (float)tex.h;
+            reb[i].u = (u_abs - srx) / (float)cw;
+            reb[i].v = (v_abs - sry) / (float)ch;
         }
-        g_occ_hint.t = t; g_occ_hint.srx = srx; g_occ_hint.sry = sry;
-        mf_emit_group(tex, tex.w, tex.h, reb, 2, bl, has_key, /*extra_flags=*/0);
+        // The keyed-occluder texel test reads the SOURCE texture in page order; a
+        // transposed page gets no hint (it is never axis-aligned 1:1 anyway).
+        g_occ_hint.t = tr ? nullptr : t; g_occ_hint.srx = srx; g_occ_hint.sry = sry;
+        g_tr_emit = tr;
+        if (tr) g_tr_quads_frame++;
+        mf_emit_group(tex, cw, ch, reb, 2, bl, has_key, /*extra_flags=*/0);
+        g_tr_emit = false;
         g_occ_hint.t = nullptr;
     }
 }
@@ -3880,19 +4020,26 @@ static void mf_emit_fps_digit(int x, int y, int digit) {
 // bottom-right corner of the WORK buffer. Called from present() right before
 // mf_frame_end, so it overlays the game's own draws for this frame.
 static void mf_emit_fps_overlay_fills(void) {
-    if (g_ps_pending) g_ps_why[2]++;
-    mf_ps_discharge();   // [present-from-surface] the overlay paints over the composite
+    // [present-from-surface] The overlay must land on whatever is scanned out. When this
+    // frame is presented straight from the app surface (the identity composite is still
+    // deferred), paint it INTO the surface and keep the deferral: discharging the composite
+    // here -- the old behaviour -- put a 62k-pixel copy (~3.8 ms of fabric) back into every
+    // frame the overlay was on, so the FPS readout slowed the game it was measuring
+    // (level_2_3, .81, 2026-09-26: 16.2-17.5 ms fabric with the overlay on).
+    // Cost: the readout is now part of the surface's contents. The panel is repainted in
+    // the same place every frame, and the game redraws its surface each frame; a draw that
+    // SAMPLES the surface later in a frame would see it -- acceptable for a diagnostic.
+    const bool into_surf = g_ps_pending;
     // [W3 batching] FLUSH POINT 10: the overlay paints OVER the frame's draws, so
     // every pending triangle must already be in the ring. Redundant with
     // mf_present's own flush just above the call, and kept anyway -- this
     // function emits fills and switches target, so it must not depend on its
     // caller having done it.
     mf_batch_flush();
-    // The overlay lands on the scanned-out WORK buffer, never the app surface:
-    // restore the target if the frame's last op left it on APPSURF.
-    if (g_cur_target != MF_TARGET_WORK) {
-        blt_set_target(&g_e, MF_TARGET_WORK);
-        g_cur_target = MF_TARGET_WORK;
+    const int ov_target = into_surf ? MF_TARGET_APPSURF : MF_TARGET_WORK;
+    if (g_cur_target != ov_target) {
+        blt_set_target(&g_e, ov_target);
+        g_cur_target = ov_target;
     }
     int fps = fps_overlay_clamp(g_fps_value);
     int tens = fps / 10, ones = fps % 10;
@@ -4007,6 +4154,9 @@ static void mf_frame_end(void) {
             fprintf(stderr, "MFOCC frames=%u on=%d culled_tris=%u last_frame=%u occluders=%u tris=%d\n",
                     nf, mf_occlude_on(), g_occ_culled_total, g_occ_culled_frame,
                     g_occ_occluders_frame, g_occ_n);
+            fprintf(stderr, "MFSPARSE frames=%u on=%d quads=%u rects=%u empty=%u transposed=%u (last frame)\n",
+                    nf, mf_sparse_on(), g_sp_quads_frame, g_sp_rects_frame, g_sp_empty_frame,
+                    g_tr_quads_frame);
             fprintf(stderr, "MFPRES frames=%u present_surf=%u on=%d cap=%d discharged emit=%u clear=%u fps=%u pcflush=%u second=%u\n",
                     nf, g_ps_frames_total, mf_present_surf_on(), mf_ps_capable() ? 1 : 0,
                     g_ps_why[0], g_ps_why[1], g_ps_why[2], g_ps_why[3], g_ps_why[4]);
@@ -4418,7 +4568,11 @@ extern "C" int RasterBackend_MFGPU_TestFillPrecedesTrilist(void) {
 // the first thing in the binary to call mf_defer_clear_on().
 // [W3 batching] GMLOADER_MFGPU_BATCH_TRILIST joins it for the same reason: an
 // A/B case that flips the knob mid-binary needs the cached read cleared.
-extern "C" void RasterBackend_MFGPU_TestEnvReset(void) { g_defer_clear_v = -1; g_batch_v = -1; g_occlude_v = -1; g_ps_v = -1; }
+extern "C" void RasterBackend_MFGPU_TestEnvReset(void) { g_defer_clear_v = -1; g_batch_v = -1; g_occlude_v = -1; g_ps_v = -1;
+                                                        g_sparse_v = -1; g_transpose_v = -1; }
+extern "C" uint32_t RasterBackend_MFGPU_TestSparseRects(void) { return g_sp_rects_frame; }
+extern "C" uint32_t RasterBackend_MFGPU_TestSparseEmpty(void) { return g_sp_empty_frame; }
+extern "C" uint32_t RasterBackend_MFGPU_TestTransposed(void)  { return g_tr_quads_frame; }
 extern "C" uint32_t RasterBackend_MFGPU_TestPresentSurf(void) { return g_ps_last; }
 extern "C" void RasterBackend_MFGPU_TestSetPresentSurfCap(int on) {
 #ifndef MISTER_NATIVE_VIDEO
