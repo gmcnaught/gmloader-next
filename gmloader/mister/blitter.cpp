@@ -12,6 +12,8 @@
 
 #include "blitter.h"
 #include "blitter_raster.h"
+#include "prim_assemble.h"   // GL_TRIANGLE_FAN/STRIP -> triangle list
+#include <set>
 #include "raster_backend.h"
 #include "configuration.h"   // gmloader_config.blitter (default level)
 
@@ -209,12 +211,47 @@ bool fg_window() {
 // thunk vs. go straight to Mesa via eglGetProcAddress (RTLD_GLOBAL bypass).
 uint32_t g_nVap=0, g_nBindBuf=0, g_nBufData=0, g_nGetULoc=0, g_nUniMat=0, g_nEnVap=0, g_nUseProg=0;
 
+// Bounded report of what an upload produced -- see the call sites in
+// store_texture(). Every upload is logged for the first TEXLOG_FIRST calls;
+// after that only uploads that leave the texture invalid are, so a texture
+// created mid-run (a room transition, a surface recreation) still reports.
+const int TEXLOG_FIRST = 64;   // log every upload for this many calls
+const int TEXLOG_BAD   = 32;   // ...then this many invalid-result uploads
+void texnew_log(GLuint id, int w, int h, GLenum fmt, GLenum type,
+                bool px_null, int valid) {
+    static int n_all = 0, n_bad = 0;
+    bool want = (n_all < TEXLOG_FIRST) || (!valid && n_bad < TEXLOG_BAD);
+    n_all++;
+    if (!valid) n_bad++;
+    if (!want) return;
+    fprintf(stderr, "TEXNEW id=%u %dx%d fmt=0x%04X type=0x%04X px=%s -> valid=%d%s\n",
+            id, w, h, (unsigned)fmt, (unsigned)type, px_null ? "null" : "data", valid,
+            valid ? "" : (px_null ? "  [DROPS DRAWS: no pixels, awaiting TexSubImage2D]"
+                                  : "  [DROPS DRAWS: unsupported upload format]"));
+}
+
 // Convert an uploaded texture to an RGBA8888 CPU copy (common GM formats only).
 void store_texture(GLuint id, int w, int h, GLenum fmt, GLenum type, const void *px) {
     Tex &t = g_textures[id];
     free(t.rgba); t.rgba = nullptr; t.valid = 0; t.packed = 0; t.opaque = 0;
     t.w = w; t.h = h; t.fmt = fmt; t.type = type;
-    if (!px || w <= 0 || h <= 0) return;            // allocated-but-unfilled (FBO target)
+    // TEXNEW: what this upload actually produced. A texture that ends up with
+    // rgba==nullptr samples as valid=0 at draw time, and handle_draw's
+    // `tex.valid` gate then drops the draw -- so this line is the difference
+    // between "the draw did nothing" and "the draw was rejected, here's why".
+    // Two distinct paths land there, and they need different fixes:
+    //   px==NULL          -> allocated-but-unfilled; the pixels arrive later via
+    //                        glTexSubImage2D, which is not wired up (see
+    //                        Blitter_OnTexSubImage2D).
+    //   fmt/type != RGBA8 -> unsupported upload format, falls through to the
+    //                        "leave invalid" default at the end of this function.
+    // Bounded: the first TEXLOG_FIRST uploads, plus any upload that produces an
+    // invalid texture (capped separately, so a mid-run upload still reports).
+    const bool _px_null = (px == nullptr);
+    if (!px || w <= 0 || h <= 0) {                  // allocated-but-unfilled (FBO target)
+        texnew_log(id, w, h, fmt, type, _px_null, t.valid);
+        return;
+    }
     if (type == GL_UNSIGNED_BYTE && (fmt == GL_RGBA)) {
         size_t n = (size_t)w * h;
         uint64_t _t0 = g_prof ? bl_now_ns() : 0;
@@ -243,6 +280,7 @@ void store_texture(GLuint id, int w, int h, GLenum fmt, GLenum type, const void 
     }
     // other formats (RGB, LUMINANCE, compressed) -> leave invalid; such draws
     // will fall back to GL. The log reports the format so we know what to add.
+    texnew_log(id, w, h, fmt, type, _px_null, t.valid);
 }
 
 // column-major mat4 (GL default) times vec4
@@ -253,6 +291,7 @@ void mat4_mul_vec4(const float *m, const float *v, float *out) {
 
 const char* blend_name() {
     if (!g_blendEnabled) return "NONE";
+    if (g_blendSrc == GL_ONE && g_blendDst == GL_ZERO) return "NONE";  // replace
     if (g_blendSrc == GL_SRC_ALPHA && g_blendDst == GL_ONE_MINUS_SRC_ALPHA) return "ALPHA";
     if (g_blendSrc == GL_ONE && g_blendDst == GL_ONE_MINUS_SRC_ALPHA) return "PREMULT";
     if ((g_blendSrc == GL_ONE && g_blendDst == GL_ONE) ||
@@ -316,6 +355,13 @@ void read_attrib(const Attrib &a, int i, float *out) {
 // Map current GL blend state to an RBlend; false if unsupported.
 bool get_rblend(RBlend *out) {
     if (!g_blendEnabled) { *out = RB_NONE; return true; }
+    // Blending ENABLED with ONE/ZERO is dst = src*1 + dst*0 -- a plain replace,
+    // identical to blending disabled. Cursed Castilla EX drives every draw this
+    // way; without this case get_rblend() returned false, which short-circuits
+    // the caller's `if (get_render_target() && get_rblend())` and SILENTLY drops
+    // the draw before submission (trace shows rast=0 with cull=-), producing a
+    // black screen while the fabric still ticks over on clear/present batches.
+    if (g_blendSrc == GL_ONE && g_blendDst == GL_ZERO)                      { *out = RB_NONE; return true; }
     if (g_blendSrc == GL_SRC_ALPHA && g_blendDst == GL_ONE_MINUS_SRC_ALPHA) { *out = RB_ALPHA; return true; }
     if (g_blendSrc == GL_ONE && g_blendDst == GL_ONE_MINUS_SRC_ALPHA)       { *out = RB_PREMULT; return true; }
     if ((g_blendSrc == GL_ONE && g_blendDst == GL_ONE) ||
@@ -338,7 +384,13 @@ bool get_render_target(RSurface *out) {
     auto fit = g_fboColorTex.find(g_curFBO);
     if (fit == g_fboColorTex.end()) return false;
     Tex &t = g_textures[fit->second];
-    if (t.w <= 0 || t.h <= 0) return false;
+    if (t.w <= 0 || t.h <= 0) {
+        static int _warned = 0;
+        if (_warned < 8) { _warned++;
+            fprintf(stderr, "RTDROP fbo=%u attachtex=%u recorded=%dx%d -- no dimensions, "
+                            "draw dropped\n", g_curFBO, fit->second, t.w, t.h); }
+        return false;
+    }
     // A render target must be a full RGBA8888 surface (the rasterizer writes 4
     // bpp). If this texture was uploaded as packed RGBA4444, drop it and back the
     // target with a fresh 8888 buffer — never alias a 2 bpp buffer as 4 bpp.
@@ -444,6 +496,11 @@ void Blitter_OnBindFramebuffer(GLenum, GLuint fbo) {
 void Blitter_OnFramebufferTexture2D(GLenum, GLuint tex) {
     if (!g_enabled) return;
     g_fboColorTex[g_curFBO] = tex;   // attach to currently-bound FBO
+    {   static int _n = 0;
+        if (_n < 16) { _n++;
+            Tex &at = g_textures[tex];
+            fprintf(stderr, "RTATTACH fbo=%u tex=%u recorded=%dx%d\n",
+                    g_curFBO, tex, at.w, at.h); } }
     if (fg_window()) fprintf(stderr, "FG f=%d attachTex fbo=%u tex=%u\n", g_frameNo, g_curFBO, tex);
 }
 
@@ -455,11 +512,146 @@ GLuint Blitter_AppSurfaceFBO(void) { return g_appSurfFbo; }
 GLuint Blitter_AppSurfaceTex(void) { return g_appSurfTex; }
 
 void Blitter_OnUseProgram(GLuint program) { if (g_enabled) { g_nUseProg++; g_curProgram = program; } }
+
+// ---- [strip the in-game CRT shader] ----------------------------------------
+// Cursed Castilla EX ships its own CRT simulation, and unlike Maldita's (which
+// is obj_old_tv drawing plain geometry over the app surface at ~70% alpha, and
+// is stripped by mf_strip_crt in raster_backend_mfgpu.cpp) EX's is a real GLSL
+// shader: a scanline + radial-distortion + corner-mask pass over the whole
+// screen. We never want it -- the output is driven either to a real CRT or
+// through the MiSTer framework's own CRT treatment, so the in-game version is
+// double-applied, and on Maldita the equivalent pass measured ~8ms of a ~31ms
+// frame because a screen-aligned quad is two triangles that EACH walk the full
+// screen bbox.
+//
+// It is identified by PROGRAM, not by geometry. That is a much tighter
+// signature than the alpha/self-draw heuristic mf_strip_crt has to use: GM
+// applies a custom shader only to the draws between shader_set and
+// shader_reset, so a program-scoped drop cannot swallow anything else. The
+// program is found by matching the shader SOURCE TEXT against identifiers that
+// GM's own default shaders never contain.
+//
+// Note EX's CRT shader does not even compile on this stack --
+//   0:52(16): error: initializer of global variable `aspect' must be a
+//   constant expression
+// because `vec2 aspect = vec2(u_crt_sizes.x/..., ...)` initializes a global
+// from a uniform, which GLSL ES forbids. So the pass may already be inert. The
+// PROGSTAT counters below say whether it ever runs; the strip costs nothing if
+// it doesn't, and catches it if a future runtime accepts the shader.
+static std::set<GLuint> g_crtShaders;    // shader ids whose source is the CRT pass
+static std::set<GLuint> g_crtPrograms;   // programs those shaders were attached to
+static uint64_t g_crtDrawsStripped = 0;
+static std::map<GLuint, uint64_t> g_progDraws;   // per-program draw counts (PROGSTAT)
+
+static int strip_game_crt(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GMLOADER_STRIP_GAME_CRT");
+        v = (e && *e) ? atoi(e) : 1;   // on by default, like GMLOADER_MFGPU_STRIP_CRT
+    }
+    return v;
+}
+
+void Blitter_OnShaderSource(GLuint shader, const char *src, unsigned long len) {
+    // Deliberately NOT gated on g_enabled. Shaders are compiled during
+    // LoadGameData() (Process Chunk: SHDR), which runs long before
+    // Blitter_Init sets g_enabled -- an earlier version of this guard read
+    // `!g_enabled` and the hook therefore never fired once, which made the
+    // shader half of the census silently empty while the program half looked
+    // fine. Recording a shader id costs nothing and the strip is still gated
+    // at the draw site.
+    if (!src || !len) return;
+    // Signature: identifiers that only a CRT shader carries. u_crt_sizes is
+    // EX's own uniform; scanlineWeights/radialDistortion are the standard
+    // cgwg/Lottes CRT function names, so this also catches a re-spelled port.
+    std::string s(src, len);
+    bool crt = s.find("u_crt_sizes")      != std::string::npos
+            || s.find("scanlineWeights")  != std::string::npos
+            || s.find("radialDistortion") != std::string::npos;
+    if (crt) g_crtShaders.insert(shader);
+    // Cap generously: GM compiles ~30 default shader variants during
+    // GR_D3D_Init BEFORE it reaches the game's own SHDR chunk, so a cap of 32
+    // hid the one shader this census exists to find. (The g_crtShaders insert
+    // above is deliberately NOT capped -- detection must not depend on how
+    // much we chose to print.)
+    static int n = 0;
+    if (n < 256) { n++;
+        fprintf(stderr, "SHADER id=%u len=%lu crt=%d\n", shader, len, (int)crt); }
+}
+
+void Blitter_OnAttachShader(GLuint program, GLuint shader) {
+    // Same reasoning as Blitter_OnShaderSource: linking happens before
+    // g_enabled is set, so gating here loses the shader->program mapping.
+    if (g_crtShaders.count(shader)) {
+        g_crtPrograms.insert(program);
+        fprintf(stderr, "PROGCRT program=%u (crt shader %u attached) strip=%d\n",
+                program, shader, strip_game_crt());
+    }
+}
 void Blitter_OnGetUniformLocation(GLuint program, const char *name, GLint loc) {
+    // The RECORD is deliberately not gated on g_enabled. GameMaker links its
+    // programs and queries their uniform locations during GR_D3D_Init /
+    // LoadGameData, which both run before Blitter_Init sets g_enabled -- so an
+    // early return here dropped every built-in uniform's location, including
+    // gm_AlphaRefValue, and alpha_test_ref() could only ever answer "unknown".
+    // (Same failure this file already hit with Blitter_OnShaderSource.) Only
+    // the hook-fired COUNTER stays gated, since it reports on the blitter's own
+    // active window.
+    if (name && loc >= 0) g_uniformLoc[program][name] = loc;
     if (!g_enabled) return;
     g_nGetULoc++;
-    if (name && loc >= 0) g_uniformLoc[program][name] = loc;
 }
+// ── [alpha-test threshold] capture gm_AlphaRefValue / gm_AlphaTestEnabled ────
+// mf_texel565 folds every texel with alpha < 128 into the colorkey sentinel --
+// a HARDCODED 1-bit cut at 50%. The game states its own cut: its shaders run
+//     if (gm_AlphaTestEnabled) { if (SrcColour.a <= gm_AlphaRefValue) discard; }
+// and, because Cursed Castilla EX draws with an enabled GL_ONE/GL_ZERO replace,
+// a texel that PASSES that test is written fully opaque. So the game's own
+// output is already 1-bit alpha and we are doing the right KIND of operation
+// with a threshold we invented.
+//
+// raster_backend.h's draw() has carried an `alphaRef` parameter for this all
+// along, but handle_draw passes a constant 0.0f and nothing captures the value:
+// glGetUniformLocation is hooked, glUniform1f is not. These two hooks close
+// that gap. Stored per (program, location) because a location is only
+// meaningful within its program.
+std::map<GLuint, std::map<GLint, float>> g_uniform1f;   // program -> loc -> value
+std::map<GLuint, std::map<GLint, int>>   g_uniform1i;   // program -> loc -> value
+
+// Not gated on g_enabled either, for the same reason as the location hook: a
+// uniform set before the blitter turns on is still the value in effect after.
+void Blitter_OnUniform1f(GLint loc, float v) {
+    if (loc < 0) return;
+    g_uniform1f[g_curProgram][loc] = v;
+}
+void Blitter_OnUniform1i(GLint loc, int v) {
+    if (loc < 0) return;
+    g_uniform1i[g_curProgram][loc] = v;
+}
+
+// Current alpha-test state for the bound program. Returns the threshold in
+// 0..1, or -1.0f when the game has alpha test off (or never told us), which
+// callers must treat as "keep the existing behaviour" rather than "threshold 0".
+static float alpha_test_ref(void) {
+    auto pit = g_uniformLoc.find(g_curProgram);
+    if (pit == g_uniformLoc.end()) return -1.0f;
+    auto lit = pit->second.find("gm_AlphaTestEnabled");
+    if (lit != pit->second.end()) {
+        auto vp = g_uniform1i.find(g_curProgram);
+        if (vp != g_uniform1i.end()) {
+            auto vv = vp->second.find(lit->second);
+            if (vv != vp->second.end() && vv->second == 0) return -1.0f;  // test off
+        }
+    }
+    auto rit = pit->second.find("gm_AlphaRefValue");
+    if (rit == pit->second.end()) return -1.0f;
+    auto vp = g_uniform1f.find(g_curProgram);
+    if (vp == g_uniform1f.end()) return -1.0f;
+    auto vv = vp->second.find(rit->second);
+    if (vv == vp->second.end()) return -1.0f;
+    return vv->second;
+}
+
 void Blitter_OnUniformMatrix4fv(GLint loc, GLsizei count, const GLfloat *value) {
     if (g_enabled) g_nUniMat++;
     if (!g_enabled || !value) return;
@@ -583,15 +775,55 @@ static int handle_draw(const char *kind, GLenum mode, int count,
             }
     }
 
+    // ---- primitive assembly -------------------------------------------------
+    // The rasterize path below consumes a flat triangle LIST. GameMaker draws
+    // quads as GL_TRIANGLE_FAN, and the gate below used to require
+    // mode == GL_TRIANGLES -- so every fan was dropped with rast=0 and no
+    // reason recorded. Measured on Cursed Castilla EX (.62, 2026-08-23): every
+    // rt=FBO app-surface draw is a 5-vertex fan (mode=0x0006), which is why the
+    // app surface never updated while the fbo=0 GL_TRIANGLES draws rendered
+    // fine. Expand fans and strips into a triangle list here.
+    //
+    // Nothing downstream is winding-sensitive -- blitter_raster.cpp picks its
+    // inside test from the sign of the signed area (`bool ccw = area > 0`) and
+    // blt_tri.c CCW-normalizes by swapping b/c -- so the expansion only has to
+    // preserve coverage. It emits GL's winding anyway (the odd-triangle swap
+    // for strips) so that a later backface test would see the right thing.
+    static std::vector<BVtx> s_tris;
+    const std::vector<BVtx> *prim = &s_verts;
+    int primCount = count;
+    const bool assembled = prim_needs_assembly((unsigned)mode);
+    if (assembled && decoded == count) {
+        int n = prim_assemble((unsigned)mode, s_verts.data(), count, s_tris);
+        if (n) { prim = &s_tris; primCount = n; }
+    }
+
     // Rasterize into our surfaces (owning mode only).
     int rast = 0;
     const char *cullReason = nullptr;   // non-null => skipped as provably invisible
-    if (g_own && decoded == count && mode == GL_TRIANGLES && count >= 3) {
+    // Why nothing was rasterized, when it was NOT an overdraw cull. Every gate
+    // between here and the draw() call used to fail silently, reporting rast=0
+    // paired with cull=- -- which reads as "nothing happened" rather than
+    // "rejected, here is the gate". That signature hid a black screen for a
+    // whole debugging session (get_rblend() returning false on an enabled
+    // ONE/ZERO replace blend short-circuited the draw before the cull logic
+    // could record anything). Kept separate from cullReason so the g_pf_culled
+    // profiling counter keeps counting culls only.
+    const char *dropReason = nullptr;
+    int texval = -1;                    // -1 = never reached the texture gate
+    if (g_own && decoded == count && primCount >= 3 &&
+        (mode == GL_TRIANGLES || assembled)) {
         RSurface rt; RBlend blend;
-        if (get_render_target(&rt) && get_rblend(&blend)) {
+        bool okRT = get_render_target(&rt);
+        bool okBL = okRT && get_rblend(&blend);   // short-circuit as before
+        if (!okRT)                    dropReason = "nortarget";
+        else if (!okBL)               dropReason = "noblend";
+        else {
             RTexture tex; get_rtexture(&tex);
             if (g_notex) tex.valid = 0;   // probe: skip texture fetch -> samples white
-            if (tex.valid || g_notex) {
+            texval = tex.valid;
+            if (!(tex.valid || g_notex)) dropReason = "notex";
+            else {
                 // ---- overdraw culling (env GMLOADER_BLITTER_CULL, default on) ----
                 // Cheap per-draw short-circuits that drop draws which provably can't
                 // change a visible pixel of the render target. The bbox is in the
@@ -619,15 +851,15 @@ static int handle_draw(const char *kind, GLenum mode, int count,
                 if (!cullReason && g_opaque &&
                     (blend == RB_ALPHA || blend == RB_PREMULT) && tex.valid && tex.opaque) {
                     int vop = 1;
-                    for (int v = 0; v < count; v++) if (s_verts[v].a < 0.998f) { vop = 0; break; }
+                    for (int v = 0; v < decoded; v++) if (s_verts[v].a < 0.998f) { vop = 0; break; }
                     if (vop) blend = RB_NONE;
                 }
                 if (cullReason) {
                     if (g_prof) g_pf_culled++;
                 } else {
                     uint64_t _t0 = g_prof ? bl_now_ns() : 0;
-                    RasterBackend_Select()->draw(&rt, &s_verts[0], count / 3, &tex, blend, 0.0f, g_boundTex2D);
-                    if (g_prof) { g_pf_raster += bl_now_ns() - _t0; g_pf_draws++; g_pf_tris += count/3; }
+                    RasterBackend_Select()->draw(&rt, &(*prim)[0], primCount / 3, &tex, blend, 0.0f, g_boundTex2D);
+                    if (g_prof) { g_pf_raster += bl_now_ns() - _t0; g_pf_draws++; g_pf_tris += primCount/3; }
                     // Coverage estimate (Task 4) is NOT accumulated here — see the
                     // note near the top of this file. draw() reaching this line only
                     // means the triangles were SUBMITTED to the selected backend, not
@@ -636,16 +868,70 @@ static int handle_draw(const char *kind, GLenum mode, int count,
                 }
             }
         }
+    } else {
+        dropReason = !g_own ? "notown"
+                   : (decoded != count) ? "undecoded"
+                   : (mode != GL_TRIANGLES && !assembled) ? "notri" : "degenerate";
     }
+
+    // [alpha-test threshold] Report the game's own alpha-test cut, once per
+    // (program, quantised ref). mf_texel565's hardcoded `a < 128` is only
+    // correct if this reports ~0.5; anything else means we are discarding a
+    // band of texels the game keeps (or keeping ones it discards).
+    {
+        float ar_now = alpha_test_ref();
+        static bool dumped = false;
+        if (!dumped) {   // one-shot: which uniforms did this program actually expose?
+            dumped = true;
+            auto pit = g_uniformLoc.find(g_curProgram);
+            if (pit == g_uniformLoc.end()) {
+                fprintf(stderr, "ALPHATEST prog=%u has NO recorded uniform locations\n",
+                        g_curProgram);
+            } else {
+                for (const auto &kv : pit->second)
+                    fprintf(stderr, "UNIFORM prog=%u %-28s loc=%d\n",
+                            g_curProgram, kv.first.c_str(), kv.second);
+            }
+        }
+        static int n = 0;
+        static GLuint last_prog = 0xFFFFFFFFu; static int last_q = -12345;
+        int q = (ar_now < 0.0f) ? -1 : (int)(ar_now * 255.0f + 0.5f);
+        if ((g_curProgram != last_prog || q != last_q) && n < 40) {
+            n++; last_prog = g_curProgram; last_q = q;
+            fprintf(stderr, "ALPHATEST f=%d prog=%u gm_AlphaRefValue=%.5f (=%d/255) "
+                    "%s | staging cut is HARDCODED a<128\n",
+                    g_frameNo, g_curProgram, ar_now, q,
+                    ar_now < 0.0f ? "[test OFF or unknown]" : "[test ON]");
+        }
+    }
+
+    // [strip the in-game CRT shader] Drop anything drawn under the CRT program.
+    // Placed AFTER the block above so it overrides whatever that recorded: the
+    // reason we want in the trace is "we chose to drop this", not an incidental
+    // gate it would also have hit. Counted so the strip's effect is measurable
+    // rather than assumed.
+    g_progDraws[g_curProgram]++;
+    if (strip_game_crt() && g_crtPrograms.count(g_curProgram)) {
+        rast = 0;
+        cullReason = nullptr;
+        dropReason = "crtshader";
+        g_crtDrawsStripped++;
+    }
+
+    // One reason field for the whole path: a cull if it got that far, otherwise
+    // the gate that rejected it (or the CRT strip). Never "-" while rast=0.
+    const char *whyNot = cullReason ? cullReason : dropReason;
 
     bool fg_win = fg_window();
     if (g_drawNo <= LOG_FIRST) {
         Tex *bt = g_textures.count(g_boundTex2D) ? &g_textures[g_boundTex2D] : nullptr;
         fprintf(stderr, "BLIT draw#%llu %s rt=%s tex=%u(%dx%d val=%d) blend=%s "
-                "decoded=%d/%d rast=%d cull=%s screen=[%.0f,%.0f..%.0f,%.0f]\n",
+                "decoded=%d/%d rast=%d cull=%s mode=0x%04X blendraw=%s/0x%04X/0x%04X "
+                "screen=[%.0f,%.0f..%.0f,%.0f]\n",
                 (unsigned long long)g_drawNo, kind, g_curFBO ? "FBO" : "DEF",
                 g_boundTex2D, bt?bt->w:0, bt?bt->h:0, bt?bt->valid:0, blend_name(),
-                decoded, count, rast, cullReason ? cullReason : "-",
+                decoded, count, rast, whyNot ? whyNot : "-", (unsigned)mode,
+                g_blendEnabled ? "on" : "off", (unsigned)g_blendSrc, (unsigned)g_blendDst,
                 decoded?minx:0, decoded?miny:0, decoded?maxx:0, decoded?maxy:0);
     }
     // Full-frame draw-graph dump (GMLOADER_FRAMEGRAPH): every draw in the
@@ -655,9 +941,12 @@ static int handle_draw(const char *kind, GLenum mode, int count,
     if (fg_win) {
         GLuint fbotex = g_curFBO ? g_fboColorTex[g_curFBO] : 0;
         fprintf(stderr, "FG f=%d d#%llu fbo=%u fbotex=%u srctex=%u prog=%u blend=%s "
+                "rast=%d texval=%d why=%s mode=0x%04X nv=%d "
                 "vp=[%d,%d,%d,%d] scr=[%.0f,%.0f..%.0f,%.0f]\n",
                 g_frameNo, (unsigned long long)g_drawNo, g_curFBO, fbotex, g_boundTex2D,
-                g_curProgram, blend_name(), g_vpX, g_vpY, g_vpW, g_vpH,
+                g_curProgram, blend_name(),
+                rast, texval, whyNot ? whyNot : "-", (unsigned)mode, count,
+                g_vpX, g_vpY, g_vpW, g_vpH,
                 decoded?minx:0, decoded?miny:0, decoded?maxx:0, decoded?maxy:0);
     }
 
@@ -681,6 +970,18 @@ int Blitter_TryDrawElements(GLenum mode, GLsizei count, GLenum type, const void 
 
 const uint8_t *Blitter_PresentDefault(void) {
     g_frameNo++;
+    // [strip the in-game CRT shader] Periodic per-program draw census. This is
+    // what says whether the CRT pass actually runs -- EX's CRT shader fails to
+    // compile, so the strip may be inert, and "we stripped it" must be a
+    // measurement, not an assumption.
+    if (g_enabled && g_frameNo % 600 == 0) {
+        for (const auto &kv : g_progDraws)
+            fprintf(stderr, "PROGSTAT f=%d prog=%u draws=%llu crt=%d\n",
+                    g_frameNo, kv.first, (unsigned long long)kv.second,
+                    (int)g_crtPrograms.count(kv.first));
+        fprintf(stderr, "PROGSTAT f=%d crt_draws_stripped=%llu\n",
+                g_frameNo, (unsigned long long)g_crtDrawsStripped);
+    }
     if (g_own) {
         // Route present through the seam. backend_sw's present is a no-op
         // today (see raster_backend_sw.cpp) — the real RGB565 conversion

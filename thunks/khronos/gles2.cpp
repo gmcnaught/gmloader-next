@@ -66,6 +66,9 @@ static void GLViewport_trace(GLint x, GLint y, GLsizei w, GLsizei h) {
 // Blitter state-shadow hooks: mirror the GL state a stock draw consumes so the
 // blitter can rasterize it itself. Each calls the real driver then records.
 static void GLUseProgram_b(GLuint p) { glad_glUseProgram(p); Blitter_OnUseProgram(p); }
+static void GLAttachShader_b(GLuint prog, GLuint sh) {
+    glad_glAttachShader(prog, sh); Blitter_OnAttachShader(prog, sh);
+}
 static void GLBindAttribLocation_b(GLuint p, GLuint i, const GLchar* n) {
     glad_glBindAttribLocation(p, i, n); Blitter_OnBindAttribLocation(p, i, n);
 }
@@ -101,6 +104,14 @@ static void GLUniformMatrix4fv_b(GLint loc, GLsizei count, GLboolean tr, const G
     glad_glUniformMatrix4fv(loc, count, tr, v);
     Blitter_OnUniformMatrix4fv(loc, count, v);
 }
+static void GLUniform1f_b(GLint loc, GLfloat v) { glad_glUniform1f(loc, v); Blitter_OnUniform1f(loc, v); }
+static void GLUniform1fv_b(GLint loc, GLsizei n, const GLfloat* v) {
+    glad_glUniform1fv(loc, n, v); if (n >= 1 && v) Blitter_OnUniform1f(loc, v[0]);
+}
+static void GLUniform1iv_b(GLint loc, GLsizei n, const GLint* v) {
+    glad_glUniform1iv(loc, n, v); if (n >= 1 && v) Blitter_OnUniform1i(loc, v[0]);
+}
+static void GLUniform1i_b(GLint loc, GLint v)   { glad_glUniform1i(loc, v); Blitter_OnUniform1i(loc, v); }
 static GLint GLGetUniformLocation_b(GLuint p, const GLchar* n) {
     GLint loc = glad_glGetUniformLocation(p, n);
     Blitter_OnGetUniformLocation(p, n, loc);
@@ -122,6 +133,20 @@ void glShaderSource_dump(
     const GLchar** strings,
     const GLint*  lengths
 ) {
+#ifdef MISTER_NATIVE_VIDEO
+	// [strip the in-game CRT shader] The blitter identifies the game's CRT pass
+	// by shader SOURCE, so it has to see every source -- including on the
+	// early-return path below, which is the normal one (shader dump/override is
+	// off unless explicitly configured).
+	{
+		std::string peek;
+		for (GLsizei i = 0; i < count; i++) {
+			if (lengths && lengths[i] >= 0) peek.append(strings[i], lengths[i]);
+			else                            peek.append(strings[i]);
+		}
+		Blitter_OnShaderSource(shader, peek.data(), peek.size());
+	}
+#endif
 	// shader dump/override are disabled.
 	if (shader_override_dir.empty()) {
 		glad_glShaderSource(shader, count, strings, lengths);
@@ -179,6 +204,9 @@ void load_gles2_funcs()
 {
     glad_glActiveTexture = (PFNGLACTIVETEXTUREPROC)PTR_RESOLVE(glActiveTexture);
 	glad_glAttachShader = (PFNGLATTACHSHADERPROC)PTR_RESOLVE(glAttachShader);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLAttachShader_b;
+#endif
 	glad_glBindAttribLocation = (PFNGLBINDATTRIBLOCATIONPROC)PTR_RESOLVE(glBindAttribLocation);
 #ifdef MISTER_NATIVE_VIDEO
 	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLBindAttribLocation_b;
@@ -344,9 +372,21 @@ void load_gles2_funcs()
 	glad_glTexParameteriv = (PFNGLTEXPARAMETERIVPROC)PTR_RESOLVE(glTexParameteriv);
 	glad_glTexSubImage2D = (PFNGLTEXSUBIMAGE2DPROC)PTR_RESOLVE(glTexSubImage2D);
 	glad_glUniform1f = (PFNGLUNIFORM1FPROC)PTR_RESOLVE(glUniform1f);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLUniform1f_b;
+#endif
 	glad_glUniform1fv = (PFNGLUNIFORM1FVPROC)PTR_RESOLVE(glUniform1fv);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLUniform1fv_b;
+#endif
 	glad_glUniform1i = (PFNGLUNIFORM1IPROC)PTR_RESOLVE(glUniform1i);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLUniform1i_b;
+#endif
 	glad_glUniform1iv = (PFNGLUNIFORM1IVPROC)PTR_RESOLVE(glUniform1iv);
+#ifdef MISTER_NATIVE_VIDEO
+	symtable_gles2[symtable_gles2_index-1].func = (uintptr_t)GLUniform1iv_b;
+#endif
 	glad_glUniform2f = (PFNGLUNIFORM2FPROC)PTR_RESOLVE(glUniform2f);
 	glad_glUniform2fv = (PFNGLUNIFORM2FVPROC)PTR_RESOLVE(glUniform2fv);
 	glad_glUniform2i = (PFNGLUNIFORM2IPROC)PTR_RESOLVE(glUniform2i);

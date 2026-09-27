@@ -264,6 +264,16 @@ mf-vtx-clip-test:
 	  gmloader/mister/mf_vtx_clip_test.cpp \
 	  -lm -o /tmp/mvct && /tmp/mvct
 
+.PHONY: prim-assemble-test
+# Host test for the GL primitive assembly (fan/strip -> triangle list) that
+# handle_draw runs before rasterizing. prim_assemble.h is deliberately
+# dependency-free, so like mf-seam-stat-test this needs no other translation
+# unit -- just the test driver.
+prim-assemble-test:
+	c++ -std=c++17 -O2 -g -Igmloader/mister \
+	  gmloader/mister/prim_assemble_test.cpp \
+	  -o /tmp/pat && /tmp/pat
+
 .PHONY: blitter-raster-test
 # Host test for the GL-free software rasterizer + surface clear
 # (blitter_raster.cpp). The file predates this target and was unreachable from

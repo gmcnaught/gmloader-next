@@ -649,6 +649,42 @@ static const uint16_t MF_COLORKEY = 0xF81F;
 //                              with MF_COLORKEY, nudge it off by one green LSB
 //                              so an opaque texel can never be mistaken for the
 //                              key (out_has_key still only set by real holes).
+// ── [glyph readability] the 1-bit alpha cut, as a knob ───────────────────────
+// Staging quantises the source alpha to 1 bit: below the cut a texel becomes
+// the MF_COLORKEY sentinel (culled by the fabric), at or above it becomes an
+// opaque RGB565 texel. The cut was hardcoded at 128 (50%).
+//
+// Measured on Cursed Castilla EX (.62, TEXALPHA histogram over the per-quad
+// staged regions): once the transparent padding is discounted, 40-50% of a
+// glyph's VISIBLE texels are antialiased edge. A cut of 128 deletes the 1..127
+// half of that and hardens the 128..254 half, which reads as "chunky" on the
+// 50-62px title glyphs and shreds the ~5px splash line into stroke-cores.
+//
+// Lowering the cut keeps the edge and hardens it instead of deleting it, which
+// is also closer to what EX's own GL_ONE/GL_ZERO replace blend does -- replace
+// writes a texel's RGB whatever its alpha. A cut of 1 discards only fully
+// transparent texels. The cost is that genuinely soft art (shadows, large
+// low-alpha regions) hardens into a halo rather than fading, so this is a knob
+// and not a new hardcoded number.
+//
+// Read once. It MUST NOT change mid-run: staged pages are cached in g_texcache
+// keyed by texture/region, so a mid-run change would leave pages staged under
+// the old cut in place. Clamped to 1..255 -- 0 would keep fully transparent
+// texels and paint their (usually black) RGB over everything behind them.
+static int mf_alpha_cut(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_ALPHA_CUT");
+        v = (e && *e) ? atoi(e) : 128;
+        if (v < 1)   v = 1;
+        if (v > 255) v = 255;
+        if (v != 128)
+            fprintf(stderr, "backend_mfgpu: alpha cut = %d (default 128) -- "
+                            "texels below this stage as the colorkey sentinel\n", v);
+    }
+    return v;
+}
+
 // One RTexture texel as 8-bit r,g,b,a (RGBA4444 sources nibble-replicated).
 static inline void mf_src_rgba(const RTexture *t, int x, int y,
                                uint8_t &r, uint8_t &g, uint8_t &b, uint8_t &a) {
@@ -668,7 +704,7 @@ static inline void mf_src_rgba(const RTexture *t, int x, int y,
 static inline uint16_t mf_texel565(const RTexture *t, int x, int y, bool *out_has_key) {
     uint8_t r, g, b, a;
     mf_src_rgba(t, x, y, r, g, b, a);
-    if (a < 128) { *out_has_key = true; return MF_COLORKEY; }
+    if ((int)a < mf_alpha_cut()) { *out_has_key = true; return MF_COLORKEY; }
     uint16_t result = mf_rgb565(r, g, b);
     if (result == MF_COLORKEY) result ^= 0x0020;   // opaque texel must never == the key
     return result;
@@ -2766,7 +2802,8 @@ static inline bool mf_neon_all_set_u16(uint16x8_t v) {
 static inline void mf_stage8_rgba8888(const uint8_t *src, uint16_t *dst,
                                       uint16x8_t *acc_key, uint16x8_t *acc_dark) {
     uint8x8x4_t p = vld4_u8(src);                         // r, g, b, a
-    uint16x8_t keym = vcltq_u16(vmovl_u8(p.val[3]), vdupq_n_u16(128));
+    uint16x8_t keym = vcltq_u16(vmovl_u8(p.val[3]),
+                               vdupq_n_u16((uint16_t)mf_alpha_cut()));
 
     // (r & 0xF8) << 8  |  (g & 0xFC) << 3  |  b >> 3
     uint16x8_t r16 = vandq_u16(vshll_n_u8(p.val[0], 8), vdupq_n_u16(0xF800));
@@ -2953,6 +2990,54 @@ static uint8_t mf_pa_resolve_fmt(const RTexture *t, uint32_t key, int rx, int ry
     return mf_pa_pick(cls, pa_req == MF_PA_REQ_FADED) ? BLT_FMT_ARGB4444 : BLT_FMT_RGB565;
 }
 
+// ── [glyph readability] source-alpha histogram of a texture being staged ─────
+// mf_texel565 folds every texel with alpha < 128 into the colorkey sentinel: a
+// hardcoded 1-BIT cut at 50%. That is only harmless if the source art is
+// hard-edged (alpha essentially 0 or 255). If a font atlas carries antialiased
+// edges, everything in 1..127 disappears and everything in 128..254 becomes
+// fully opaque -- which shreds small text into isolated stroke-cores, exactly
+// what Cursed Castilla EX's splash line looks like on device.
+//
+// This measures that instead of assuming it. Printed once per staged texture
+// (bounded), with the same tw x th the MFKEY trace reports so the two can be
+// cross-referenced to a specific on-screen draw.
+//
+// Reading it: mid[] near zero => the fold is innocent and the shredding is a
+// sampling/minification problem, not an alpha problem. mid[] carrying real mass
+// => the fold IS eating the glyphs.
+// Scans the SUB-REGION actually being staged (rx,ry,rw,rh), not the whole atlas
+// page: a font atlas is mostly empty, so a whole-page histogram would drown the
+// glyph in transparent padding and read as "hard-edged" no matter what.
+static void mf_alpha_histogram(const char *tag, const RTexture *t,
+                               int rx, int ry, int rw, int rh) {
+    if (!t || !t->rgba || t->w <= 0 || t->h <= 0 || rw <= 0 || rh <= 0) return;
+    static int n = 0;
+    if (n >= 40) return;
+    n++;
+    unsigned a0 = 0, lo = 0, hi = 0, a255 = 0;
+    size_t npx = 0;
+    for (int y = 0; y < rh; y++) {
+        int sy = ry + y; if (sy < 0 || sy >= t->h) continue;
+        for (int x = 0; x < rw; x++) {
+            int sx = rx + x; if (sx < 0 || sx >= t->w) continue;
+            size_t i = (size_t)sy * t->w + sx;
+            unsigned a = (t->format == RTEX_RGBA4444)
+                       ? (unsigned)((((const uint16_t *)t->rgba)[i] & 0xF) * 17)
+                       : (unsigned)t->rgba[i * 4 + 3];
+            if (a == 0) a0++; else if (a < 128) lo++; else if (a < 255) hi++; else a255++;
+            npx++;
+        }
+    }
+    if (!npx) return;
+    const double tot = (double)npx;
+    fprintf(stderr, "TEXALPHA %-6s page=%dx%d region=[%d,%d %dx%d] a=0:%.1f%%  "
+            "1..127:%.1f%%(DISCARDED)  128..254:%.1f%%(forced opaque)  255:%.1f%%  "
+            "partial=%.1f%%\n",
+            tag, t->w, t->h, rx, ry, rw, rh,
+            100.0 * a0 / tot, 100.0 * lo / tot, 100.0 * hi / tot, 100.0 * a255 / tot,
+            100.0 * (lo + hi) / tot);
+}
+
 static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *out_has_key,
                                        int pa_req = MF_PA_REQ_NONE) {
     // Whole-page entry: rect (0,0,tw,th). Untextured => 1x1 opaque-white page.
@@ -2974,6 +3059,7 @@ static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *ou
     // [strip in-game CRT simulation] classify while already visiting every texel -- see the
     // sub-region path for why a black+transparent-only page is interesting.
     bool mask_only = textured;
+    if (textured) mf_alpha_histogram("page", t, 0, 0, tw, th);   // [glyph readability]
     if (!textured) {
         g_texscratch[0] = 0xFFFF;   // 1x1 opaque white
     } else if (fmt == BLT_FMT_ARGB4444) {
@@ -3073,6 +3159,7 @@ static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
     // dumps of its frames measure 100% black+colorkey with the black fraction ANIMATING
     // (4.7% -> 27.1% -> 38.2% -> 47.8%), i.e. a tube iris opening and closing over the image.
     bool mask_only = true;
+    mf_alpha_histogram("region", t, rx, ry, rw, rh);   // [glyph readability]
     if (fmt == BLT_FMT_ARGB4444)
         mf_stage_texels_4444(t, rx, ry, rw, rh, g_texscratch, &mask_only);   // no key: A4==0 skips
     else
@@ -3407,6 +3494,79 @@ static int mf_sp_try(const blt_surface_ref_t &tex) {
     return -1;
 }
 
+// ── [C2 magenta band] colorkey-vs-const-alpha census ─────────────────────────
+// mf_emit_group can only pick ONE of BLT_BLEND_COLORKEY and BLT_BLEND_CONST_ALPHA
+// (a TRILIST header carries one blend mode), so a KEYED texture drawn at less
+// than fully-opaque vertex alpha falls back to CONST_ALPHA -- and the colorkey
+// sentinel MF_COLORKEY (0xF81F) is then written as a visible MAGENTA pixel
+// instead of being culled. That is the documented hole at the top of this file
+// ("real per-texel alpha is a future RTL item").
+//
+// The observable that makes this worth measuring rather than assuming: on .62
+// the magenta band flickers to transparent for a moment roughly every 7s. That
+// is exactly what the threshold predicts -- when min_vtx_a momentarily reaches
+// >= 254/255 the branch flips to COLORKEY, the sentinel culls, and the band
+// disappears for those frames.
+//
+// Bounded two ways so this can be left on: a line only when a given staged page
+// CHANGES blend mode (steady state prints nothing, the flip prints once), plus
+// a periodic census. tex.off + tw x th identifies the staged page -- 512x256
+// would be one of the app-surface FBO attachments, which would also tie this to
+// the frozen frame.
+struct MfKeyStat { uint32_t off; int tw, th; uint8_t last_ck; uint32_t n_ck, n_fb;
+                   float amin, amax; };
+static MfKeyStat g_keystat[16];
+static int       g_keystat_n = 0;
+static int       g_keytrace_lines = 0;
+static void mf_key_trace(uint32_t off, int tw, int th, float min_a, bool colorkeyed,
+                         bool has_key, const BVtx *verts, int nverts, int nt) {
+    // Only a KEYED page can paint the sentinel, so an un-keyed draw taking the
+    // non-colorkey branch is completely normal and must not be labelled as
+    // writing magenta -- mislabelling it would send a later reader chasing every
+    // ordinary CONST_ALPHA draw in the frame.
+    if (!has_key) return;
+    MfKeyStat *e = nullptr;
+    for (int i = 0; i < g_keystat_n; i++)
+        if (g_keystat[i].off == off && g_keystat[i].tw == tw && g_keystat[i].th == th)
+            { e = &g_keystat[i]; break; }
+    if (!e) {
+        if (g_keystat_n >= (int)(sizeof(g_keystat)/sizeof(g_keystat[0]))) return;
+        e = &g_keystat[g_keystat_n++];
+        *e = MfKeyStat{ off, tw, th, (uint8_t)(colorkeyed ? 1 : 0), 0, 0, 1.0f, 0.0f };
+        e->last_ck = 0xFF;   // force the first observation to print
+    }
+    if (colorkeyed) e->n_ck++; else e->n_fb++;
+    if (min_a < e->amin) e->amin = min_a;
+    if (min_a > e->amax) e->amax = min_a;
+
+    uint8_t ck = colorkeyed ? 1 : 0;
+    if (e->last_ck != ck && g_keytrace_lines < 200) {
+        g_keytrace_lines++;
+        float mnx = verts[0].x, mxx = verts[0].x, mny = verts[0].y, mxy = verts[0].y;
+        for (int i = 1; i < nverts; i++) {
+            if (verts[i].x < mnx) mnx = verts[i].x;
+            if (verts[i].x > mxx) mxx = verts[i].x;
+            if (verts[i].y < mny) mny = verts[i].y;
+            if (verts[i].y > mxy) mxy = verts[i].y;
+        }
+        fprintf(stderr, "MFKEY f=%lu off=%08X %dx%d min_a=%.5f -> %s "
+                "rect=[%.0f,%.0f..%.0f,%.0f] nt=%d\n",
+                (unsigned long)g_frame_no, (unsigned)off, tw, th, min_a,
+                ck ? "COLORKEY(culls)" : "CONST_ALPHA(WRITES MAGENTA)",
+                mnx, mny, mxx, mxy, nt);
+    }
+    e->last_ck = ck;
+}
+static void mf_key_census(void) {
+    for (int i = 0; i < g_keystat_n; i++) {
+        MfKeyStat &e = g_keystat[i];
+        fprintf(stderr, "MFKEYSTAT f=%lu off=%08X %dx%d colorkey=%u fallback=%u "
+                "min_a=[%.5f..%.5f]\n",
+                (unsigned long)g_frame_no, (unsigned)e.off, e.tw, e.th,
+                e.n_ck, e.n_fb, e.amin, e.amax);
+    }
+}
+
 static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
                           const BVtx *verts, int nt, RBlend bl,
                           bool has_key, uint8_t extra_flags) {
@@ -3482,6 +3642,33 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
     // the reorder is inert. The push itself now happens inside each branch.
     uint8_t blend_mode;
     uint16_t colorkey;
+    // [C2 magenta band] COLORKEY culls the sentinel; the alternative for a keyed
+    // page does not, and MF_COLORKEY (0xF81F) is then WRITTEN as visible magenta.
+    //
+    // The vertex-alpha test is only meaningful when the fallback would actually
+    // USE the alpha. It doesn't for RB_NONE: rblend_to_blt(RB_NONE) is
+    // BLT_BLEND_COPY, whose refmodel case is `*dp = src` -- vertex alpha plays
+    // no part in the result at all (blt_tint565 modulates by the vertex RGB, not
+    // its alpha). COLORKEY differs from COPY on exactly one class of texel, the
+    // sentinel, which is precisely the texel that must not be written. So for a
+    // COPY blend, COLORKEY is strictly MORE correct than COPY at ANY alpha, and
+    // gating it on alpha gates it on a quantity that cannot change the output.
+    //
+    // Measured on Cursed Castilla EX (.62, 2026-08-23) -- but see 2026-09-27: that
+    // "every EX draw is an enabled GL_ONE/GL_ZERO replace" reading was a blend-
+    // TRACKING artifact (the init-time glBlendFunc was dropped); EX really blends
+    // SRC_ALPHA. With tracking fixed its faded keyed draws take PALPHA. The
+    // original record: every EX draw read as RB_NONE, and the game pulses the
+    // title logo's vertex alpha. The old condition therefore took the fallback
+    // ~86% of the time (off=0009E8C8: colorkey=352 fallback=2196), painting the
+    // logo and the band behind it magenta, and flipped to COLORKEY only for the
+    // few frames per cycle where alpha touched 1.0 -- the ~7s "flickers to
+    // transparent" that made this findable.
+    //
+    // RB_ALPHA/PREMULT keep the old threshold: their fallback IS CONST_ALPHA,
+    // which really does use the alpha, and colorkey + const-alpha cannot be
+    // combined in one TRILIST header. That remains the documented RTL hole at
+    // the top of this file.
     // [TRILIST PALPHA] An ARGB4444 page is only ever staged for an RB_ALPHA draw
     // (mf_pa_resolve_fmt), and every draw on it goes out as PALPHA: texel alpha x
     // vertex alpha, A4==0 skipped. This replaces the COLORKEY / CONST_ALPHA / COPY
@@ -3492,10 +3679,12 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
     if (palpha) {
         blend_mode = BLT_BLEND_PALPHA;
         colorkey = 0;
-    } else if (has_key && min_vtx_a * 255.0f >= 254.0f) {
+    } else if (has_key && (bl == RB_NONE || min_vtx_a * 255.0f >= 254.0f)) {
         blend_mode = BLT_BLEND_COLORKEY;
         colorkey = MF_COLORKEY;
+        mf_key_trace(tex.off, tw, th, min_vtx_a, /*colorkeyed=*/true, has_key, verts, nverts, nt);
     } else {
+        mf_key_trace(tex.off, tw, th, min_vtx_a, /*colorkeyed=*/false, has_key, verts, nverts, nt);
         blend_mode = rblend_to_blt(bl);
         // A fully-opaque ALPHA draw over a source with no per-texel alpha IS a copy, and
         // the difference is not free on the fabric. BLT_BLEND_CONST_ALPHA sets the RTL's
@@ -3792,6 +3981,36 @@ static void mf_uvlog(const char *tag, const BVtx *v, int triCount, int tw, int t
             v_at_ymin, v_at_ymax, verdict);
 }
 
+// [default-surface Y flip] A/B knob so the flip can be turned off on device
+// without a rebuild -- this reconciles two conventions and the failure mode of
+// getting it wrong is a whole inverted frame, which is exactly the kind of thing
+// worth being able to bisect in place. On by default.
+// [composite fit] Default OFF: Maldita's composite is already near 1:1
+// ([0,0..320,240]) and changing its framing is a visible change that needs its
+// own device check. EX needs it (3x oversize); turn it on there once verified.
+static int mf_composite_fit(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_MFGPU_COMPOSITE_FIT");
+                 v = (e && *e) ? atoi(e) : 0; }
+    return v;
+}
+
+static int mf_yflip_appsurf(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_MFGPU_YFLIP_APPSURF");
+                 v = (e && *e) ? atoi(e) : 0;
+                 if (v) fprintf(stderr, "backend_mfgpu: YFLIP_APPSURF=1 -- app-surface "
+                                        "draws are Y-flipped too (non-default)\n"); }
+    return v;
+}
+
+static int mf_defsurf_yflip(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("GMLOADER_MFGPU_DEFSURF_YFLIP");
+                 v = (e && *e) ? atoi(e) : 1; }
+    return v;
+}
+
 static void mf_draw(RSurface *d, const BVtx *v, int triCount,
                     const RTexture *t, RBlend bl, float ar, uint32_t tex_key) {
     mf_ensure_frame();
@@ -3965,6 +4184,54 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         const float vsum = vmin + vmax;
         static BVtx compscratch[MF_MAX_VERTS];
         for (int i = 0; i < nverts; i++) { compscratch[i] = v[i]; compscratch[i].v = vsum - v[i].v; }
+
+        // ── [composite fit] map the composite quad onto the render target ────
+        // Measured on Cursed Castilla EX (.62 2026-08-23), every frame:
+        //   COMPOSITE(appsurf->screen) screen=[-288,-216..576,432] uv=[0,0..0.5625,0.8438]
+        // The UVs are correct -- 0.5625 x 0.8438 is exactly the 288x216 content
+        // inside the 512x256 padded page -- but the GEOMETRY is 864x648, i.e.
+        // 3x the 288x216 target, centred on it. The scanned-out window
+        // therefore shows only the middle third: the device symptom is the
+        // title art hugely zoomed, with a diagonal where the quad's 4-triangle
+        // split crosses the visible area.
+        //
+        // Maldita's same draw is screen=[0,0..320,240], near 1:1, which is why
+        // it looks right and EX does not. The difference tracks the forked
+        // gmloader.json (EX force_platform=os_windows vs Maldita os_android),
+        // which is what decides the runner's notional window size.
+        //
+        // The quad by construction spans the whole surface -- blitter.cpp only
+        // detects the app surface from a draw covering the full viewport -- so
+        // fitting its own bbox onto the target rect is exact and
+        // self-calibrating, the same argument the V-flip above uses for
+        // (vmin+vmax)-v. Degenerate extents collapse to identity.
+        if (mf_composite_fit()) {
+            float xmn = compscratch[0].x, xmx = compscratch[0].x;
+            float ymn = compscratch[0].y, ymx = compscratch[0].y;
+            for (int i = 1; i < nverts; i++) {
+                if (compscratch[i].x < xmn) xmn = compscratch[i].x;
+                if (compscratch[i].x > xmx) xmx = compscratch[i].x;
+                if (compscratch[i].y < ymn) ymn = compscratch[i].y;
+                if (compscratch[i].y > ymx) ymx = compscratch[i].y;
+            }
+            const float dw = (d && d->w > 0) ? (float)d->w : (float)BLT_FB_WIDTH;
+            const float dh = (d && d->h > 0) ? (float)d->h : (float)BLT_FB_HEIGHT;
+            const float sx = (xmx - xmn) > 0.0001f ? dw / (xmx - xmn) : 0.0f;
+            const float sy = (ymx - ymn) > 0.0001f ? dh / (ymx - ymn) : 0.0f;
+            if (sx > 0.0f && sy > 0.0f) {
+                static int shown = 0;
+                if (shown < 4 && (sx < 0.99f || sx > 1.01f || sy < 0.99f || sy > 1.01f)) {
+                    shown++;
+                    fprintf(stderr, "MFFIT f=%lu composite [%.0f,%.0f..%.0f,%.0f] -> "
+                            "[0,0..%.0f,%.0f]  scale %.3fx%.3f\n",
+                            (unsigned long)g_frame_no, xmn, ymn, xmx, ymx, dw, dh, sx, sy);
+                }
+                for (int i = 0; i < nverts; i++) {
+                    compscratch[i].x = (compscratch[i].x - xmn) * sx;
+                    compscratch[i].y = (compscratch[i].y - ymn) * sy;
+                }
+            }
+        }
         if (g_ps_pending) g_ps_why[4]++;
         mf_ps_discharge();   // a second composite in one frame: the first one is real
         if (mf_present_surf_on() && mf_ps_capable() && !dst_is_appsurf &&
@@ -3980,6 +4247,114 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         }
         mf_emit_group(tex, tw, th, compscratch, triCount, bl, /*has_key=*/false, BLT_F_SRC_SURFACE);
         return;
+    }
+
+    // ── [oversized-draw trace] ───────────────────────────────────────────────
+    // Device symptom (EX, .62 2026-08-23): the second intro renders the title
+    // art hugely zoomed AND with a clean corner-to-corner diagonal, content on
+    // one side and black on the other. A quad drawn much larger than the
+    // 288x216 screen has its split diagonal crossing the visible area, so
+    // "over-scaled" and "half missing" are one draw, not two bugs.
+    //
+    // The suspected mechanism is that EX never composites its app surface
+    // (measured: UVLOG composite=0 over 400 frames), so scene content authored
+    // at app-surface scale (the attachments are 512x256) reaches the default
+    // surface without the composite's mapping and lands zoomed + clipped.
+    //
+    // Fires only when a draw's bbox materially overflows its target, so a
+    // normal frame prints nothing. Records mode/nv so it simultaneously settles
+    // whether the fan/strip assembly is producing the right triangle count.
+    {
+        int nv_all = triCount * 3;
+        if (nv_all > 0 && v) {
+            float mnx = v[0].x, mxx = v[0].x, mny = v[0].y, mxy = v[0].y;
+            float mnu = v[0].u, mxu = v[0].u, mnv = v[0].v, mxv = v[0].v;
+            for (int i = 1; i < nv_all; i++) {
+                if (v[i].x < mnx) mnx = v[i].x;  if (v[i].x > mxx) mxx = v[i].x;
+                if (v[i].y < mny) mny = v[i].y;  if (v[i].y > mxy) mxy = v[i].y;
+                if (v[i].u < mnu) mnu = v[i].u;  if (v[i].u > mxu) mxu = v[i].u;
+                if (v[i].v < mnv) mnv = v[i].v;  if (v[i].v > mxv) mxv = v[i].v;
+            }
+            const float W = (d && d->w > 0) ? (float)d->w : (float)BLT_FB_WIDTH;
+            const float H = (d && d->h > 0) ? (float)d->h : (float)BLT_FB_HEIGHT;
+            bool over = (mxx > W * 1.5f) || (mxy > H * 1.5f) ||
+                        (mnx < -W * 0.5f) || (mny < -H * 0.5f);
+            static int n = 0;
+            if (over && n < 96) {
+                n++;
+                fprintf(stderr, "MFBIG f=%lu tris=%d dst=%s %.0fx%.0f "
+                        "xy=[%.1f,%.1f..%.1f,%.1f] uv=[%.4f,%.4f..%.4f,%.4f] "
+                        "tex=%ux%d(page) key=%u\n",
+                        (unsigned long)g_frame_no, triCount,
+                        dst_is_appsurf ? "APPSURF" : "DEFAULT", W, H,
+                        mnx, mny, mxx, mxy, mnu, mnv, mxu, mxv,
+                        (unsigned)(t ? t->w : 0), t ? t->h : 0, tex_key);
+            }
+        }
+    }
+
+    // ── screen-space Y flip for draws that reach the DEFAULT surface DIRECTLY ──
+    // blitter.cpp:674 builds screen Y in GL's BOTTOM-origin convention
+    //     bv.y = g_vpY + (ndcy*0.5f + 0.5f) * g_vpH;   // GL bottom-up
+    // and the fabric's surfaces are TOP-origin. This engine has exactly one
+    // place that reconciles the two: the app-surface composite just above,
+    // whose texture-space v flip was calibrated on a Maldita capture. Maldita
+    // renders its scene into the app surface and composites it, so every pixel
+    // takes that path and lands upright -- the internal content is stored
+    // inverted and un-inverted once, at the end.
+    //
+    // Cursed Castilla EX never composites the app surface. Measured on .62 with
+    // GMLOADER_MFGPU_UVLOG over 400 frames: composite=0, scene=0. It draws
+    // straight to fbo=0, so nothing ever undoes the bottom-up Y and the WHOLE
+    // FRAME is displayed upside down. The fabric is not involved:
+    // tools/fabric_probe.armhf, which bypasses the engine entirely, renders its
+    // apex-at-y=48 triangle upright on both HDMI and the analog CRT.
+    //
+    // The flip is POSITION-only and the UVs travel with the vertices, so this
+    // repositions content without mirroring any texture. It is placed AFTER the
+    // composite branch's return on purpose: a composite is already reconciled in
+    // texture space, and flipping it here too would double-flip Maldita.
+    //
+    // Scene->appsurf draws are deliberately NOT flipped: that content is stored
+    // inverted BY DESIGN, because the composite is what un-inverts it.
+    //
+    // Safety for Maldita, measured rather than assumed (.62, f=600..602): its
+    // steady state is exactly three fbo=0 draws per frame, ALL spanning
+    // scr=[0,0..288,216] -- two app-surface composites (srctex=4), which return
+    // above and never reach here, and one full-screen border (srctex=6), whose
+    // geometry maps onto itself under this flip.
+    // GMLOADER_MFGPU_YFLIP_APPSURF=1 extends the flip to app-surface-destined
+    // draws. Default 0 = current behaviour, so Maldita is untouched: it stores
+    // scene content in the app surface INVERTED on purpose and un-inverts once
+    // at composite time, so flipping there would double-flip it.
+    //
+    // The reason this is a knob and not a decision: the claim "EX never
+    // composites, so its app-surface content is never un-inverted" rested on a
+    // UVLOG measurement over frames 1-400, and EX does not start using the app
+    // surface until ~frame 2763. That window could not have seen a composite,
+    // so it proved nothing. This knob lets the question be settled on the
+    // screen that actually shows the defect rather than by argument.
+    if (mf_defsurf_yflip() && (!dst_is_appsurf || mf_yflip_appsurf())) {
+        int nv = triCount * 3;
+        if (nv > 0 && nv <= MF_MAX_VERTS) {
+            static BVtx s_yflip[MF_MAX_VERTS];
+            // Flip about the CONTENT height, never the surface's height.
+            // d->w/d->h report the app surface's PADDED POT PAGE (512x256 on
+            // both cores -- see MFBIG "dst=APPSURF 512x256" and the composite's
+            // own note, page=512x256 content=288x216, uv 0.5625 x 0.8438 =
+            // 288/512 x 216/256). Mirroring about 256 instead of 216 would be
+            // off by 40px and would place content in the dead padding below the
+            // used region -- the same trap the composite's V-flip documents for
+            // a normalized 1-v. The default surface's height already IS the
+            // content height, so this is only load-bearing for APPSURF.
+            const float H = dst_is_appsurf
+                          ? (float)BLT_FB_HEIGHT
+                          : ((d && d->h > 0) ? (float)d->h : (float)BLT_FB_HEIGHT);
+            for (int i = 0; i < nv; i++) { s_yflip[i] = v[i]; s_yflip[i].y = H - v[i].y; }
+            v = s_yflip;
+        }
+        // nv > MF_MAX_VERTS is left alone: mf_emit_group drops that draw with an
+        // explicit error, so there is nothing to correct.
     }
 
     // Scene draws INTO the app surface, for the same capture: if GM's
@@ -4374,6 +4749,7 @@ static void mf_frame_end(void) {
             fprintf(stderr, "MFPALPHA frames=%u on=%d cap=%d groups=%u tris=%u px=%.0f (last frame) staged4444=%u\n",
                     nf, mf_palpha_on(), mf_pa_capable() ? 1 : 0, g_pa_groups_frame,
                     g_pa_tris_frame, g_pa_px_frame, g_pa_staged_total);
+            mf_key_census();   // [C2 magenta band] see mf_key_trace
         }
     }
 #endif
