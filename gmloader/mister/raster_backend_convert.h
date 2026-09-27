@@ -17,6 +17,10 @@
 //     Alpha compositing is therefore done with BLT_BLEND_CONST_ALPHA, whose
 //     effective alpha is (interpolated vtx.a * header.alpha)/255. So RB_ALPHA
 //     maps to CONST_ALPHA, not PALPHA.
+//   [TRILIST PALPHA] The refmodel has since gained a TRILIST PALPHA case plus
+//   ARGB4444 page decode. rblend_to_blt is unchanged: raster_backend_mfgpu.cpp
+//   upgrades an RB_ALPHA draw to PALPHA itself, only when it staged the draw's
+//   region ARGB4444 (GMLOADER_MFGPU_PALPHA + the RBF capability bit).
 #pragma once
 
 #include "blitter_raster.h"   // BVtx, RBlend, RB_*
