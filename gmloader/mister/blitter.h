@@ -87,7 +87,11 @@ GLuint Blitter_AppSurfaceTex(void);
 void Blitter_OnUseProgram(GLuint program);
 void Blitter_OnGetUniformLocation(GLuint program, const char *name, GLint loc);
 void Blitter_OnUniformMatrix4fv(GLint location, GLsizei count, const GLfloat *value);  // capture matrices
-void Blitter_OnBlendState(int enabled, GLenum src, GLenum dst);
+// glBlendFunc / glBlendFuncSeparate (RGB factors) and glEnable/glDisable(GL_BLEND).
+// Recorded even while the blitter is disabled; GL_ZERO is a valid factor.
+void Blitter_OnBlendFunc(GLenum src, GLenum dst);
+void Blitter_OnBlendEnable(int enabled);
+void Blitter_GetBlendState(int *enabled, GLenum *src, GLenum *dst);  // for tests/diag
 void Blitter_OnViewport(int x, int y, int w, int h);
 void Blitter_OnScissor(int enabled, int x, int y, int w, int h);
 
