@@ -467,13 +467,17 @@ static void test_pa_classify_cases() {
     for (int i = 0; i < W * H; i++) { px[i*4] = px[i*4+1] = px[i*4+2] = 255; px[i*4+3] = 255; }
     check_int("classify opaque white", RasterBackend_MFGPU_TestPaClassify(&t, 0, 0, W, H),
               PA_KNOWN | PA_LOSSLESS);
-    // Policy: soft edges always, a cutout only when faded, never when lossy.
+    // Policy: unfaded -> soft edges only, and only when lossless; faded -> any
+    // transparency, lossy or not (the alternative paints the colorkey sentinel).
     const int L = PA_KNOWN | PA_LOSSLESS;
     check_int("pick partial",            RasterBackend_MFGPU_TestPaPick(L | PA_PARTIAL, 0), 1);
     check_int("pick hole unfaded",       RasterBackend_MFGPU_TestPaPick(L | PA_HOLE, 0), 0);
     check_int("pick hole faded",         RasterBackend_MFGPU_TestPaPick(L | PA_HOLE, 1), 1);
     check_int("pick opaque faded",       RasterBackend_MFGPU_TestPaPick(L, 1), 0);
-    check_int("pick lossy partial",      RasterBackend_MFGPU_TestPaPick(PA_KNOWN | PA_PARTIAL | PA_HOLE, 1), 0);
+    check_int("pick lossy partial",      RasterBackend_MFGPU_TestPaPick(PA_KNOWN | PA_PARTIAL, 0), 0);
+    check_int("pick lossy faded",        RasterBackend_MFGPU_TestPaPick(PA_KNOWN | PA_PARTIAL | PA_HOLE, 1), 1);
+    check_int("pick lossy hole faded",   RasterBackend_MFGPU_TestPaPick(PA_KNOWN | PA_HOLE, 1), 1);
+    check_int("pick lossy opaque faded", RasterBackend_MFGPU_TestPaPick(PA_KNOWN, 1), 0);
 }
 
 // Random rects over random textures, both source formats, against the oracle --
