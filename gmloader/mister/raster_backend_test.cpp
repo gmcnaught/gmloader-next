@@ -4151,14 +4151,13 @@ static int case_palpha_hard_cutout_faded_only(void) {
     return 1;
 }
 
-// A region whose colours ARGB4444 cannot hold stays RGB565, and renders exactly as with
-// PALPHA off.
+// An UNFADED draw of a region whose colours ARGB4444 cannot hold stays RGB565, and
+// renders exactly as with PALPHA off.
 static int case_palpha_lossy_stays_rgb565(void) {
     static uint16_t fb_on[BW*BH], fb_off[BW*BH]; static uint8_t ring[1 << 16]; int rn = 0;
-    const PaQuad qs[2] = { { pa_tex_lossy(), 1.0f, RB_ALPHA, 40.f, 30.f, 0x5401 },
-                           { pa_tex_lossy(), 0.5f, RB_ALPHA, 80.f, 30.f, 0x5401 } };
-    pa_set(0, 1); pa_render(qs, 2, fb_off, nullptr, nullptr);
-    pa_set(1, 1); uint32_t g = pa_render(qs, 2, fb_on, ring, &rn);
+    const PaQuad qs[1] = { { pa_tex_lossy(), 1.0f, RB_ALPHA, 40.f, 30.f, 0x5401 } };
+    pa_set(0, 1); pa_render(qs, 1, fb_off, nullptr, nullptr);
+    pa_set(1, 1); uint32_t g = pa_render(qs, 1, fb_on, ring, &rn);
     uint32_t staged = RasterBackend_MFGPU_TestPalphaStaged();
     pa_unset();
     int np, n4; pa_scan_ring(ring, rn, &np, &n4);
@@ -4168,6 +4167,29 @@ static int case_palpha_lossy_stays_rgb565(void) {
         return 0;
     }
     printf("  OK   palpha-lossy  lossy soft region stays RGB565, image unchanged\n");
+    return 1;
+}
+
+// A FADED draw of the same lossy region goes PALPHA. With PALPHA off it falls back to
+// CONST_ALPHA with no cutout and blends the colorkey sentinel (magenta) into the frame;
+// with it on the block matches the straight-alpha oracle within 4444's colour loss
+// (<= 1 LSB on R/B, <= 3 on G against the RGB565 source). EX's bck_check title band.
+static int case_palpha_lossy_faded(void) {
+    static uint16_t fb_on[BW*BH], fb_off[BW*BH]; static uint8_t ring[1 << 16]; int rn = 0;
+    const PaQuad qs[1] = { { pa_tex_lossy(), 0.5f, RB_ALPHA, 80.f, 30.f, 0x5401 } };
+    pa_set(0, 1); pa_render(qs, 1, fb_off, nullptr, nullptr);
+    pa_set(1, 1); pa_render(qs, 1, fb_on, ring, &rn);
+    pa_unset();
+    int np, n4; pa_scan_ring(ring, rn, &np, &n4);
+    const int va = (int)(0.5f * 255.0f + 0.5f);
+    const int e_off = pa_block_err(fb_off, pa_tex_lossy(), 80, 30, va);
+    const int e_on  = pa_block_err(fb_on,  pa_tex_lossy(), 80, 30, va);
+    if (np < 1 || n4 < 1 || e_on > 3 || e_off <= 8) {
+        printf("  FAIL palpha-lossy-faded  palpha=%d 4444=%d err off=%d on=%d\n", np, n4, e_off, e_on);
+        return 0;
+    }
+    printf("  OK   palpha-lossy-faded  faded lossy region: PALPHA, max err %d (was %d with PALPHA off)\n",
+           e_on, e_off);
     return 1;
 }
 
@@ -4384,6 +4406,7 @@ int main(void){
     if (!case_palpha_gated_off_is_unchanged()) { printf("FAIL mfgpu-palpha-gated-off\n"); ok = 0; }
     if (!case_palpha_hard_cutout_faded_only()) { printf("FAIL mfgpu-palpha-hard\n"); ok = 0; }
     if (!case_palpha_lossy_stays_rgb565()) { printf("FAIL mfgpu-palpha-lossy\n"); ok = 0; }
+    if (!case_palpha_lossy_faded()) { printf("FAIL mfgpu-palpha-lossy-faded\n"); ok = 0; }
     if (!case_palpha_cache_key_separates_formats()) { printf("FAIL mfgpu-palpha-cache-key\n"); ok = 0; }
     if (!case_palpha_never_occludes()) { printf("FAIL mfgpu-palpha-occlude\n"); ok = 0; }
     if (!case_palpha_duplicate_not_elided()) { printf("FAIL mfgpu-palpha-dup\n"); ok = 0; }

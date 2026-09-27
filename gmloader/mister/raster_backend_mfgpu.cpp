@@ -2916,7 +2916,9 @@ static inline uint16_t mf_argb4444(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
 // Scalar: runs once per rect, on a cache miss of a PALPHA-eligible draw.
 static uint8_t mf_pa_classify(const RTexture *t, int rx, int ry, int rw, int rh) {
     bool partial = false, hole = false, lossless = true;
-    for (int y = 0; y < rh && lossless; y++)
+    // Scan the whole rect: the faded rule in mf_pa_pick needs hole/partial even when
+    // the rect is lossy, so the first lossy texel must not end the scan.
+    for (int y = 0; y < rh; y++)
         for (int x = 0; x < rw; x++) {
             uint8_t r, g, b, a;
             mf_src_rgba(t, rx + x, ry + y, r, g, b, a);
@@ -2924,9 +2926,9 @@ static uint8_t mf_pa_classify(const RTexture *t, int rx, int ry, int rw, int rh)
             if (a4 == 0) { hole = true; continue; }
             if (a4 < 15) partial = true;
             unsigned a8;
-            if (blt_argb4444_to_565(mf_argb4444(r, g, b, a), &a8) != mf_rgb565(r, g, b)) {
-                lossless = false; break;
-            }
+            if (lossless &&
+                blt_argb4444_to_565(mf_argb4444(r, g, b, a), &a8) != mf_rgb565(r, g, b))
+                lossless = false;
         }
     return (uint8_t)(MF_PA_KNOWN | (partial ? MF_PA_PARTIAL : 0) | (hole ? MF_PA_HOLE : 0) |
                      (lossless ? MF_PA_LOSSLESS : 0));
@@ -2953,9 +2955,15 @@ static void mf_stage_texels_4444(const RTexture *t, int rx, int ry, int rw, int 
 // alpha is below the COLORKEY threshold, so the RGB565 path would emit CONST_ALPHA and
 // paint the colorkey sentinel over the cutout. Soft edges always need PALPHA; a hard
 // cutout needs it only when faded (unfaded, COLORKEY already renders it exactly).
+// A FADED draw on a rect with any transparency takes PALPHA even when 4444 loses
+// colour: its only alternative is CONST_ALPHA with no cutout, which paints the colorkey
+// sentinel as magenta. Measured on EX's title (.62, 2026-09-27): bck_check (a
+// 1892x602 staged page, painted art, lossy) is drawn at vertex alpha 0.008..1.0 and
+// took that fallback 2904/2933 times -- the magenta band. 4444's colour cost there is a
+// mean 3.7/255 per channel (G0c). Unfaded, a lossy rect keeps RGB565 + the 128 cut.
 static inline bool mf_pa_pick(uint8_t cls, bool faded) {
-    if (!(cls & MF_PA_LOSSLESS)) return false;
-    return (cls & MF_PA_PARTIAL) || ((cls & MF_PA_HOLE) && faded);
+    if (faded) return (cls & (MF_PA_HOLE | MF_PA_PARTIAL)) != 0;
+    return (cls & MF_PA_LOSSLESS) && (cls & MF_PA_PARTIAL);
 }
 // PALPHA request passed to the staging functions by mf_draw.
 enum { MF_PA_REQ_NONE = 0, MF_PA_REQ_OPAQUE = 1, MF_PA_REQ_FADED = 2 };
