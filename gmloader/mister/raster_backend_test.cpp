@@ -3304,7 +3304,7 @@ static uint32_t mf_test_render_ps_scene(uint16_t *out, int cap, int after) {
 static int case_present_surf(void) {
     static uint16_t fb_on[BW*BH], fb_off[BW*BH];
     const char *names[5] = { "identity", "work-draw-after", "fps-overlay", "appsurf-draw-after", "dropped-draw-after" };
-    const uint32_t want[5] = { 3, 0, 0, 0, 3 };
+    const uint32_t want[5] = { 3, 0, 3, 0, 3 };   // the fps overlay paints into the surface
     for (int after = 0; after < 5; after++) {
         uint32_t p_off = mf_test_render_ps_scene(fb_off, 0, after);
         uint32_t p_on  = mf_test_render_ps_scene(fb_on, 1, after);
@@ -3323,7 +3323,7 @@ static int case_present_surf(void) {
         }
     }
     printf("  OK   present-surf  identity composite presented from the surface (3/3 frames); "
-           "work draw / fps overlay / surface draw after it force it out, a dropped draw does not; all byte-identical\n");
+           "work draw / surface draw after it force it out, fps overlay and a dropped draw do not; all byte-identical\n");
     return 1;
 }
 

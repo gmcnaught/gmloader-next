@@ -4020,19 +4020,26 @@ static void mf_emit_fps_digit(int x, int y, int digit) {
 // bottom-right corner of the WORK buffer. Called from present() right before
 // mf_frame_end, so it overlays the game's own draws for this frame.
 static void mf_emit_fps_overlay_fills(void) {
-    if (g_ps_pending) g_ps_why[2]++;
-    mf_ps_discharge();   // [present-from-surface] the overlay paints over the composite
+    // [present-from-surface] The overlay must land on whatever is scanned out. When this
+    // frame is presented straight from the app surface (the identity composite is still
+    // deferred), paint it INTO the surface and keep the deferral: discharging the composite
+    // here -- the old behaviour -- put a 62k-pixel copy (~3.8 ms of fabric) back into every
+    // frame the overlay was on, so the FPS readout slowed the game it was measuring
+    // (level_2_3, .81, 2026-09-26: 16.2-17.5 ms fabric with the overlay on).
+    // Cost: the readout is now part of the surface's contents. The panel is repainted in
+    // the same place every frame, and the game redraws its surface each frame; a draw that
+    // SAMPLES the surface later in a frame would see it -- acceptable for a diagnostic.
+    const bool into_surf = g_ps_pending;
     // [W3 batching] FLUSH POINT 10: the overlay paints OVER the frame's draws, so
     // every pending triangle must already be in the ring. Redundant with
     // mf_present's own flush just above the call, and kept anyway -- this
     // function emits fills and switches target, so it must not depend on its
     // caller having done it.
     mf_batch_flush();
-    // The overlay lands on the scanned-out WORK buffer, never the app surface:
-    // restore the target if the frame's last op left it on APPSURF.
-    if (g_cur_target != MF_TARGET_WORK) {
-        blt_set_target(&g_e, MF_TARGET_WORK);
-        g_cur_target = MF_TARGET_WORK;
+    const int ov_target = into_surf ? MF_TARGET_APPSURF : MF_TARGET_WORK;
+    if (g_cur_target != ov_target) {
+        blt_set_target(&g_e, ov_target);
+        g_cur_target = ov_target;
     }
     int fps = fps_overlay_clamp(g_fps_value);
     int tens = fps / 10, ones = fps % 10;
