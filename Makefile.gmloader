@@ -412,3 +412,8 @@ native-audio-shim-test:
 	  gmloader/mister/mister_native_audio.cpp \
 	  gmloader/mister/native_audio_writer.c \
 	  $(shell pkg-config sdl2 --libs) -o /tmp/mnat && /tmp/mnat
+
+# [joy keymap] GMLOADER_JOY_KEYMAP parser + edge logic (mister/joy_keymap.h).
+joy-keymap-test:
+	c++ -std=c++17 -Igmloader/mister gmloader/mister/joy_keymap_test.cpp -o /tmp/joy_keymap_test && /tmp/joy_keymap_test
+.PHONY: joy-keymap-test
