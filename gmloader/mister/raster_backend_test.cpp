@@ -50,6 +50,7 @@ extern "C" void RasterBackend_MFGPU_SetAppSurface(uint32_t fbo, uint32_t tex);
 // Task 2: cache introspection/reset hooks (host-test-only, not part of the vtable).
 extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestStageCount(void);   // FO Task 3
+extern "C" uint32_t RasterBackend_MFGPU_TestUnstagedCount(void);   // [unstage on drop]
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes);
 // in-flight-batch guard: force the "is the fabric still chewing on the last submit?"
 // predicate (-1 = ask for real; on a host build the real answer is always "no"), and
@@ -1496,7 +1497,8 @@ static int case_inflight_drop(void) {
     // frame B: the fabric has not acked -> must be refused at the publish barrier
     RasterBackend_MFGPU_TestSetFabricBusy(1);
     backend_mfgpu.clear(&s_mf, 0,0,0,255);
-    backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, next_key());
+    const uint32_t key_blue = next_key();   // frames B and C draw the SAME texture identity
+    backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, key_blue);
     backend_mfgpu.present(&s_mf);
     static uint16_t fbB[BW*BH];
     RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbB);
@@ -1527,11 +1529,12 @@ static int case_inflight_drop(void) {
     }
 
     const uint32_t st_dropped = RasterBackend_MFGPU_TestStageCount() - st_after_A;
+    const uint32_t st_after_B = RasterBackend_MFGPU_TestStageCount();
 
     // frame C: fabric acked -> normal service resumes and the BLUE triangle lands
     RasterBackend_MFGPU_TestSetFabricBusy(0);
     backend_mfgpu.clear(&s_mf, 0,0,0,255);
-    backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, next_key());
+    backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, key_blue);
     backend_mfgpu.present(&s_mf);
     static uint16_t fbC[BW*BH];
     RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbC);
@@ -1542,6 +1545,15 @@ static int case_inflight_drop(void) {
     if (RasterBackend_MFGPU_TestDropCount() != dr_after_A + 1) {
         printf("  FAIL inflight-drop  frame C was dropped too (drop_count=%u)\n",
                RasterBackend_MFGPU_TestDropCount());
+        return 0;
+    }
+    // [unstage on drop] frame B's STAGE for the blue page died with frame B's ring. The
+    // oracle cannot see that (blt_execute no-ops OP_STAGE and reads the heap directly), so
+    // assert the bookkeeping: frame C must RE-STAGE the page instead of trusting a cache hit
+    // on a page the fabric never received (device: stripes/speckle, 2026-09-27).
+    if (st_dropped >= 1 && RasterBackend_MFGPU_TestStageCount() == st_after_B) {
+        printf("  FAIL inflight-drop  frame C reused a page whose STAGE was dropped with frame B "
+               "(no re-stage; unstaged=%u)\n", RasterBackend_MFGPU_TestUnstagedCount());
         return 0;
     }
     RasterBackend_MFGPU_TestSetFabricBusy(-1);

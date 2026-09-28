@@ -2320,6 +2320,8 @@ static bool mf_publish_barrier(void) {
     return true;
 }
 
+static void mf_fresh_commit(void);
+static void mf_unstage_fresh(const char *why);
 static void mf_frame_begin(void) {
     mf_init_once();
     // [in-flight-batch guard] Decide BEFORE blt_begin_frame: it is the call that would
@@ -2361,6 +2363,7 @@ static void mf_frame_begin(void) {
         // resolution point, and clearing the flag here would make it skip its await and
         // stomp a live control block.
     }
+    mf_fresh_commit();   // [unstage on drop] the previous frame was resolved at its end
     g_frame_dropped = false;
     g_frame_ovf_cause = MF_OVF_UNKNOWN;   // [Phase 1 B3] per-frame: reset before staging
     g_last_draw.valid = false;   // [duplicate-draw elimination] never span frames
@@ -2484,6 +2487,39 @@ static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
         return;
     }
     blt_fill(&g_e, 0, 0, w, h, col);
+}
+
+// [unstage on drop] Texture pages uploaded AND staged while building the current
+// frame. Their BLT_OP_STAGE rides in this frame's ring, so if the frame is dropped
+// after it was built (publish barrier timeout, emitter overflow, shutdown) the
+// fabric never copies them into SDRAM -- yet the cache entry would stay, every
+// later draw would HIT it, and the fabric would sample whatever that SDRAM range
+// held before. Device-observed 2026-09-27 (.62/.81, Cursed Castilla EX title): a
+// 2.3 MB page uploaded in the frame that hit "publish barrier timed out" rendered
+// as diagonal colour stripes (COPY readback) / green-purple speckle (PALPHA) for as
+// long as it stayed cached. So: remember what this frame staged, forget it (and
+// free its heap) when the frame is dropped, commit it when the frame publishes.
+struct MfFreshStage { int slot; uint32_t off; };
+static MfFreshStage g_fresh[MF_TEX_CACHE_N];
+static int          g_fresh_n = 0;
+static uint32_t     g_unstaged_total = 0;   // entries evicted because their STAGE was dropped
+static void mf_fresh_commit(void) { g_fresh_n = 0; }
+static void mf_unstage_fresh(const char *why) {
+    int n = 0;
+    for (int i = 0; i < g_fresh_n; i++) {
+        const int s = g_fresh[i].slot;
+        if (s < 0 || s >= MF_TEX_CACHE_N) continue;
+        if (!g_texcache[s].used || g_texcache[s].ref.off != g_fresh[i].off) continue;
+        // Never published, so nothing in flight can read it: safe to free now.
+        blt_emitter_free(&g_e, g_texcache[s].ref.off, g_texcache[s].ref.size);
+        g_texcache[s].used = false;
+        g_sp_ok[s] = false;
+        n++;
+    }
+    g_fresh_n = 0;
+    g_unstaged_total += (uint32_t)n;
+    if (n) fprintf(stderr, "backend_mfgpu: %s - %d texture page(s) staged this frame "
+                   "evicted so they re-stage (%u total)\n", why, n, g_unstaged_total);
 }
 
 static bool evict_one_lru(void) {
@@ -2709,6 +2745,7 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
     g_texcache[slot] = MfTexEntry{ key, true, has_key, mask_only, ref, ++g_lru_clock,
                                    (uint16_t)rx, (uint16_t)ry, (uint16_t)w, (uint16_t)h, tr,
                                    fmt, pa_cls };
+    if (g_fresh_n < MF_TEX_CACHE_N) g_fresh[g_fresh_n++] = MfFreshStage{ slot, ref.off };   // [unstage on drop]
     // [sparse keyed quads] Only a keyed page big enough for a quad worth splitting.
     g_sp_ok[slot] = false;
     if (has_key && pw * ph >= MF_SP_MIN_PX) {
@@ -4409,6 +4446,7 @@ static void mf_frame_end(void) {
     if (g_e.overflow) {
         fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped %s\n",
                 mf_ovf_cause_str());
+        mf_unstage_fresh("emitter overflow");
         return;
     }
     // [Phase 1 B2] Publish and return. The await moved to mf_frame_begin, so the engine's
@@ -4422,6 +4460,7 @@ static void mf_frame_end(void) {
     // engine's bring-up has to dig out of.
     if (g_fabric_shutdown) {
         g_frame_dropped = true;
+        mf_unstage_fresh("shutdown");
     }
     else if (g_dev_ok) {
         // [Phase 2 host lever] Barrier immediately before the control-block writes, not at
@@ -4431,20 +4470,24 @@ static void mf_frame_end(void) {
             g_frame_dropped = true;
             fprintf(stderr, "backend_mfgpu: publish barrier timed out on seq=%u - batch dropped\n",
                     g_pending_seq);
+            mf_unstage_fresh("publish barrier timed out");
         } else {
             mf_pace_gate();
             mf_device_publish();
+            mf_fresh_commit();
             g_fabric_pending = true; g_pending_seq = g_e.submit_seq;
             g_pending_arena  = g_arena & 1u;
         }
     }
-    else          fprintf(stderr, "backend_mfgpu: device DDR unmapped - frame dropped\n");
+    else {        fprintf(stderr, "backend_mfgpu: device DDR unmapped - frame dropped\n");
+                  mf_unstage_fresh("device DDR unmapped"); }
 #else
     // Host oracle: software-execute the ring into g_fb565 (parity tests read it back).
     if (g_e.overflow) {
         fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped %s\n",
                 mf_ovf_cause_str());
         memset(g_fb565, 0, sizeof g_fb565);   // nothing safe to execute this frame
+        mf_unstage_fresh("emitter overflow");
         return;
     }
     // [Phase 1 B2] Drive the same submit seam the device path uses, so the publish/await
@@ -4465,12 +4508,14 @@ static void mf_frame_end(void) {
     // exactly what case_inflight_drop asks by comparing framebuffers.
     // [fabric lifecycle] Same guard as the device path above, so "teardown stops the
     // frame loop from re-arming the ring" is a property the oracle can assert.
-    if (g_fabric_shutdown) { g_frame_dropped = true; return; }
+    if (g_fabric_shutdown) { g_frame_dropped = true; mf_unstage_fresh("shutdown"); return; }
     if (!mf_publish_barrier()) {
         g_frame_dropped = true;
+        mf_unstage_fresh("publish barrier timed out");
         return;
     }
     mf_device_publish();
+    mf_fresh_commit();
     g_fabric_pending = true; g_pending_seq = g_e.submit_seq;
     g_pending_arena  = g_arena & 1u;
     int n = g_e.cmd_count;
@@ -4609,6 +4654,7 @@ extern "C" void RasterBackend_MFGPU_TestTraceReset(void) {
 extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void) { return g_upload_count; }
 // FO Task 3 host hook: BLT_OP_STAGE emits since reinit (proves stage-once-per-page).
 extern "C" uint32_t RasterBackend_MFGPU_TestStageCount(void) { return g_stage_count; }
+extern "C" uint32_t RasterBackend_MFGPU_TestUnstagedCount(void) { return g_unstaged_total; }
 // [in-flight-batch guard] host-test hooks: force the "fabric still busy" predicate
 // (-1 = ask for real) and read the dropped-frame tally.
 extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy) {
