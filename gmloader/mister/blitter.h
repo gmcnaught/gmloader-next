@@ -85,7 +85,15 @@ GLuint Blitter_AppSurfaceFBO(void);
 GLuint Blitter_AppSurfaceTex(void);
 
 void Blitter_OnUseProgram(GLuint program);
+// [strip the in-game CRT shader] Source text goes past on the way to GL so the
+// CRT shader can be recognised, and the attach call maps it onto a program id.
+void Blitter_OnShaderSource(GLuint shader, const char *src, unsigned long len);
+void Blitter_OnAttachShader(GLuint program, GLuint shader);
 void Blitter_OnGetUniformLocation(GLuint program, const char *name, GLint loc);
+// [alpha-test threshold] The scalar uniforms the alpha test rides on:
+// gm_AlphaRefValue (float) and gm_AlphaTestEnabled (bool -> glUniform1i).
+void Blitter_OnUniform1f(GLint loc, float v);
+void Blitter_OnUniform1i(GLint loc, int v);
 void Blitter_OnUniformMatrix4fv(GLint location, GLsizei count, const GLfloat *value);  // capture matrices
 // glBlendFunc / glBlendFuncSeparate (RGB factors) and glEnable/glDisable(GL_BLEND).
 // Recorded even while the blitter is disabled; GL_ZERO is a valid factor.
