@@ -3602,7 +3602,12 @@ static void mf_key_trace(uint32_t off, int tw, int th, float min_a, bool colorke
     }
     e->last_ck = ck;
 }
+// Keyed COPY draws below the old 254/255 vertex-alpha gate: the only draws whose
+// blend 67f1d20 changed (COLORKEY now, COPY before). Zero on a game means the
+// rule is inert there.
+static uint32_t g_key_copy_lowa_total = 0;
 static void mf_key_census(void) {
+    fprintf(stderr, "MFKEYCOPY lowa_total=%u\n", g_key_copy_lowa_total);
     for (int i = 0; i < g_keystat_n; i++) {
         MfKeyStat &e = g_keystat[i];
         fprintf(stderr, "MFKEYSTAT f=%lu off=%08X %dx%d colorkey=%u fallback=%u "
@@ -3727,6 +3732,7 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
     } else if (has_key && (bl == RB_NONE || min_vtx_a * 255.0f >= 254.0f)) {
         blend_mode = BLT_BLEND_COLORKEY;
         colorkey = MF_COLORKEY;
+        if (min_vtx_a * 255.0f < 254.0f) g_key_copy_lowa_total++;
         mf_key_trace(tex.off, tw, th, min_vtx_a, /*colorkeyed=*/true, has_key, verts, nverts, nt);
     } else {
         mf_key_trace(tex.off, tw, th, min_vtx_a, /*colorkeyed=*/false, has_key, verts, nverts, nt);
