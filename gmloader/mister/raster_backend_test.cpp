@@ -4306,12 +4306,54 @@ static int case_palpha_duplicate_not_elided(void) {
     return 1;
 }
 
+// [default-surface Y flip, 820e39b] Draws that reach fbo 0 directly are built in
+// GL's bottom-origin Y (blitter.cpp) and flipped to the fabric's top origin in
+// mf_draw. The rest of this suite compares the fabric against the SW rasterizer,
+// which never flips, so main() runs it with the flip off; this case checks the
+// flip itself: a quad at rows [10,26) must land at rows [BH-26,BH-10) and nowhere else.
+static int case_defsurf_yflip(void) {
+    static uint16_t fb_off[BW*BH], fb_on[BW*BH];
+    uint16_t *fbs[2] = { fb_off, fb_on };
+    for (int k = 0; k < 2; k++) {
+        RasterBackend_MFGPU_TestReset();
+        setenv("GMLOADER_MFGPU_DEFSURF_YFLIP", k ? "1" : "0", 1); RasterBackend_MFGPU_TestEnvReset();
+        RSurface d; mf_test_make_default_surface(&d);
+        BVtx q[6];
+        backend_mfgpu.clear(&d, 0, 0, 0, 255);
+        mf_test_make_quad_at(q, 20.f, 10.f, 16.f, 16.f, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, mf_test_opaque_texture(), RB_NONE, 0.0f, 0x5801);
+        backend_mfgpu.present(&d);
+        RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbs[k]);
+    }
+    setenv("GMLOADER_MFGPU_DEFSURF_YFLIP", "0", 1); RasterBackend_MFGPU_TestEnvReset();
+    int lit = 0;
+    for (int y = 0; y < BH; y++) for (int x = 0; x < BW; x++) {
+        if (fb_off[y*BW + x]) lit++;
+        if (fb_on[(BH-1-y)*BW + x] != fb_off[y*BW + x]) {
+            printf("  FAIL defsurf-yflip  flip-on (%d,%d)=0x%04X is not flip-off (%d,%d)=0x%04X mirrored\n",
+                   x, BH-1-y, fb_on[(BH-1-y)*BW + x], x, y, fb_off[y*BW + x]);
+            return 0;
+        }
+    }
+    if (lit != 16*16 || !fb_off[10*BW + 20] || !fb_on[(BH-11)*BW + 20]) {
+        printf("  FAIL defsurf-yflip  lit=%d (want 256)\n", lit);
+        return 0;
+    }
+    printf("  OK   defsurf-yflip  fbo-0 quad at rows 10..25 lands at rows %d..%d with the flip on\n", BH-26, BH-11);
+    return 1;
+}
+
 int main(void){
     int ok = 1;
+    // The SW rasterizer this suite compares against has no default-surface Y flip
+    // (production default 1, 820e39b); case_defsurf_yflip covers it separately.
+    setenv("GMLOADER_MFGPU_DEFSURF_YFLIP", "0", 1);
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
     else printf("raster_backend sw-equivalence OK\n");
     if (!case_clear_parity()) { printf("FAIL mfgpu-clear-parity\n"); ok = 0; }
     else printf("raster_backend mfgpu-clear-parity OK\n");
+    if (!case_defsurf_yflip()) { printf("FAIL mfgpu-defsurf-yflip\n"); ok = 0; }
+    else printf("raster_backend mfgpu-defsurf-yflip OK\n");
     if (!battery()) { printf("FAIL mfgpu-trilist-battery\n"); ok = 0; }
     else printf("raster_backend mfgpu-trilist-battery OK\n");
     if (!case_large_page()) { printf("FAIL mfgpu-cache-large-page\n"); ok = 0; }

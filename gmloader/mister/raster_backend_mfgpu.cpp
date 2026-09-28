@@ -4049,11 +4049,12 @@ static int mf_yflip_appsurf(void) {
     return v;
 }
 
+// File-scope so RasterBackend_MFGPU_TestEnvReset can re-read the env.
+static int g_defsurf_yflip_v = -1;
 static int mf_defsurf_yflip(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("GMLOADER_MFGPU_DEFSURF_YFLIP");
-                 v = (e && *e) ? atoi(e) : 1; }
-    return v;
+    if (g_defsurf_yflip_v < 0) { const char *e = getenv("GMLOADER_MFGPU_DEFSURF_YFLIP");
+                                 g_defsurf_yflip_v = (e && *e) ? atoi(e) : 1; }
+    return g_defsurf_yflip_v;
 }
 
 static void mf_draw(RSurface *d, const BVtx *v, int triCount,
@@ -5213,7 +5214,8 @@ extern "C" int RasterBackend_MFGPU_TestFillPrecedesTrilist(void) {
 // [W3 batching] GMLOADER_MFGPU_BATCH_TRILIST joins it for the same reason: an
 // A/B case that flips the knob mid-binary needs the cached read cleared.
 extern "C" void RasterBackend_MFGPU_TestEnvReset(void) { g_defer_clear_v = -1; g_batch_v = -1; g_occlude_v = -1; g_ps_v = -1;
-                                                        g_sparse_v = -1; g_transpose_v = -1; g_pa_v = -1; }
+                                                        g_sparse_v = -1; g_transpose_v = -1; g_pa_v = -1;
+                                                        g_defsurf_yflip_v = -1; }
 // [TRILIST PALPHA] host-test hooks: force C_STATUS bit3 (as TestSetPresentSurfCap does
 // bit2), read the last frame's PALPHA accounting and the ARGB4444 upload count, and
 // reach the pure staging helpers directly.
