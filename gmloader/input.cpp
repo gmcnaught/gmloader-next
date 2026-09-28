@@ -14,6 +14,7 @@
 #include "mister/joy_ddr_reader.h"
 #include "mister/mister_joy_shm.h"
 #include "mister/dev_testing_mode.h"
+#include "mister/joy_keymap.h"
 #endif
 
 int app_in_focus = 0;
@@ -370,11 +371,40 @@ int update_inputs(SDL_Window *win)
         //     (explicit opt-in; wins when a producer is running)
         //   - joy-ddr: the OpenBOR-contract words the FPGA core writes into
         //     the native-video DDR region each frame (the default path)
+        // [joy keymap] GMLOADER_JOY_KEYMAP: player 1's mask drives the KEYBOARD and
+        // player 1's gamepad is hidden from the game (see mister/joy_keymap.h).
+        static JoyKeymap s_keymap; static int s_keymap_on = -1;
+        if (s_keymap_on < 0) {
+            s_keymap_on = joykey_parse(&s_keymap, getenv("GMLOADER_JOY_KEYMAP")) > 0;
+            const char *e = getenv("GMLOADER_JOY_KEYMAP");
+            if (e && *e) fprintf(stderr, "JOYKEYMAP %s (%d pairs): %s\n",
+                                 s_keymap_on ? "on" : "INVALID, off", s_keymap.n, e);
+        }
         for (int p = 0; p < MALDITA_JOY_MAX_PLAYERS; p++) {
             uint32_t mask = (g_joyshm_ready == 1) ? JoyShm_ReadMask(p)
                                                   : JoyDdr_ReadMask(p);
             if (p == 0)
                 DevTestingMode_Step(&mask);
+            if (p == 0 && s_keymap_on) {
+                joykey_step(&s_keymap, mask, [](int k, int down) {
+                    SDL_Keycode kc = SDLK_UNKNOWN;
+                    switch (k) {
+                    case JK_UP: kc = SDLK_UP; break;       case JK_DOWN: kc = SDLK_DOWN; break;
+                    case JK_LEFT: kc = SDLK_LEFT; break;   case JK_RIGHT: kc = SDLK_RIGHT; break;
+                    case JK_ESC: kc = SDLK_ESCAPE; break;  case JK_ENTER: kc = SDLK_RETURN; break;
+                    case JK_SPACE: kc = SDLK_SPACE; break; case JK_TAB: kc = SDLK_TAB; break;
+                    case JK_BACKSPACE: kc = SDLK_BACKSPACE; break;
+                    case JK_SHIFT: kc = SDLK_LSHIFT; break; case JK_CTRL: kc = SDLK_LCTRL; break;
+                    case JK_ALT: kc = SDLK_LALT; break;
+                    default: if (k >= JK_CHAR_BASE) kc = (SDL_Keycode)(k - JK_CHAR_BASE); break;
+                    }
+                    if (kc != SDLK_UNKNOWN) keyboard_set_key(kc, down ? SDL_PRESSED : SDL_RELEASED);
+                });
+                yoyo_gamepads[p].is_available = 0;
+                for (int j = 0; j < 16; j++) yoyo_gamepads[p].buttons[j] = 0.0;
+                for (int a = 0; a < 4; a++) yoyo_gamepads[p].axis[a] = 0.0;
+                continue;
+            }
             unsigned char raw[16];
             JoyShm_MaskToButtons(mask, raw);
 
