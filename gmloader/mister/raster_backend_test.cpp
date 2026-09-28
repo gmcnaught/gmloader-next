@@ -50,6 +50,7 @@ extern "C" void RasterBackend_MFGPU_SetAppSurface(uint32_t fbo, uint32_t tex);
 // Task 2: cache introspection/reset hooks (host-test-only, not part of the vtable).
 extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void);
 extern "C" uint32_t RasterBackend_MFGPU_TestStageCount(void);   // FO Task 3
+extern "C" uint32_t RasterBackend_MFGPU_TestUnstagedCount(void);   // [unstage on drop]
 extern "C" void RasterBackend_MFGPU_TestReinit(uint32_t tex_heap_bytes);
 // in-flight-batch guard: force the "is the fabric still chewing on the last submit?"
 // predicate (-1 = ask for real; on a host build the real answer is always "no"), and
@@ -1496,7 +1497,8 @@ static int case_inflight_drop(void) {
     // frame B: the fabric has not acked -> must be refused at the publish barrier
     RasterBackend_MFGPU_TestSetFabricBusy(1);
     backend_mfgpu.clear(&s_mf, 0,0,0,255);
-    backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, next_key());
+    const uint32_t key_blue = next_key();   // frames B and C draw the SAME texture identity
+    backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, key_blue);
     backend_mfgpu.present(&s_mf);
     static uint16_t fbB[BW*BH];
     RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbB);
@@ -1527,11 +1529,12 @@ static int case_inflight_drop(void) {
     }
 
     const uint32_t st_dropped = RasterBackend_MFGPU_TestStageCount() - st_after_A;
+    const uint32_t st_after_B = RasterBackend_MFGPU_TestStageCount();
 
     // frame C: fabric acked -> normal service resumes and the BLUE triangle lands
     RasterBackend_MFGPU_TestSetFabricBusy(0);
     backend_mfgpu.clear(&s_mf, 0,0,0,255);
-    backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, next_key());
+    backend_mfgpu.draw(&s_mf, v, 1, &t_blue, RB_NONE, 0.f, key_blue);
     backend_mfgpu.present(&s_mf);
     static uint16_t fbC[BW*BH];
     RasterBackend_MFGPU_TestCopyFB565(BW, BH, fbC);
@@ -1542,6 +1545,15 @@ static int case_inflight_drop(void) {
     if (RasterBackend_MFGPU_TestDropCount() != dr_after_A + 1) {
         printf("  FAIL inflight-drop  frame C was dropped too (drop_count=%u)\n",
                RasterBackend_MFGPU_TestDropCount());
+        return 0;
+    }
+    // [unstage on drop] frame B's STAGE for the blue page died with frame B's ring. The
+    // oracle cannot see that (blt_execute no-ops OP_STAGE and reads the heap directly), so
+    // assert the bookkeeping: frame C must RE-STAGE the page instead of trusting a cache hit
+    // on a page the fabric never received (device: stripes/speckle, 2026-09-27).
+    if (st_dropped >= 1 && RasterBackend_MFGPU_TestStageCount() == st_after_B) {
+        printf("  FAIL inflight-drop  frame C reused a page whose STAGE was dropped with frame B "
+               "(no re-stage; unstaged=%u)\n", RasterBackend_MFGPU_TestUnstagedCount());
         return 0;
     }
     RasterBackend_MFGPU_TestSetFabricBusy(-1);
@@ -3970,6 +3982,330 @@ static void test_publish_delay_spins(void) {
     unsetenv("GMLOADER_MFGPU_PUBLISH_DELAY_US");
 }
 
+// ── [TRILIST PALPHA] per-texel alpha ─────────────────────────────────────────
+extern "C" void     RasterBackend_MFGPU_TestSetPalphaCap(int on);
+extern "C" uint32_t RasterBackend_MFGPU_TestPalphaGroups(void);
+extern "C" double   RasterBackend_MFGPU_TestPalphaPixels(void);
+extern "C" uint32_t RasterBackend_MFGPU_TestPalphaStaged(void);
+extern "C" int      RasterBackend_MFGPU_TestRingBytes(uint8_t *out, int cap);
+
+// 16x16, left half white / right half pure red (both exact in ARGB4444), alpha
+// ramping 0..255 across the whole page: soft edges, holes and opaque texels.
+static void pa_make_ramp(uint8_t *tex, int r0, int g0, int b0, int r1, int g1, int b1) {
+    for (int y = 0; y < 16; y++) for (int x = 0; x < 16; x++) {
+        uint8_t *p = &tex[(y * 16 + x) * 4];
+        const bool left = x < 8;
+        p[0] = (uint8_t)(left ? r0 : r1); p[1] = (uint8_t)(left ? g0 : g1); p[2] = (uint8_t)(left ? b0 : b1);
+        p[3] = (uint8_t)(y * 16 + x);
+    }
+}
+static const RTexture *pa_tex_soft(void) {
+    static uint8_t tex[16*16*4]; static bool made = false;
+    if (!made) { made = true; pa_make_ramp(tex, 255, 255, 255, 255, 0, 0); }
+    static RTexture t = { tex, 16, 16, 1, 1, /*RTEX_RGBA8888*/0, 0 };
+    return &t;
+}
+// Same alpha ramp, colours ARGB4444 cannot hold (r = 0x08 -> R5 = 1 -> r4 = 0): lossy.
+static const RTexture *pa_tex_lossy(void) {
+    static uint8_t tex[16*16*4]; static bool made = false;
+    if (!made) { made = true; pa_make_ramp(tex, 0x08, 0x44, 0x88, 0x98, 0x28, 0x18); }
+    static RTexture t = { tex, 16, 16, 1, 1, /*RTEX_RGBA8888*/0, 0 };
+    return &t;
+}
+// Hard-edged cutout: white, alpha checker 0/255.
+static const RTexture *pa_tex_hard(void) {
+    static uint8_t tex[16*16*4]; static bool made = false;
+    if (!made) { made = true;
+        for (int i = 0; i < 256; i++) { tex[i*4] = tex[i*4+1] = tex[i*4+2] = 255;
+                                        tex[i*4+3] = (((i & 15) + (i >> 4)) & 1) ? 255 : 0; } }
+    static RTexture t = { tex, 16, 16, 1, 1, /*RTEX_RGBA8888*/0, 0 };
+    return &t;
+}
+static void pa_set(int knob, int cap) {
+    setenv("GMLOADER_MFGPU_PALPHA", knob ? "1" : "0", 1);
+    RasterBackend_MFGPU_TestEnvReset();
+    RasterBackend_MFGPU_TestSetPalphaCap(cap);
+}
+static void pa_unset(void) {
+    unsetenv("GMLOADER_MFGPU_PALPHA");
+    RasterBackend_MFGPU_TestEnvReset();
+    RasterBackend_MFGPU_TestSetPalphaCap(0);
+}
+// Count TRILIST commands in `ring` with PALPHA / an ARGB4444 page.
+static void pa_scan_ring(const uint8_t *ring, int n, int *palpha, int *argb4444) {
+    *palpha = 0; *argb4444 = 0;
+    for (int off = 0; off + BLT_CMD_BYTES <= n; off += BLT_CMD_BYTES) {
+        blt_cmd_t c; blt_unpack_cmd(ring + off, &c);
+        if (c.opcode != BLT_OP_TRILIST) continue;
+        if (c.blend_mode == BLT_BLEND_PALPHA) (*palpha)++;
+        if (c.format == BLT_FMT_ARGB4444) (*argb4444)++;
+    }
+}
+static const uint8_t PA_BG_R = 40, PA_BG_G = 80, PA_BG_B = 120;
+// Expected 565 pixel for one texel drawn 1:1 over the background by a PALPHA draw with
+// vertex alpha `va` (0..255), as straight float source-over. The staged alpha is
+// A4*17 (A4 = round(a*15/255)); colour is the texel's RGB565 (exact in 4444 here).
+static void pa_expect(const uint8_t *p, int va, double out[3]) {
+    const int a4 = (int)(p[3] * 15.0 / 255.0 + 0.5);
+    const double al = (a4 * 17) / 255.0 * (va / 255.0);
+    const double s[3] = { (double)(p[0] >> 3), (double)(p[1] >> 2), (double)(p[2] >> 3) };
+    const double d[3] = { (double)(PA_BG_R >> 3), (double)(PA_BG_G >> 2), (double)(PA_BG_B >> 3) };
+    for (int c = 0; c < 3; c++) out[c] = a4 ? s[c] * al + d[c] * (1.0 - al) : d[c];
+}
+static int pa_max_err(uint16_t got, const double want[3]) {
+    const int g[3] = { (got >> 11) & 0x1F, (got >> 5) & 0x3F, got & 0x1F };
+    int m = 0;
+    // Error in LSBs, rounded UP: 1 means |got - want| <= 1.0 in every channel.
+    for (int c = 0; c < 3; c++) { const int e = (int)ceil(fabs(g[c] - want[c]) - 1e-9); if (e > m) m = e; }
+    return m;
+}
+// One frame: background cleared, then each (tex, vertex alpha, blend) quad drawn 16x16 at
+// (x, y). Returns the frame's PALPHA group count; fills fb and the ring.
+struct PaQuad { const RTexture *t; float a; RBlend bl; float x, y; uint32_t key; };
+static uint32_t pa_render(const PaQuad *qs, int nq, uint16_t *fb, uint8_t *ring, int *ring_n) {
+    RasterBackend_MFGPU_TestReset();
+    RSurface d; mf_test_make_default_surface(&d);
+    backend_mfgpu.clear(&d, PA_BG_R, PA_BG_G, PA_BG_B, 255);
+    for (int i = 0; i < nq; i++) {
+        BVtx q[6]; mf_test_make_quad_at(q, qs[i].x, qs[i].y, 16.f, 16.f, qs[i].a);
+        backend_mfgpu.draw(&d, q, 2, qs[i].t, qs[i].bl, 0.0f, qs[i].key);
+    }
+    backend_mfgpu.present(&d);
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb);
+    if (ring) *ring_n = RasterBackend_MFGPU_TestRingBytes(ring, 1 << 16);
+    return RasterBackend_MFGPU_TestPalphaGroups();
+}
+// Compare the 16x16 block at (x0, y0) against pa_expect; returns the max channel error.
+static int pa_block_err(const uint16_t *fb, const RTexture *t, int x0, int y0, int va) {
+    int m = 0;
+    for (int j = 0; j < 16; j++) for (int i = 0; i < 16; i++) {
+        double w[3]; pa_expect(t->rgba + (j * 16 + i) * 4, va, w);
+        int e = pa_max_err(fb[(y0 + j) * BW + x0 + i], w);
+        if (e > m) m = e;
+    }
+    return m;
+}
+
+// End to end: the emitted stream, executed by the reference model, blends every texel
+// at texel alpha x vertex alpha (within ±1 LSB of a float oracle), with PALPHA and an
+// ARGB4444 page in the ring.
+static int case_palpha_end_to_end(void) {
+    static uint16_t fb[BW*BH]; static uint8_t ring[1 << 16]; int rn = 0;
+    pa_set(1, 1);
+    const PaQuad qs[2] = { { pa_tex_soft(), 1.0f, RB_ALPHA, 40.f, 30.f, 0x5101 },
+                           { pa_tex_soft(), 0.5f, RB_ALPHA, 100.f, 30.f, 0x5101 } };
+    uint32_t groups = pa_render(qs, 2, fb, ring, &rn);
+    double px = RasterBackend_MFGPU_TestPalphaPixels();
+    pa_unset();
+    int np, n4; pa_scan_ring(ring, rn, &np, &n4);
+    int e0 = pa_block_err(fb, pa_tex_soft(), 40, 30, 255);
+    int e1 = pa_block_err(fb, pa_tex_soft(), 100, 30, 128);
+    // Outside both quads the background is untouched.
+    const uint16_t bg = (uint16_t)(((PA_BG_R >> 3) << 11) | ((PA_BG_G >> 2) << 5) | (PA_BG_B >> 3));
+    bool bg_ok = fb[10 * BW + 10] == bg && fb[100 * BW + 200] == bg;
+    if (groups != 2 || np < 1 || n4 < 1 || e0 > 1 || e1 > 1 || !bg_ok || px != 512.0) {
+        printf("  FAIL palpha-e2e  groups=%u palpha_cmds=%d argb4444_cmds=%d err(va255)=%d err(va128)=%d bg=%d px=%.0f\n",
+               groups, np, n4, e0, e1, bg_ok, px);
+        return 0;
+    }
+    printf("  OK   palpha-e2e  2 PALPHA groups, 512 px, max err %d/%d LSB vs float oracle\n", e0, e1);
+    return 1;
+}
+
+// Knob off or capability off: the ring and the image are byte-identical to each other
+// (both are the pre-PALPHA path) and carry no PALPHA / ARGB4444.
+static int case_palpha_gated_off_is_unchanged(void) {
+    static uint16_t fb[4][BW*BH]; static uint8_t ring[4][1 << 16]; int rn[4];
+    const PaQuad qs[5] = { { pa_tex_soft(),  1.0f, RB_ALPHA, 10.f, 10.f, 0x5201 },
+                           { pa_tex_soft(),  0.5f, RB_ALPHA, 40.f, 10.f, 0x5201 },
+                           { pa_tex_hard(),  0.5f, RB_ALPHA, 70.f, 10.f, 0x5202 },
+                           { pa_tex_lossy(), 1.0f, RB_ALPHA, 100.f, 10.f, 0x5203 },
+                           { pa_tex_soft(),  1.0f, RB_NONE, 130.f, 10.f, 0x5201 } };
+    const int knob[4] = { 0, 1, 0, 1 }, cap[4] = { 1, 0, 0, 1 };
+    uint32_t groups[4];
+    for (int k = 0; k < 4; k++) { pa_set(knob[k], cap[k]); groups[k] = pa_render(qs, 5, fb[k], ring[k], &rn[k]); }
+    pa_unset();
+    int np[4], n4[4];
+    for (int k = 0; k < 4; k++) pa_scan_ring(ring[k], rn[k], &np[k], &n4[k]);
+    bool same = rn[0] == rn[1] && rn[0] == rn[2] && memcmp(ring[0], ring[1], rn[0]) == 0 &&
+                memcmp(ring[0], ring[2], rn[0]) == 0 && memcmp(fb[0], fb[1], sizeof fb[0]) == 0 &&
+                memcmp(fb[0], fb[2], sizeof fb[0]) == 0;
+    bool none = np[0] + np[1] + np[2] + n4[0] + n4[1] + n4[2] == 0 && groups[0] + groups[1] + groups[2] == 0;
+    bool on_differs = np[3] > 0 && memcmp(fb[0], fb[3], sizeof fb[0]) != 0;
+    if (!same || !none || !on_differs) {
+        printf("  FAIL palpha-gated-off  same=%d none=%d on_differs=%d (palpha %d/%d/%d/%d argb4444 %d/%d/%d/%d)\n",
+               same, none, on_differs, np[0], np[1], np[2], np[3], n4[0], n4[1], n4[2], n4[3]);
+        return 0;
+    }
+    printf("  OK   palpha-gated-off  knob-off / cap-off streams byte-identical (%d bytes), no PALPHA; on differs\n", rn[0]);
+    return 1;
+}
+
+// A hard cutout: unfaded stays COLORKEY on RGB565; faded goes PALPHA (holes skip, no
+// sentinel magenta) instead of CONST_ALPHA.
+static int case_palpha_hard_cutout_faded_only(void) {
+    static uint16_t fb[BW*BH]; static uint8_t ring[1 << 16]; int rn = 0;
+    pa_set(1, 1);
+    const PaQuad unf[1] = { { pa_tex_hard(), 1.0f, RB_ALPHA, 40.f, 30.f, 0x5301 } };
+    uint32_t g_unf = pa_render(unf, 1, fb, ring, &rn);
+    int np0, n40; pa_scan_ring(ring, rn, &np0, &n40);
+    const PaQuad fad[1] = { { pa_tex_hard(), 0.5f, RB_ALPHA, 40.f, 30.f, 0x5301 } };
+    uint32_t g_fad = pa_render(fad, 1, fb, ring, &rn);
+    pa_unset();
+    int np1, n41; pa_scan_ring(ring, rn, &np1, &n41);
+    int err = pa_block_err(fb, pa_tex_hard(), 40, 30, 128);
+    if (g_unf != 0 || np0 != 0 || n40 != 0 || g_fad != 1 || np1 != 1 || n41 != 1 || err > 1) {
+        printf("  FAIL palpha-hard  unfaded groups=%u palpha=%d 4444=%d | faded groups=%u palpha=%d 4444=%d err=%d\n",
+               g_unf, np0, n40, g_fad, np1, n41, err);
+        return 0;
+    }
+    printf("  OK   palpha-hard  unfaded cutout stays RGB565/COLORKEY; faded cutout PALPHA, max err %d\n", err);
+    return 1;
+}
+
+// An UNFADED draw of a region whose colours ARGB4444 cannot hold stays RGB565, and
+// renders exactly as with PALPHA off.
+static int case_palpha_lossy_stays_rgb565(void) {
+    static uint16_t fb_on[BW*BH], fb_off[BW*BH]; static uint8_t ring[1 << 16]; int rn = 0;
+    const PaQuad qs[1] = { { pa_tex_lossy(), 1.0f, RB_ALPHA, 40.f, 30.f, 0x5401 } };
+    pa_set(0, 1); pa_render(qs, 1, fb_off, nullptr, nullptr);
+    pa_set(1, 1); uint32_t g = pa_render(qs, 1, fb_on, ring, &rn);
+    uint32_t staged = RasterBackend_MFGPU_TestPalphaStaged();
+    pa_unset();
+    int np, n4; pa_scan_ring(ring, rn, &np, &n4);
+    if (g != 0 || np != 0 || n4 != 0 || staged != 0 || memcmp(fb_on, fb_off, sizeof fb_on) != 0) {
+        printf("  FAIL palpha-lossy  groups=%u palpha=%d 4444=%d staged=%u identical=%d\n",
+               g, np, n4, staged, memcmp(fb_on, fb_off, sizeof fb_on) == 0);
+        return 0;
+    }
+    printf("  OK   palpha-lossy  lossy soft region stays RGB565, image unchanged\n");
+    return 1;
+}
+
+// A FADED draw of the same lossy region goes PALPHA. With PALPHA off it falls back to
+// CONST_ALPHA with no cutout and blends the colorkey sentinel (magenta) into the frame;
+// with it on the block matches the straight-alpha oracle within 4444's colour loss
+// (<= 1 LSB on R/B, <= 3 on G against the RGB565 source). EX's bck_check title band.
+static int case_palpha_lossy_faded(void) {
+    static uint16_t fb_on[BW*BH], fb_off[BW*BH]; static uint8_t ring[1 << 16]; int rn = 0;
+    const PaQuad qs[1] = { { pa_tex_lossy(), 0.5f, RB_ALPHA, 80.f, 30.f, 0x5401 } };
+    pa_set(0, 1); pa_render(qs, 1, fb_off, nullptr, nullptr);
+    pa_set(1, 1); pa_render(qs, 1, fb_on, ring, &rn);
+    pa_unset();
+    int np, n4; pa_scan_ring(ring, rn, &np, &n4);
+    const int va = (int)(0.5f * 255.0f + 0.5f);
+    const int e_off = pa_block_err(fb_off, pa_tex_lossy(), 80, 30, va);
+    const int e_on  = pa_block_err(fb_on,  pa_tex_lossy(), 80, 30, va);
+    if (np < 1 || n4 < 1 || e_on > 3 || e_off <= 8) {
+        printf("  FAIL palpha-lossy-faded  palpha=%d 4444=%d err off=%d on=%d\n", np, n4, e_off, e_on);
+        return 0;
+    }
+    printf("  OK   palpha-lossy-faded  faded lossy region: PALPHA, max err %d (was %d with PALPHA off)\n",
+           e_on, e_off);
+    return 1;
+}
+
+// The staged format is part of the cache key: the same texture rect drawn RB_NONE and
+// RB_ALPHA gets one RGB565 and one ARGB4444 page, each reused on the next frame, and
+// each draw samples its own.
+static int case_palpha_cache_key_separates_formats(void) {
+    static uint16_t fb[BW*BH]; static uint8_t ring[1 << 16];
+    pa_set(1, 1);
+    RasterBackend_MFGPU_TestReset();
+    RSurface d; mf_test_make_default_surface(&d);
+    uint32_t up[2]; int np[2], n4[2], ncmd565[2];
+    for (int f = 0; f < 2; f++) {
+        backend_mfgpu.clear(&d, PA_BG_R, PA_BG_G, PA_BG_B, 255);
+        BVtx q[6];
+        mf_test_make_quad_at(q, 40.f, 30.f, 16.f, 16.f, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, pa_tex_soft(), RB_NONE, 0.0f, 0x5501);
+        mf_test_make_quad_at(q, 80.f, 30.f, 16.f, 16.f, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, pa_tex_soft(), RB_ALPHA, 0.0f, 0x5501);
+        mf_test_make_quad_at(q, 120.f, 30.f, 16.f, 16.f, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, pa_tex_soft(), RB_NONE, 0.0f, 0x5501);
+        backend_mfgpu.present(&d);
+        up[f] = RasterBackend_MFGPU_TestUploadCount();
+        int rn = RasterBackend_MFGPU_TestRingBytes(ring, sizeof ring);
+        pa_scan_ring(ring, rn, &np[f], &n4[f]);
+        ncmd565[f] = 0;
+        for (int off = 0; off + BLT_CMD_BYTES <= rn; off += BLT_CMD_BYTES) {
+            blt_cmd_t c; blt_unpack_cmd(ring + off, &c);
+            if (c.opcode == BLT_OP_TRILIST && c.format == BLT_FMT_RGB565) ncmd565[f]++;
+        }
+    }
+    uint32_t staged = RasterBackend_MFGPU_TestPalphaStaged();
+    RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb);
+    pa_unset();
+    // RB_NONE copies every texel's colour (holes as the key colour -- COPY does not cut).
+    // The two RB_NONE quads must match each other, and not the PALPHA quad.
+    bool copies_match = true, palpha_differs = false;
+    for (int j = 0; j < 16; j++) for (int i = 0; i < 16; i++) {
+        if (fb[(30 + j) * BW + 40 + i] != fb[(30 + j) * BW + 120 + i]) copies_match = false;
+        if (fb[(30 + j) * BW + 40 + i] != fb[(30 + j) * BW + 80 + i]) palpha_differs = true;
+    }
+    int err = pa_block_err(fb, pa_tex_soft(), 80, 30, 255);
+    if (up[0] != 2 || up[1] != 2 || staged != 1 || np[0] != 1 || np[1] != 1 || n4[1] != 1 ||
+        ncmd565[1] != 2 || !copies_match || !palpha_differs || err > 1) {
+        printf("  FAIL palpha-cache-key  uploads=%u/%u staged4444=%u palpha=%d/%d 4444=%d/%d rgb565 cmds=%d/%d "
+               "copies_match=%d palpha_differs=%d err=%d\n", up[0], up[1], staged, np[0], np[1], n4[0], n4[1],
+               ncmd565[0], ncmd565[1], copies_match, palpha_differs, err);
+        return 0;
+    }
+    printf("  OK   palpha-cache-key  one RGB565 + one ARGB4444 page, both reused next frame\n");
+    return 1;
+}
+
+// A PALPHA draw is never an occluder: an opaque background under a full-screen PALPHA
+// quad keeps all its triangles. Control: the same scene with an opaque texture culls it.
+static int case_palpha_never_occludes(void) {
+    static uint16_t fb[BW*BH];
+    setenv("GMLOADER_MFGPU_OCCLUDE", "1", 1);
+    uint32_t culled[2], groups[2];
+    for (int k = 0; k < 2; k++) {
+        pa_set(1, 1);
+        RasterBackend_MFGPU_TestReset();
+        RSurface d; mf_test_make_default_surface(&d);
+        BVtx q[6];
+        mf_test_make_quad_at(q, 0.f, 0.f, (float)BW, (float)BH, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, mf_test_occ_bg(), RB_NONE, 0.0f, 0x5601);
+        mf_test_make_quad_at(q, 0.f, 0.f, (float)BW, (float)BH, 1.0f);
+        backend_mfgpu.draw(&d, q, 2, k == 0 ? pa_tex_soft() : mf_test_opaque_texture(), RB_ALPHA, 0.0f, 0x5602 + k);
+        backend_mfgpu.present(&d);
+        RasterBackend_MFGPU_TestCopyFB565(BW, BH, fb);
+        culled[k] = RasterBackend_MFGPU_TestOccCulled();
+        groups[k] = RasterBackend_MFGPU_TestPalphaGroups();
+    }
+    unsetenv("GMLOADER_MFGPU_OCCLUDE");
+    pa_unset();
+    if (groups[0] != 1 || culled[0] != 0 || culled[1] != 2) {
+        printf("  FAIL palpha-occlude  palpha groups=%u culled under PALPHA=%u (want 0) under opaque=%u (want 2)\n",
+               groups[0], culled[0], culled[1]);
+        return 0;
+    }
+    printf("  OK   palpha-occlude  PALPHA quad culls nothing; opaque control culls 2\n");
+    return 1;
+}
+
+// Duplicate-draw elision must not fire on PALPHA (a repeat blends the soft texels twice).
+static int case_palpha_duplicate_not_elided(void) {
+    static uint16_t fb1[BW*BH], fb2[BW*BH];
+    const PaQuad one[1] = { { pa_tex_soft(), 1.0f, RB_ALPHA, 40.f, 30.f, 0x5701 } };
+    const PaQuad two[2] = { one[0], one[0] };
+    pa_set(1, 1);
+    pa_render(one, 1, fb1, nullptr, nullptr);
+    const uint32_t skipped0 = RasterBackend_MFGPU_TestDupSkipped();
+    uint32_t g = pa_render(two, 2, fb2, nullptr, nullptr);
+    const uint32_t skipped = RasterBackend_MFGPU_TestDupSkipped() - skipped0;
+    pa_unset();
+    if (g != 2 || skipped != 0 || memcmp(fb1, fb2, sizeof fb1) == 0) {
+        printf("  FAIL palpha-dup  groups=%u elided=%u images_differ=%d\n", g, skipped,
+               memcmp(fb1, fb2, sizeof fb1) != 0);
+        return 0;
+    }
+    printf("  OK   palpha-dup  identical PALPHA draws both emitted\n");
+    return 1;
+}
+
 int main(void){
     int ok = 1;
     if (!one_case()) { printf("FAIL sw-equivalence\n"); ok = 0; }
@@ -4077,6 +4413,15 @@ int main(void){
     if (!case_sparse_keyed_quads_are_bit_identical()) { printf("FAIL mfgpu-sparse-identical\n"); ok = 0; }
     if (!case_transposed_staging_is_bit_identical()) { printf("FAIL mfgpu-transpose-identical\n"); ok = 0; }
     if (!case_present_surf()) { printf("FAIL mfgpu-present-surf\n"); ok = 0; }
+    // [TRILIST PALPHA]
+    if (!case_palpha_end_to_end()) { printf("FAIL mfgpu-palpha-e2e\n"); ok = 0; }
+    if (!case_palpha_gated_off_is_unchanged()) { printf("FAIL mfgpu-palpha-gated-off\n"); ok = 0; }
+    if (!case_palpha_hard_cutout_faded_only()) { printf("FAIL mfgpu-palpha-hard\n"); ok = 0; }
+    if (!case_palpha_lossy_stays_rgb565()) { printf("FAIL mfgpu-palpha-lossy\n"); ok = 0; }
+    if (!case_palpha_lossy_faded()) { printf("FAIL mfgpu-palpha-lossy-faded\n"); ok = 0; }
+    if (!case_palpha_cache_key_separates_formats()) { printf("FAIL mfgpu-palpha-cache-key\n"); ok = 0; }
+    if (!case_palpha_never_occludes()) { printf("FAIL mfgpu-palpha-occlude\n"); ok = 0; }
+    if (!case_palpha_duplicate_not_elided()) { printf("FAIL mfgpu-palpha-dup\n"); ok = 0; }
     else printf("raster_backend mfgpu-batch-identical OK\n");
     if (!case_batch_preserves_deferred_clear_drop()) { printf("FAIL mfgpu-batch-vs-defer-clear\n"); ok = 0; }
     else printf("raster_backend mfgpu-batch-vs-defer-clear OK\n");

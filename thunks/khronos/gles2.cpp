@@ -91,12 +91,12 @@ static void GLBindFramebuffer_b(GLenum t, GLuint f) { glad_glBindFramebuffer(t, 
 static void GLFramebufferTexture2D_b(GLenum t, GLenum at, GLenum tt, GLuint tex, GLint lv) {
     glad_glFramebufferTexture2D(t, at, tt, tex, lv); Blitter_OnFramebufferTexture2D(at, tex);
 }
-static void GLBlendFunc_b(GLenum s, GLenum d) { glad_glBlendFunc(s, d); Blitter_OnBlendState(-1, s, d); }
+static void GLBlendFunc_b(GLenum s, GLenum d) { glad_glBlendFunc(s, d); Blitter_OnBlendFunc(s, d); }
 static void GLBlendFuncSeparate_b(GLenum sR, GLenum dR, GLenum sA, GLenum dA) {
-    glad_glBlendFuncSeparate(sR, dR, sA, dA); Blitter_OnBlendState(-1, sR, dR);
+    glad_glBlendFuncSeparate(sR, dR, sA, dA); Blitter_OnBlendFunc(sR, dR);
 }
-static void GLEnable_b(GLenum c) { glad_glEnable(c); if (c == GL_BLEND) Blitter_OnBlendState(1, 0, 0); }
-static void GLDisable_b(GLenum c) { glad_glDisable(c); if (c == GL_BLEND) Blitter_OnBlendState(0, 0, 0); }
+static void GLEnable_b(GLenum c) { glad_glEnable(c); if (c == GL_BLEND) Blitter_OnBlendEnable(1); }
+static void GLDisable_b(GLenum c) { glad_glDisable(c); if (c == GL_BLEND) Blitter_OnBlendEnable(0); }
 static void GLUniformMatrix4fv_b(GLint loc, GLsizei count, GLboolean tr, const GLfloat* v) {
     glad_glUniformMatrix4fv(loc, count, tr, v);
     Blitter_OnUniformMatrix4fv(loc, count, v);

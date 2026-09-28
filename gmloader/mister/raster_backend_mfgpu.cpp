@@ -42,7 +42,8 @@
 // The TRILIST rasterizer (refmodel/blt_tri.c) samples the texture page as
 // RGB565 (tex_nearest reads a raw 16-bit texel; the format byte is ignored) and
 // modulates it by the interpolated per-vertex color (blt_tint565). There is NO
-// per-texel alpha and NO BLT_BLEND_PALPHA case in a triangle list. So textures
+// per-texel alpha and NO BLT_BLEND_PALPHA case in a triangle list (superseded,
+// opt-in, by [TRILIST PALPHA] below; everything here stays the default path). So textures
 // are staged as RGB565 (blt_upload, not blt_upload_argb4444), an untextured draw
 // uses a 1x1 opaque-white page, and alpha compositing rides BLT_BLEND_CONST_ALPHA
 // with header alpha=255 (effective alpha = interpolated vtx.a). See
@@ -62,6 +63,16 @@
 // texture) can't combine colorkey + const-alpha in one TRILIST pass, so it
 // falls back to CONST_ALPHA (no cutout, see the comment at the call site);
 // real per-texel alpha is a future RTL item.
+//
+// ── [TRILIST PALPHA] PER-TEXEL ALPHA (GMLOADER_MFGPU_PALPHA, default 0) ───────
+// The reference model (3rdparty/mfgpu refmodel/blt_tri.c) now decodes a
+// BLT_FMT_ARGB4444 page for every TRILIST blend and implements BLT_BLEND_PALPHA
+// (texel alpha x vertex alpha x header alpha, A4==0 skips). The RBF advertises
+// it in C_STATUS bit3 (mf_pa_capable). With the knob on AND the bit set, an
+// RB_ALPHA draw stages its region as ARGB4444 and emits PALPHA iff the region
+// needs it and 4444 loses no colour (mf_pa_pick); every other draw is staged and
+// emitted exactly as described above. The staged format is part of the texture
+// cache key (MfTexEntry::fmt), so one region staged both ways never aliases.
 #include "raster_backend.h"
 #include "raster_backend_convert.h"
 #include "mf_vtx_clip.h"   // guard-band screen clip (int16 12.4 wrap)
@@ -203,8 +214,12 @@ static int           g_frame_no = 0;
 // key regardless of rect.
 // `tr`: the page holds the rect TRANSPOSED (page texel (x, y) = source texel (y, x)); see
 // mf_transpose_on. rw/rh are the SOURCE rect's size either way.
+// [TRILIST PALPHA] `fmt`: the staged texel format (BLT_FMT_RGB565 or BLT_FMT_ARGB4444) --
+// part of the key, so the same rect staged both ways is two entries. `pa_cls`: the rect's
+// MF_PA_* classification (mf_pa_classify), 0 = not yet classified; an RGB565 entry staged
+// for a non-PALPHA draw is classified lazily, the first time a PALPHA-eligible draw asks.
 struct MfTexEntry { uint32_t key; bool used; bool has_key; bool mask_only; blt_surface_ref_t ref; uint64_t lru;
-                    uint16_t rx, ry, rw, rh; bool tr; };
+                    uint16_t rx, ry, rw, rh; bool tr; uint8_t fmt; uint8_t pa_cls; };
 static MfTexEntry g_texcache[MF_TEX_CACHE_N];
 // [sparse keyed quads] Per-slot mf_sp_build map of the page, built at upload from the
 // staged texels (g_sp_ok[i] says whether slot i's map belongs to its CURRENT page; every
@@ -215,6 +230,12 @@ static bool     g_sp_ok[MF_TEX_CACHE_N];
 static blt_vtx_t g_sp_out[MF_MAX_VERTS];
 static uint32_t g_sp_quads_frame = 0, g_sp_rects_frame = 0, g_sp_empty_frame = 0;   // MFSUBMIT
 static uint32_t g_tr_quads_frame = 0;                                            // MFSUBMIT
+// [TRILIST PALPHA] per-frame accounting (reset in mf_frame_begin; read after present()):
+// PALPHA groups, triangles and covered pixels (clipped triangle area); and ARGB4444
+// page uploads since reinit.
+static uint32_t g_pa_groups_frame = 0, g_pa_tris_frame = 0;
+static double   g_pa_px_frame = 0.0;
+static uint32_t g_pa_staged_total = 0;
 static int g_sparse_v = -1;
 static int mf_sparse_on(void) {
     if (g_sparse_v < 0) {
@@ -323,6 +344,12 @@ static int mf_strip_crt(void) {
 // anyway -- alpha test discards the same pixels every time -- and the signature comparison
 // at the call site still requires the two draws to share the same ar, so a differing
 // threshold blocks elision there.
+//
+// [TRILIST PALPHA] Not the whole story once PALPHA is active: a fully-opaque-vertex RB_ALPHA
+// draw on a region with soft texels goes out as PALPHA, which composites (a repeat blends
+// the soft texels twice). The region's staged format is only known after staging, so
+// mf_draw additionally refuses elision for every staged-texture RB_ALPHA draw while
+// mf_pa_active() -- see the call site. The app-surface composite is never staged and keeps it.
 static bool mf_draw_is_idempotent(const BVtx *v, int nverts, RBlend bl) {
     if (bl != RB_NONE && bl != RB_ALPHA) return false;   // ADD/MULTIPLY accumulate
     for (int i = 0; i < nverts; i++) if (v[i].a < 0.999f) return false;   // per-vertex opacity
@@ -622,8 +649,9 @@ static const uint16_t MF_COLORKEY = 0xF81F;
 //                              with MF_COLORKEY, nudge it off by one green LSB
 //                              so an opaque texel can never be mistaken for the
 //                              key (out_has_key still only set by real holes).
-static inline uint16_t mf_texel565(const RTexture *t, int x, int y, bool *out_has_key) {
-    uint8_t r, g, b, a;
+// One RTexture texel as 8-bit r,g,b,a (RGBA4444 sources nibble-replicated).
+static inline void mf_src_rgba(const RTexture *t, int x, int y,
+                               uint8_t &r, uint8_t &g, uint8_t &b, uint8_t &a) {
     if (t->format == RTEX_RGBA4444) {
         const uint16_t *p16 = (const uint16_t *)t->rgba;
         uint16_t p = p16[(size_t)y * t->w + x];        // packed (R4<<12|G4<<8|B4<<4|A4)
@@ -636,6 +664,10 @@ static inline uint16_t mf_texel565(const RTexture *t, int x, int y, bool *out_ha
         const uint8_t *p = t->rgba + ((size_t)y * t->w + x) * 4;  // RTEX_RGBA8888
         r = p[0]; g = p[1]; b = p[2]; a = p[3];
     }
+}
+static inline uint16_t mf_texel565(const RTexture *t, int x, int y, bool *out_has_key) {
+    uint8_t r, g, b, a;
+    mf_src_rgba(t, x, y, r, g, b, a);
     if (a < 128) { *out_has_key = true; return MF_COLORKEY; }
     uint16_t result = mf_rgb565(r, g, b);
     if (result == MF_COLORKEY) result ^= 0x0020;   // opaque texel must never == the key
@@ -2041,6 +2073,7 @@ static void mf_init_once(void) {
 #endif
     for (int i = 0; i < MF_TEX_CACHE_N; i++) g_texcache[i].used = false;
     g_lru_clock = 0; g_upload_count = 0; g_stage_count = 0; g_lru_frame_floor = 0;
+    g_pa_staged_total = 0;   // [TRILIST PALPHA]
     g_evict_attempts = 0; g_cachefull_drops = 0;   // [Phase 1 B3] pressure + refusal witnesses
     g_frame_ovf_cause = MF_OVF_UNKNOWN;            // [Phase 1 B3] per-frame overflow cause
     g_lru_evict_floor = 0;                         // [Phase 1 B3] lagging floor
@@ -2287,6 +2320,8 @@ static bool mf_publish_barrier(void) {
     return true;
 }
 
+static void mf_fresh_commit(void);
+static void mf_unstage_fresh(const char *why);
 static void mf_frame_begin(void) {
     mf_init_once();
     // [in-flight-batch guard] Decide BEFORE blt_begin_frame: it is the call that would
@@ -2328,11 +2363,13 @@ static void mf_frame_begin(void) {
         // resolution point, and clearing the flag here would make it skip its await and
         // stomp a live control block.
     }
+    mf_fresh_commit();   // [unstage on drop] the previous frame was resolved at its end
     g_frame_dropped = false;
     g_frame_ovf_cause = MF_OVF_UNKNOWN;   // [Phase 1 B3] per-frame: reset before staging
     g_last_draw.valid = false;   // [duplicate-draw elimination] never span frames
     g_occ_n = 0; g_occ_full = false; g_occ_occluders_frame = 0;   // [occlusion cull] per frame
     g_sp_quads_frame = g_sp_rects_frame = g_sp_empty_frame = g_tr_quads_frame = 0;
+    g_pa_groups_frame = g_pa_tris_frame = 0; g_pa_px_frame = 0.0;   // [TRILIST PALPHA]
     g_ps_pending = false;   // [present-from-surface] never spans frames
     g_appsurf_presented = false; // [strip CRT] the present must re-land every frame
     // Snapshot the pin floor for this frame: any g_texcache entry touched
@@ -2452,6 +2489,39 @@ static void mf_clear(RSurface *d, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     blt_fill(&g_e, 0, 0, w, h, col);
 }
 
+// [unstage on drop] Texture pages uploaded AND staged while building the current
+// frame. Their BLT_OP_STAGE rides in this frame's ring, so if the frame is dropped
+// after it was built (publish barrier timeout, emitter overflow, shutdown) the
+// fabric never copies them into SDRAM -- yet the cache entry would stay, every
+// later draw would HIT it, and the fabric would sample whatever that SDRAM range
+// held before. Device-observed 2026-09-27 (.62/.81, Cursed Castilla EX title): a
+// 2.3 MB page uploaded in the frame that hit "publish barrier timed out" rendered
+// as diagonal colour stripes (COPY readback) / green-purple speckle (PALPHA) for as
+// long as it stayed cached. So: remember what this frame staged, forget it (and
+// free its heap) when the frame is dropped, commit it when the frame publishes.
+struct MfFreshStage { int slot; uint32_t off; };
+static MfFreshStage g_fresh[MF_TEX_CACHE_N];
+static int          g_fresh_n = 0;
+static uint32_t     g_unstaged_total = 0;   // entries evicted because their STAGE was dropped
+static void mf_fresh_commit(void) { g_fresh_n = 0; }
+static void mf_unstage_fresh(const char *why) {
+    int n = 0;
+    for (int i = 0; i < g_fresh_n; i++) {
+        const int s = g_fresh[i].slot;
+        if (s < 0 || s >= MF_TEX_CACHE_N) continue;
+        if (!g_texcache[s].used || g_texcache[s].ref.off != g_fresh[i].off) continue;
+        // Never published, so nothing in flight can read it: safe to free now.
+        blt_emitter_free(&g_e, g_texcache[s].ref.off, g_texcache[s].ref.size);
+        g_texcache[s].used = false;
+        g_sp_ok[s] = false;
+        n++;
+    }
+    g_fresh_n = 0;
+    g_unstaged_total += (uint32_t)n;
+    if (n) fprintf(stderr, "backend_mfgpu: %s - %d texture page(s) staged this frame "
+                   "evicted so they re-stage (%u total)\n", why, n, g_unstaged_total);
+}
+
 static bool evict_one_lru(void) {
     g_evict_attempts++;   // [Phase 1 B3] pressure witness: called, not necessarily succeeded
     // Pin-for-TWO-frames invariant: an entry with .lru > g_lru_evict_floor was hit or
@@ -2544,7 +2614,8 @@ static int mf_texdump_on(void) {
                  if (e && *e && v <= 0) v = 40; }
     return v;
 }
-static void mf_texdump(uint32_t key, int w, int h, int rx, int ry, const char *what) {
+static void mf_texdump(uint32_t key, int w, int h, int rx, int ry, const char *what,
+                       uint8_t fmt = BLT_FMT_RGB565) {
     static int dumped = 0;
     if (dumped >= mf_texdump_on()) return;
     if (w <= 0 || h <= 0) return;
@@ -2559,6 +2630,7 @@ static void mf_texdump(uint32_t key, int w, int h, int rx, int ry, const char *w
     for (int y = 0; y < h; y++)                    // row 0 first == page row 0
         for (int x = 0; x < w; x++) {
             uint16_t p = g_texscratch[(size_t)y * w + x];
+            if (fmt == BLT_FMT_ARGB4444) { unsigned a8; p = blt_argb4444_to_565(p, &a8); }
             uint8_t rgb[3] = { (uint8_t)(((p >> 11) & 0x1F) << 3),
                                (uint8_t)(((p >>  5) & 0x3F) << 2),
                                (uint8_t)(( p        & 0x1F) << 3) };
@@ -2573,13 +2645,22 @@ static void mf_texdump(uint32_t key, int w, int h, int rx, int ry, const char *w
 // (h wide, w tall).
 static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
                                              int rx, int ry, bool has_key, bool mask_only,
-                                             const char *what, bool tr = false) {
+                                             const char *what, bool tr = false,
+                                             uint8_t fmt = BLT_FMT_RGB565, uint8_t pa_cls = 0) {
     const int pw = tr ? h : w, ph = tr ? w : h;   // page dims as uploaded
-    if (mf_texdump_on()) mf_texdump(key, w, h, rx, ry, what);
+    if (mf_texdump_on()) mf_texdump(key, w, h, rx, ry, what, fmt);
     bool ov_before = g_e.overflow;                    // preserve any overflow already set this frame
-    blt_surface_ref_t ref = blt_upload(&g_e, g_texscratch, pw, ph, pw * 2);
+    // [TRILIST PALPHA] Same 16 bpp packing either way; only the handle's format differs,
+    // and the TRILIST header takes its format byte from the handle.
+    const bool a4444 = (fmt == BLT_FMT_ARGB4444);
+    blt_surface_ref_t ref = a4444 ? blt_upload_argb4444(&g_e, g_texscratch, pw, ph, pw * 2)
+                                  : blt_upload(&g_e, g_texscratch, pw, ph, pw * 2);
     int evicted = 0;
-    while (!ref.valid && evict_one_lru()) { evicted++; ref = blt_upload(&g_e, g_texscratch, pw, ph, pw * 2); }
+    while (!ref.valid && evict_one_lru()) {
+        evicted++;
+        ref = a4444 ? blt_upload_argb4444(&g_e, g_texscratch, pw, ph, pw * 2)
+                    : blt_upload(&g_e, g_texscratch, pw, ph, pw * 2);
+    }
     if (!ref.valid) {
         if (mf_heaplog_on()) {
             fprintf(stderr, "HEAPLOG STAGE FAIL %s key=%u rect=%d,%d %dx%d(%zu bytes) evicted=%d "
@@ -2591,6 +2672,7 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
     }
     g_e.overflow = ov_before;                         // our transient failed-then-succeeded uploads did NOT overflow the frame
     g_upload_count++;
+    if (a4444) g_pa_staged_total++;
     if (mf_heaplog_on())
         fprintf(stderr, "HEAPLOG upload %s key=%u rect=%d,%d %dx%d bytes=%u off=%u evicted=%d heap_used=%u/%u\n",
                 what, key, rx, ry, w, h, ref.size, ref.off, evicted, blt_alloc_used(&g_e.alloc), g_e.alloc.size);
@@ -2661,7 +2743,9 @@ static blt_surface_ref_t mf_upload_and_cache(uint32_t key, int w, int h,
     if (g_texcache[slot].used)
         blt_emitter_free(&g_e, g_texcache[slot].ref.off, g_texcache[slot].ref.size);
     g_texcache[slot] = MfTexEntry{ key, true, has_key, mask_only, ref, ++g_lru_clock,
-                                   (uint16_t)rx, (uint16_t)ry, (uint16_t)w, (uint16_t)h, tr };
+                                   (uint16_t)rx, (uint16_t)ry, (uint16_t)w, (uint16_t)h, tr,
+                                   fmt, pa_cls };
+    if (g_fresh_n < MF_TEX_CACHE_N) g_fresh[g_fresh_n++] = MfFreshStage{ slot, ref.off };   // [unstage on drop]
     // [sparse keyed quads] Only a keyed page big enough for a quad worth splitting.
     g_sp_ok[slot] = false;
     if (has_key && pw * ph >= MF_SP_MIN_PX) {
@@ -2803,31 +2887,147 @@ static void mf_stage_texels(const RTexture *t, int rx, int ry, int rw, int rh,
     *out_mask_only = mask_only;
 }
 
-static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *out_has_key) {
+// ── [TRILIST PALPHA] ARGB4444 staging ───────────────────────────────────────
+// Quantization, chosen so that "lossless" is decided exactly against today's
+// RGB565 staging:
+//   A4  = round(a * 15 / 255)                 (a <= 8 -> 0, a >= 247 -> 15)
+//   RGB = the RGB565 value today's staging would write (mf_rgb565), truncated
+//         channel-wise to 4 bits: r4 = R5>>1, g4 = G6>>2, b4 = B5>>1.
+// The fabric/refmodel decode (blt_argb4444_to_565) expands r4 -> {r4,r4[3]},
+// g4 -> {g4,g4[3:2]}, b4 -> {b4,b4[3]}. Every RGB565 value that 4444 can
+// represent at all is therefore reproduced EXACTLY (pure white 0xFFFF, black
+// 0x0000, 0xF81F, ...), and one that it cannot is reported as lossy. A4 == 0
+// texels are stored as 0x0000: PALPHA skips them before the colour is used.
+enum { MF_PA_KNOWN = 1, MF_PA_PARTIAL = 2, MF_PA_HOLE = 4, MF_PA_LOSSLESS = 8 };
+static inline unsigned mf_a4(uint8_t a) { return ((unsigned)a * 15u + 127u) / 255u; }
+static inline uint16_t mf_argb4444(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    const unsigned a4 = mf_a4(a);
+    if (a4 == 0) return 0;
+    const uint16_t c = mf_rgb565(r, g, b);
+    return (uint16_t)((a4 << 12) | (((c >> 12) & 0xFu) << 8) | (((c >> 7) & 0xFu) << 4) | ((c >> 1) & 0xFu));
+}
+// Classify the rw x rh rect of `t` at (rx, ry):
+//   MF_PA_PARTIAL  : some texel has A4 in 1..14 (a real soft edge)
+//   MF_PA_HOLE     : some texel has A4 == 0 (a cutout)
+//   MF_PA_LOSSLESS : every texel with A4 > 0 decodes (blt_argb4444_to_565) to
+//                    exactly mf_rgb565 of its colour -- the colour today's
+//                    RGB565 staging shows. (The MF_COLORKEY collision nudge is a
+//                    sentinel artifact, not colour, and is not applied here.)
+// Scalar: runs once per rect, on a cache miss of a PALPHA-eligible draw.
+static uint8_t mf_pa_classify(const RTexture *t, int rx, int ry, int rw, int rh) {
+    bool partial = false, hole = false, lossless = true;
+    // Scan the whole rect: the faded rule in mf_pa_pick needs hole/partial even when
+    // the rect is lossy, so the first lossy texel must not end the scan.
+    for (int y = 0; y < rh; y++)
+        for (int x = 0; x < rw; x++) {
+            uint8_t r, g, b, a;
+            mf_src_rgba(t, rx + x, ry + y, r, g, b, a);
+            const unsigned a4 = mf_a4(a);
+            if (a4 == 0) { hole = true; continue; }
+            if (a4 < 15) partial = true;
+            unsigned a8;
+            if (lossless &&
+                blt_argb4444_to_565(mf_argb4444(r, g, b, a), &a8) != mf_rgb565(r, g, b))
+                lossless = false;
+        }
+    return (uint8_t)(MF_PA_KNOWN | (partial ? MF_PA_PARTIAL : 0) | (hole ? MF_PA_HOLE : 0) |
+                     (lossless ? MF_PA_LOSSLESS : 0));
+}
+// Stage the rect as ARGB4444 (scalar; the NEON path stays RGB565-only). mask_only
+// has the RGB565 path's meaning: every texel either draws nothing (A4 == 0) or is dark.
+static void mf_stage_texels_4444(const RTexture *t, int rx, int ry, int rw, int rh,
+                                 uint16_t *out, bool *out_mask_only) {
+    bool mask_only = true;
+    for (int y = 0; y < rh; y++)
+        for (int x = 0; x < rw; x++) {
+            uint8_t r, g, b, a;
+            mf_src_rgba(t, rx + x, ry + y, r, g, b, a);
+            const uint16_t px = mf_argb4444(r, g, b, a);
+            out[(size_t)y * rw + x] = px;
+            if (px >> 12) {
+                unsigned a8;
+                if (!mf_texel_is_dark(blt_argb4444_to_565(px, &a8))) mask_only = false;
+            }
+        }
+    *out_mask_only = mask_only;
+}
+// The PALPHA policy for one draw on one classified rect. `faded`: the draw's vertex
+// alpha is below the COLORKEY threshold, so the RGB565 path would emit CONST_ALPHA and
+// paint the colorkey sentinel over the cutout. Soft edges always need PALPHA; a hard
+// cutout needs it only when faded (unfaded, COLORKEY already renders it exactly).
+// A FADED draw on a rect with any transparency takes PALPHA even when 4444 loses
+// colour: its only alternative is CONST_ALPHA with no cutout, which paints the colorkey
+// sentinel as magenta. Measured on EX's title (.62, 2026-09-27): bck_check (a
+// 1892x602 staged page, painted art, lossy) is drawn at vertex alpha 0.008..1.0 and
+// took that fallback 2904/2933 times -- the magenta band. 4444's colour cost there is a
+// mean 3.7/255 per channel (G0c). Unfaded, a lossy rect keeps RGB565 + the 128 cut.
+static inline bool mf_pa_pick(uint8_t cls, bool faded) {
+    if (faded) return (cls & (MF_PA_HOLE | MF_PA_PARTIAL)) != 0;
+    return (cls & MF_PA_LOSSLESS) && (cls & MF_PA_PARTIAL);
+}
+// PALPHA request passed to the staging functions by mf_draw.
+enum { MF_PA_REQ_NONE = 0, MF_PA_REQ_OPAQUE = 1, MF_PA_REQ_FADED = 2 };
+
+// Cache lookup of one rect in one staged format; -1 if absent.
+static int mf_cache_find(uint32_t key, int rx, int ry, int rw, int rh, bool tr, uint8_t fmt) {
+    for (int i = 0; i < MF_TEX_CACHE_N; i++)
+        if (g_texcache[i].used && g_texcache[i].key == key &&
+            g_texcache[i].rx == rx && g_texcache[i].ry == ry &&
+            g_texcache[i].rw == rw && g_texcache[i].rh == rh && g_texcache[i].tr == tr &&
+            g_texcache[i].fmt == fmt)
+            return i;
+    return -1;
+}
+// Resolve which format a rect is served in for this draw. RGB565 unless the draw asks
+// for PALPHA and mf_pa_pick agrees; classifies the rect (and records it on the resident
+// RGB565 entry) the first time a PALPHA-eligible draw asks. *io_cls carries the result.
+static uint8_t mf_pa_resolve_fmt(const RTexture *t, uint32_t key, int rx, int ry, int rw, int rh,
+                                 bool tr, int pa_req, int *out_i565, int *out_i4444, uint8_t *io_cls) {
+    *out_i565  = mf_cache_find(key, rx, ry, rw, rh, tr, BLT_FMT_RGB565);
+    *out_i4444 = pa_req ? mf_cache_find(key, rx, ry, rw, rh, tr, BLT_FMT_ARGB4444) : -1;
+    *io_cls = 0;
+    if (!pa_req) return BLT_FMT_RGB565;
+    uint8_t cls = 0;
+    if (*out_i565 >= 0)  cls |= g_texcache[*out_i565].pa_cls;
+    if (*out_i4444 >= 0) cls |= g_texcache[*out_i4444].pa_cls;
+    if (!(cls & MF_PA_KNOWN)) {
+        cls = mf_pa_classify(t, rx, ry, rw, rh);
+        if (*out_i565 >= 0) g_texcache[*out_i565].pa_cls = cls;
+    }
+    *io_cls = cls;
+    return mf_pa_pick(cls, pa_req == MF_PA_REQ_FADED) ? BLT_FMT_ARGB4444 : BLT_FMT_RGB565;
+}
+
+static blt_surface_ref_t stage_texture(uint32_t key, const RTexture *t, bool *out_has_key,
+                                       int pa_req = MF_PA_REQ_NONE) {
     // Whole-page entry: rect (0,0,tw,th). Untextured => 1x1 opaque-white page.
     int tw, th; bool textured = (t && t->valid && t->rgba);
     if (textured) { tw = t->w; th = t->h; } else { tw = 1; th = 1; }
     if (tw <= 0 || th <= 0 || (size_t)tw * th > MF_TEX_TEXELS) {
         blt_surface_ref_t bad; bad.valid = 0; *out_has_key = false; return bad;
     }
-    for (int i = 0; i < MF_TEX_CACHE_N; i++)
-        if (g_texcache[i].used && g_texcache[i].key == key &&
-            g_texcache[i].rx == 0 && g_texcache[i].ry == 0 &&
-            g_texcache[i].rw == tw && g_texcache[i].rh == th && !g_texcache[i].tr) {
-            g_texcache[i].lru = ++g_lru_clock;
-            *out_has_key = g_texcache[i].has_key;
-            return g_texcache[i].ref;
-        }
+    if (!textured) pa_req = MF_PA_REQ_NONE;   // the 1x1 white page has no alpha
+    int i565, i4444; uint8_t cls;
+    const uint8_t fmt = mf_pa_resolve_fmt(t, key, 0, 0, tw, th, false, pa_req, &i565, &i4444, &cls);
+    const int hit = (fmt == BLT_FMT_ARGB4444) ? i4444 : i565;
+    if (hit >= 0) {
+        g_texcache[hit].lru = ++g_lru_clock;
+        *out_has_key = g_texcache[hit].has_key;
+        return g_texcache[hit].ref;
+    }
     bool has_key = false;
     // [strip in-game CRT simulation] classify while already visiting every texel -- see the
     // sub-region path for why a black+transparent-only page is interesting.
     bool mask_only = textured;
-    if (textured) {
-        mf_stage_texels(t, 0, 0, tw, th, g_texscratch, &has_key, &mask_only);
-    } else {
+    if (!textured) {
         g_texscratch[0] = 0xFFFF;   // 1x1 opaque white
+    } else if (fmt == BLT_FMT_ARGB4444) {
+        mf_stage_texels_4444(t, 0, 0, tw, th, g_texscratch, &mask_only);   // no key: A4==0 skips
+    } else {
+        mf_stage_texels(t, 0, 0, tw, th, g_texscratch, &has_key, &mask_only);
     }
-    blt_surface_ref_t ref = mf_upload_and_cache(key, tw, th, 0, 0, has_key, mask_only, "whole");
+    blt_surface_ref_t ref = mf_upload_and_cache(key, tw, th, 0, 0, has_key, mask_only, "whole",
+                                                false, fmt, cls);
     *out_has_key = ref.valid ? has_key : false;
     return ref;
 }
@@ -2891,20 +3091,22 @@ static uint16_t g_trscratch[MF_TR_MAX_TEXELS];
 static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
                                               float u0, float v0, float u1, float v1,
                                               bool *out_has_key, int *out_rx, int *out_ry,
-                                              bool *out_mask_only, bool tr = false) {
+                                              bool *out_mask_only, bool tr = false,
+                                              int pa_req = MF_PA_REQ_NONE) {
     int rx, ry, rw, rh;
     mf_crop_rect(t, u0, v0, u1, v1, &rx, &ry, &rw, &rh);
     *out_rx = rx; *out_ry = ry;
     if (tr && (size_t)rw * rh > MF_TR_MAX_TEXELS) tr = false;
-    for (int i = 0; i < MF_TEX_CACHE_N; i++)
-        if (g_texcache[i].used && g_texcache[i].key == key &&
-            g_texcache[i].rx == rx && g_texcache[i].ry == ry &&
-            g_texcache[i].rw == rw && g_texcache[i].rh == rh && g_texcache[i].tr == tr) {
-            g_texcache[i].lru = ++g_lru_clock;
-            *out_has_key = g_texcache[i].has_key;
-            if (out_mask_only) *out_mask_only = g_texcache[i].mask_only;
-            return g_texcache[i].ref;
-        }
+    if ((size_t)rw * rh > MF_TEX_TEXELS) pa_req = MF_PA_REQ_NONE;   // cannot stage anyway
+    int i565, i4444; uint8_t cls;
+    const uint8_t fmt = mf_pa_resolve_fmt(t, key, rx, ry, rw, rh, tr, pa_req, &i565, &i4444, &cls);
+    const int hit = (fmt == BLT_FMT_ARGB4444) ? i4444 : i565;
+    if (hit >= 0) {
+        g_texcache[hit].lru = ++g_lru_clock;
+        *out_has_key = g_texcache[hit].has_key;
+        if (out_mask_only) *out_mask_only = g_texcache[hit].mask_only;
+        return g_texcache[hit].ref;
+    }
     if ((size_t)rw * rh > MF_TEX_TEXELS) {
         blt_surface_ref_t bad; bad.valid = 0; *out_has_key = false;
         if (out_mask_only) *out_mask_only = false;
@@ -2916,7 +3118,10 @@ static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
     // dumps of its frames measure 100% black+colorkey with the black fraction ANIMATING
     // (4.7% -> 27.1% -> 38.2% -> 47.8%), i.e. a tube iris opening and closing over the image.
     bool mask_only = true;
-    mf_stage_texels(t, rx, ry, rw, rh, g_texscratch, &has_key, &mask_only);
+    if (fmt == BLT_FMT_ARGB4444)
+        mf_stage_texels_4444(t, rx, ry, rw, rh, g_texscratch, &mask_only);   // no key: A4==0 skips
+    else
+        mf_stage_texels(t, rx, ry, rw, rh, g_texscratch, &has_key, &mask_only);
     if (tr) {
         memcpy(g_trscratch, g_texscratch, (size_t)rw * rh * 2);
         for (int y = 0; y < rh; y++)
@@ -2924,7 +3129,7 @@ static blt_surface_ref_t stage_texture_region(uint32_t key, const RTexture *t,
                 g_texscratch[(size_t)x * rh + y] = g_trscratch[(size_t)y * rw + x];
     }
     blt_surface_ref_t ref = mf_upload_and_cache(key, rw, rh, rx, ry, has_key, mask_only,
-                                                tr ? "region-tr" : "region", tr);
+                                                tr ? "region-tr" : "region", tr, fmt, cls);
     *out_has_key = ref.valid ? has_key : false;
     if (out_mask_only) *out_mask_only = ref.valid ? mask_only : false;
     return ref;
@@ -2987,6 +3192,26 @@ static bool mf_ps_capable(void) {
 #endif
     return (mf_ctrl_rd(MF_C_STATUS) & 0x4u) != 0;
 }
+// ── [TRILIST PALPHA] ─────────────────────────────────────────────────────────
+// GMLOADER_MFGPU_PALPHA (default 0 until the device gate passes) AND C_STATUS
+// low32 bit3 ("TRILIST PALPHA supported", written by blitter_top S_WR_STATUS).
+// An RBF without the bit would treat an ARGB4444 page as RGB565 and PALPHA as an
+// unknown blend, so neither is ever emitted unless both are set.
+static int g_pa_v = -1;
+static int mf_palpha_on(void) {
+    if (g_pa_v < 0) {
+        const char *e = getenv("GMLOADER_MFGPU_PALPHA");
+        g_pa_v = (e && *e) ? atoi(e) : 0;
+    }
+    return g_pa_v;
+}
+static bool mf_pa_capable(void) {
+#ifdef MISTER_NATIVE_VIDEO
+    if (!g_dev_ok) return false;
+#endif
+    return (mf_ctrl_rd(MF_C_STATUS) & 0x8u) != 0;
+}
+static bool mf_pa_active(void) { return mf_palpha_on() && mf_pa_capable(); }
 // The composite is an identity: two triangles covering exactly the 288x216
 // target, every vertex white/opaque with u == x and v == y in 12.4 (so pixel p
 // samples surface texel p), and a blend that resolves to COPY.
@@ -3302,7 +3527,17 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
     // the reorder is inert. The push itself now happens inside each branch.
     uint8_t blend_mode;
     uint16_t colorkey;
-    if (has_key && min_vtx_a * 255.0f >= 254.0f) {
+    // [TRILIST PALPHA] An ARGB4444 page is only ever staged for an RB_ALPHA draw
+    // (mf_pa_resolve_fmt), and every draw on it goes out as PALPHA: texel alpha x
+    // vertex alpha, A4==0 skipped. This replaces the COLORKEY / CONST_ALPHA / COPY
+    // choice below for those draws only -- it is never promoted to COPY, because a
+    // soft texel blends even under an opaque vertex.
+    const bool palpha = tex.format == BLT_FMT_ARGB4444 && bl == RB_ALPHA &&
+                        !(extra_flags & BLT_F_SRC_SURFACE);
+    if (palpha) {
+        blend_mode = BLT_BLEND_PALPHA;
+        colorkey = 0;
+    } else if (has_key && min_vtx_a * 255.0f >= 254.0f) {
         blend_mode = BLT_BLEND_COLORKEY;
         colorkey = MF_COLORKEY;
     } else {
@@ -3328,6 +3563,13 @@ static void mf_emit_group(const blt_surface_ref_t &tex, int tw, int th,
         colorkey = 0;
     }
     g_last_trilist_blend = blend_mode;   // host-test hook (opaque-ALPHA -> COPY promotion)
+    if (palpha) {
+        g_pa_groups_frame++;
+        g_pa_tris_frame += (uint32_t)nt;
+        for (int i = 0; i < nt; i++)
+            g_pa_px_frame += mf_clip_tri_area(verts[i*3].x, verts[i*3].y, verts[i*3+1].x,
+                                              verts[i*3+1].y, verts[i*3+2].x, verts[i*3+2].y);
+    }
     // [sparse keyed quads] `verts` keeps describing the draw as submitted (nt_in triangles);
     // g_vtxscratch/nt become what the fabric executes.
     const int nt_in = nt;
@@ -3665,7 +3907,12 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
     }
 #endif
 
-    if (triCount > 0 && triCount <= MF_DUP_MAX_TRIS &&
+    // [TRILIST PALPHA] PALPHA-eligible draws: RB_ALPHA on a staged (non-app-surface)
+    // texture while the knob and the RBF bit are both set. Such a draw may be staged
+    // ARGB4444 and go out as PALPHA, which is not idempotent.
+    const bool pa_eligible = mf_pa_active() && bl == RB_ALPHA && !src_is_appsurf &&
+                             t && t->valid && t->rgba;
+    if (triCount > 0 && triCount <= MF_DUP_MAX_TRIS && !pa_eligible &&
         mf_draw_is_idempotent(v, triCount * 3, bl)) {
         if (g_last_draw.valid && g_last_draw.fbo == d->fbo && g_last_draw.tex_key == tex_key &&
             g_last_draw.bl == (int)bl && g_last_draw.ar == ar &&
@@ -3837,6 +4084,15 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         return;
     }
 
+    // [TRILIST PALPHA] The PALPHA request for a group of `n` vertices: none unless
+    // pa_eligible; FADED when any vertex alpha is below mf_emit_group's COLORKEY
+    // threshold (the RGB565 path would emit CONST_ALPHA and paint the sentinel).
+    auto pa_req_of = [&](const BVtx *gv, int n) -> int {
+        if (!pa_eligible) return MF_PA_REQ_NONE;
+        for (int i = 0; i < n; i++) if (gv[i].a * 255.0f < 254.0f) return MF_PA_REQ_FADED;
+        return MF_PA_REQ_OPAQUE;
+    };
+
     // ── fallback: odd triangle count is not clean sprite-quads ────────────────
     // The sub-region path below assumes 2-tri (6-vertex) sprite-quads. A draw
     // whose tri count is odd isn't that shape (stray/fan geometry, rare and not
@@ -3845,7 +4101,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
     // fragmenting into odd sub-rects.
     if (triCount % 2 != 0) {
         bool has_key = false;
-        blt_surface_ref_t tex = stage_texture(tex_key, t, &has_key);
+        blt_surface_ref_t tex = stage_texture(tex_key, t, &has_key, pa_req_of(v, triCount * 3));
         if (!tex.valid) {
             mf_note_ovf_cause(MF_OVF_HEAP_FULL);
             fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
@@ -3888,7 +4144,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         mf_crop_rect(t, u0, v0, u1, v1, &rx, &ry, &rw, &rh);
         if ((double)rw * rh >= 0.9 * (double)t->w * t->h) {
             bool has_key = false;
-            blt_surface_ref_t tex = stage_texture(tex_key, t, &has_key);
+            blt_surface_ref_t tex = stage_texture(tex_key, t, &has_key, pa_req_of(gv, 6));
             if (!tex.valid) {
                 mf_note_ovf_cause(MF_OVF_HEAP_FULL);
                 fprintf(stderr, "backend_mfgpu: texture cannot fit heap after eviction - draw dropped\n");
@@ -3904,7 +4160,7 @@ static void mf_draw(RSurface *d, const BVtx *v, int triCount,
         const bool tr = mf_transpose_on() && (size_t)rw * rh <= MF_TR_MAX_TEXELS &&
                         mf_quad_prefers_transpose(gv, t->w, t->h, rw, rh);
         blt_surface_ref_t tex = stage_texture_region(tex_key, t, u0, v0, u1, v1, &has_key, &srx, &sry,
-                                                    &mask_only, tr);
+                                                    &mask_only, tr, pa_req_of(gv, 6));
         // [strip in-game CRT simulation] obj_old_tv's CRT overlay: a FULL-SCREEN pass whose
         // staged region holds nothing but transparent and very dark texels -- the tube bezel
         // plus its SCANLINE shading -- drawn over the image
@@ -4160,6 +4416,9 @@ static void mf_frame_end(void) {
             fprintf(stderr, "MFPRES frames=%u present_surf=%u on=%d cap=%d discharged emit=%u clear=%u fps=%u pcflush=%u second=%u\n",
                     nf, g_ps_frames_total, mf_present_surf_on(), mf_ps_capable() ? 1 : 0,
                     g_ps_why[0], g_ps_why[1], g_ps_why[2], g_ps_why[3], g_ps_why[4]);
+            fprintf(stderr, "MFPALPHA frames=%u on=%d cap=%d groups=%u tris=%u px=%.0f (last frame) staged4444=%u\n",
+                    nf, mf_palpha_on(), mf_pa_capable() ? 1 : 0, g_pa_groups_frame,
+                    g_pa_tris_frame, g_pa_px_frame, g_pa_staged_total);
         }
     }
 #endif
@@ -4187,6 +4446,7 @@ static void mf_frame_end(void) {
     if (g_e.overflow) {
         fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped %s\n",
                 mf_ovf_cause_str());
+        mf_unstage_fresh("emitter overflow");
         return;
     }
     // [Phase 1 B2] Publish and return. The await moved to mf_frame_begin, so the engine's
@@ -4200,6 +4460,7 @@ static void mf_frame_end(void) {
     // engine's bring-up has to dig out of.
     if (g_fabric_shutdown) {
         g_frame_dropped = true;
+        mf_unstage_fresh("shutdown");
     }
     else if (g_dev_ok) {
         // [Phase 2 host lever] Barrier immediately before the control-block writes, not at
@@ -4209,20 +4470,24 @@ static void mf_frame_end(void) {
             g_frame_dropped = true;
             fprintf(stderr, "backend_mfgpu: publish barrier timed out on seq=%u - batch dropped\n",
                     g_pending_seq);
+            mf_unstage_fresh("publish barrier timed out");
         } else {
             mf_pace_gate();
             mf_device_publish();
+            mf_fresh_commit();
             g_fabric_pending = true; g_pending_seq = g_e.submit_seq;
             g_pending_arena  = g_arena & 1u;
         }
     }
-    else          fprintf(stderr, "backend_mfgpu: device DDR unmapped - frame dropped\n");
+    else {        fprintf(stderr, "backend_mfgpu: device DDR unmapped - frame dropped\n");
+                  mf_unstage_fresh("device DDR unmapped"); }
 #else
     // Host oracle: software-execute the ring into g_fb565 (parity tests read it back).
     if (g_e.overflow) {
         fprintf(stderr, "backend_mfgpu: emitter overflow this frame - frame dropped %s\n",
                 mf_ovf_cause_str());
         memset(g_fb565, 0, sizeof g_fb565);   // nothing safe to execute this frame
+        mf_unstage_fresh("emitter overflow");
         return;
     }
     // [Phase 1 B2] Drive the same submit seam the device path uses, so the publish/await
@@ -4243,12 +4508,14 @@ static void mf_frame_end(void) {
     // exactly what case_inflight_drop asks by comparing framebuffers.
     // [fabric lifecycle] Same guard as the device path above, so "teardown stops the
     // frame loop from re-arming the ring" is a property the oracle can assert.
-    if (g_fabric_shutdown) { g_frame_dropped = true; return; }
+    if (g_fabric_shutdown) { g_frame_dropped = true; mf_unstage_fresh("shutdown"); return; }
     if (!mf_publish_barrier()) {
         g_frame_dropped = true;
+        mf_unstage_fresh("publish barrier timed out");
         return;
     }
     mf_device_publish();
+    mf_fresh_commit();
     g_fabric_pending = true; g_pending_seq = g_e.submit_seq;
     g_pending_arena  = g_arena & 1u;
     int n = g_e.cmd_count;
@@ -4387,6 +4654,7 @@ extern "C" void RasterBackend_MFGPU_TestTraceReset(void) {
 extern "C" uint32_t RasterBackend_MFGPU_TestUploadCount(void) { return g_upload_count; }
 // FO Task 3 host hook: BLT_OP_STAGE emits since reinit (proves stage-once-per-page).
 extern "C" uint32_t RasterBackend_MFGPU_TestStageCount(void) { return g_stage_count; }
+extern "C" uint32_t RasterBackend_MFGPU_TestUnstagedCount(void) { return g_unstaged_total; }
 // [in-flight-batch guard] host-test hooks: force the "fabric still busy" predicate
 // (-1 = ask for real) and read the dropped-frame tally.
 extern "C" void RasterBackend_MFGPU_TestSetFabricBusy(int busy) {
@@ -4569,7 +4837,41 @@ extern "C" int RasterBackend_MFGPU_TestFillPrecedesTrilist(void) {
 // [W3 batching] GMLOADER_MFGPU_BATCH_TRILIST joins it for the same reason: an
 // A/B case that flips the knob mid-binary needs the cached read cleared.
 extern "C" void RasterBackend_MFGPU_TestEnvReset(void) { g_defer_clear_v = -1; g_batch_v = -1; g_occlude_v = -1; g_ps_v = -1;
-                                                        g_sparse_v = -1; g_transpose_v = -1; }
+                                                        g_sparse_v = -1; g_transpose_v = -1; g_pa_v = -1; }
+// [TRILIST PALPHA] host-test hooks: force C_STATUS bit3 (as TestSetPresentSurfCap does
+// bit2), read the last frame's PALPHA accounting and the ARGB4444 upload count, and
+// reach the pure staging helpers directly.
+extern "C" void RasterBackend_MFGPU_TestSetPalphaCap(int on) {
+#ifndef MISTER_NATIVE_VIDEO
+    g_ctrl_shadow[MF_C_STATUS] = (g_ctrl_shadow[MF_C_STATUS] & ~0x8u) | (on ? 0x8u : 0u);
+#else
+    (void)on;
+#endif
+}
+extern "C" uint32_t RasterBackend_MFGPU_TestPalphaGroups(void) { return g_pa_groups_frame; }
+extern "C" double   RasterBackend_MFGPU_TestPalphaPixels(void) { return g_pa_px_frame; }
+extern "C" uint32_t RasterBackend_MFGPU_TestPalphaStaged(void) { return g_pa_staged_total; }
+extern "C" int RasterBackend_MFGPU_TestPaClassify(const RTexture *t, int rx, int ry, int rw, int rh) {
+    return mf_pa_classify(t, rx, ry, rw, rh);
+}
+extern "C" int RasterBackend_MFGPU_TestPaPick(int cls, int faded) {
+    return mf_pa_pick((uint8_t)cls, faded != 0) ? 1 : 0;
+}
+extern "C" void RasterBackend_MFGPU_TestStageTexels4444(const RTexture *t, int rx, int ry,
+                                                        int rw, int rh, uint16_t *out,
+                                                        int *out_mask_only) {
+    bool mask_only = true;
+    mf_stage_texels_4444(t, rx, ry, rw, rh, out, &mask_only);
+    if (out_mask_only) *out_mask_only = mask_only ? 1 : 0;
+}
+// Copy the current ring (cmd_count commands) into `out`; returns the byte count, or -1
+// if it does not fit. A byte-level witness of the emitted command stream.
+extern "C" int RasterBackend_MFGPU_TestRingBytes(uint8_t *out, int cap) {
+    const int n = g_e.cmd_count * BLT_CMD_BYTES;
+    if (n > cap) return -1;
+    memcpy(out, g_e.ring, (size_t)n);
+    return n;
+}
 extern "C" uint32_t RasterBackend_MFGPU_TestSparseRects(void) { return g_sp_rects_frame; }
 extern "C" uint32_t RasterBackend_MFGPU_TestSparseEmpty(void) { return g_sp_empty_frame; }
 extern "C" uint32_t RasterBackend_MFGPU_TestTransposed(void)  { return g_tr_quads_frame; }

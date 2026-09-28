@@ -338,6 +338,21 @@ blitter-appsurf-test:
 	  gmloader/configuration.cpp \
 	  $(MFGPU_SRC) \
 	  -lm -o /tmp/bat && /tmp/bat
+.PHONY: blitter-blend-state-test
+# Blend-state shadow (Blitter_OnBlendFunc/OnBlendEnable): recorded while the
+# blitter is disabled and able to hold GL_ZERO. Same link set as
+# blitter-appsurf-test (blitter.cpp and its dependency chain).
+blitter-blend-state-test:
+	c++ -std=c++17 -DMISTER_NATIVE_VIDEO=1 -Igmloader/mister -Igmloader -I. \
+	  -Ithunks/khronos -Iloader -I3rdparty/json/include $(MFGPU_INC) \
+	  gmloader/mister/blitter_blend_state_test.cpp \
+	  gmloader/mister/blitter.cpp \
+	  gmloader/mister/blitter_raster.cpp \
+	  gmloader/mister/raster_backend_sw.cpp \
+	  gmloader/mister/raster_backend_mfgpu.cpp \
+	  gmloader/configuration.cpp \
+	  $(MFGPU_SRC) \
+	  -lm -o /tmp/bbst && /tmp/bbst
 .PHONY: strl-test
 # Host-native test for the bionic strlcpy/strlcat thunks. Links the REAL
 # stdio.cpp (ABI_ATTR is empty off-ARM) so it exercises shipped code, and uses
@@ -397,3 +412,8 @@ native-audio-shim-test:
 	  gmloader/mister/mister_native_audio.cpp \
 	  gmloader/mister/native_audio_writer.c \
 	  $(shell pkg-config sdl2 --libs) -o /tmp/mnat && /tmp/mnat
+
+# [joy keymap] GMLOADER_JOY_KEYMAP parser + edge logic (mister/joy_keymap.h).
+joy-keymap-test:
+	c++ -std=c++17 -Igmloader/mister gmloader/mister/joy_keymap_test.cpp -o /tmp/joy_keymap_test && /tmp/joy_keymap_test
+.PHONY: joy-keymap-test

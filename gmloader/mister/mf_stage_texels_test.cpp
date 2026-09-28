@@ -29,6 +29,13 @@
 extern "C" void RasterBackend_MFGPU_TestStageTexels(const RTexture *t, int rx, int ry,
                                                     int rw, int rh, uint16_t *out,
                                                     int *out_has_key, int *out_mask_only);
+// [TRILIST PALPHA] ARGB4444 staging + region classification.
+extern "C" void RasterBackend_MFGPU_TestStageTexels4444(const RTexture *t, int rx, int ry,
+                                                        int rw, int rh, uint16_t *out,
+                                                        int *out_mask_only);
+extern "C" int RasterBackend_MFGPU_TestPaClassify(const RTexture *t, int rx, int ry, int rw, int rh);
+extern "C" int RasterBackend_MFGPU_TestPaPick(int cls, int faded);
+enum { PA_KNOWN = 1, PA_PARTIAL = 2, PA_HOLE = 4, PA_LOSSLESS = 8 };
 
 static int g_fail = 0;
 
@@ -337,6 +344,200 @@ static void test_differential_sweep() {
     report("differential sweep matches oracle", all_ok);
 }
 
+// ---- [TRILIST PALPHA] ARGB4444 staging ---------------------------------------
+// Oracle, from the contract (raster_backend_mfgpu.cpp "ARGB4444 staging"):
+//   A4 = round(a*15/255) (no ties exist for integer a); A4 == 0 -> 0x0000.
+//   R4/G4/B4 = the RGB565 channel truncated to 4 bits, which is the top nibble of
+//   the 8-bit channel: (r>>3)>>1 == r>>4, (g>>2)>>2 == g>>4.
+//   Decode (fabric / refmodel): R5 = {r4, r4[3]}, G6 = {g4, g4[3:2]}, B5 = {b4, b4[3]}.
+//   Lossless iff the decode equals (r>>3, g>>2, b>>3) for every texel with A4 > 0.
+static void src_rgba(const RTexture *t, int x, int y, int *r, int *g, int *b, int *a) {
+    if (t->format == RTEX_RGBA4444) {
+        uint16_t p = ((const uint16_t *)t->rgba)[(size_t)y * t->w + x];
+        int r4 = (p >> 12) & 0xF, g4 = (p >> 8) & 0xF, b4 = (p >> 4) & 0xF, a4 = p & 0xF;
+        *r = (r4 << 4) | r4; *g = (g4 << 4) | g4; *b = (b4 << 4) | b4; *a = (a4 << 4) | a4;
+    } else {
+        const uint8_t *p = t->rgba + ((size_t)y * t->w + x) * 4;
+        *r = p[0]; *g = p[1]; *b = p[2]; *a = p[3];
+    }
+}
+static int oracle_a4(int a) { return (int)(a * 15.0 / 255.0 + 0.5); }
+static uint16_t oracle_4444(int r, int g, int b, int a) {
+    int a4 = oracle_a4(a);
+    if (a4 == 0) return 0;
+    return (uint16_t)((a4 << 12) | ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
+}
+static bool oracle_exact(int r, int g, int b) {
+    int r4 = r >> 4, g4 = g >> 4, b4 = b >> 4;
+    return (((r4 << 1) | (r4 >> 3)) == (r >> 3)) && (((g4 << 2) | (g4 >> 2)) == (g >> 2)) &&
+           (((b4 << 1) | (b4 >> 3)) == (b >> 3));
+}
+static int oracle_classify(const RTexture *t, int rx, int ry, int rw, int rh) {
+    bool partial = false, hole = false, lossless = true;
+    for (int y = 0; y < rh; y++)
+        for (int x = 0; x < rw; x++) {
+            int r, g, b, a; src_rgba(t, rx + x, ry + y, &r, &g, &b, &a);
+            int a4 = oracle_a4(a);
+            if (a4 == 0) { hole = true; continue; }
+            if (a4 < 15) partial = true;
+            if (!oracle_exact(r, g, b)) lossless = false;
+        }
+    // A lossy rect need not report PARTIAL/HOLE (the scan may stop early): mask them.
+    int c = PA_KNOWN | (lossless ? PA_LOSSLESS : 0);
+    if (lossless) c |= (partial ? PA_PARTIAL : 0) | (hole ? PA_HOLE : 0);
+    return c;
+}
+static int classify_masked(const RTexture *t, int rx, int ry, int rw, int rh) {
+    int c = RasterBackend_MFGPU_TestPaClassify(t, rx, ry, rw, rh);
+    return (c & PA_LOSSLESS) ? c : (c & (PA_KNOWN | PA_LOSSLESS));
+}
+static uint16_t stage_one_4444(int r, int g, int b, int a) {
+    uint8_t pix[4] = { (uint8_t)r, (uint8_t)g, (uint8_t)b, (uint8_t)a };
+    RTexture t{}; t.rgba = pix; t.w = 1; t.h = 1; t.valid = 1; t.format = RTEX_RGBA8888;
+    uint16_t px = 0xDEAD; int mo = -1;
+    RasterBackend_MFGPU_TestStageTexels4444(&t, 0, 0, 1, 1, &px, &mo);
+    return px;
+}
+
+// Hand-computed goldens, independent of both oracle and implementation.
+static void test_4444_goldens() {
+    check_u16("4444 white a=128 -> A4 8",   stage_one_4444(255, 255, 255, 128), 0x8FFF);
+    check_u16("4444 black opaque",           stage_one_4444(0, 0, 0, 255),       0xF000);
+    check_u16("4444 red a=200 -> A4 12",     stage_one_4444(255, 0, 0, 200),     0xCF00);
+    check_u16("4444 a=8 -> transparent 0",   stage_one_4444(255, 255, 255, 8),   0x0000);
+    check_u16("4444 a=9 -> A4 1",            stage_one_4444(255, 255, 255, 9),   0x1FFF);
+    check_u16("4444 a=246 -> A4 14",         stage_one_4444(255, 255, 255, 246), 0xEFFF);
+    check_u16("4444 a=247 -> A4 15",         stage_one_4444(255, 255, 255, 247), 0xFFFF);
+    check_u16("4444 0x12,0x34,0x56 a=255",   stage_one_4444(0x12, 0x34, 0x56, 255), 0xF135);
+}
+
+// Every alpha value, and every value of each colour channel, against the oracle.
+static void test_4444_exhaustive_channels() {
+    bool ok = true;
+    for (int a = 0; a < 256 && ok; a++)
+        if (stage_one_4444(255, 255, 255, a) != oracle_4444(255, 255, 255, a)) {
+            fprintf(stderr, "  alpha %d: got 0x%04X want 0x%04X\n", a,
+                    stage_one_4444(255, 255, 255, a), oracle_4444(255, 255, 255, a));
+            ok = false;
+        }
+    for (int c = 0; c < 256 && ok; c++) {
+        if (stage_one_4444(c, 0, 0, 255) != oracle_4444(c, 0, 0, 255) ||
+            stage_one_4444(0, c, 0, 255) != oracle_4444(0, c, 0, 255) ||
+            stage_one_4444(0, 0, c, 255) != oracle_4444(0, 0, c, 255)) {
+            fprintf(stderr, "  channel value %d mismatches\n", c); ok = false;
+        }
+    }
+    report("4444 encode: every alpha and channel value matches oracle", ok);
+}
+
+// The classification the staging policy turns on.
+static void test_pa_classify_cases() {
+    enum { W = 8, H = 4 };
+    uint8_t px[W * H * 4];
+    RTexture t{}; t.rgba = px; t.w = W; t.h = H; t.valid = 1; t.format = RTEX_RGBA8888;
+    auto fill = [&](int r, int g, int b) {
+        for (int i = 0; i < W * H; i++) { px[i*4] = (uint8_t)r; px[i*4+1] = (uint8_t)g; px[i*4+2] = (uint8_t)b;
+                                          px[i*4+3] = (uint8_t)(i * 255 / (W * H - 1)); }   // 0..255 ramp
+    };
+    // Single-colour alpha masks (system_font, spr_torch_darkness): lossless.
+    fill(255, 255, 255);
+    check_int("classify white ramp mask", RasterBackend_MFGPU_TestPaClassify(&t, 0, 0, W, H),
+              PA_KNOWN | PA_PARTIAL | PA_HOLE | PA_LOSSLESS);
+    fill(0, 0, 0);
+    check_int("classify black ramp mask", RasterBackend_MFGPU_TestPaClassify(&t, 0, 0, W, H),
+              PA_KNOWN | PA_PARTIAL | PA_HOLE | PA_LOSSLESS);
+    // A colour 4444 cannot hold (r = 0x08: R5 = 1 -> r4 = 0 -> decodes to 0): lossy.
+    fill(0x08, 0x20, 0x30);
+    check_int("classify lossy colour", classify_masked(&t, 0, 0, W, H), PA_KNOWN);
+    // Hard-edged cutout: holes and opaque texels only, no partial.
+    for (int i = 0; i < W * H; i++) { px[i*4] = px[i*4+1] = px[i*4+2] = 255; px[i*4+3] = (i & 1) ? 255 : 0; }
+    check_int("classify hard-edged white", RasterBackend_MFGPU_TestPaClassify(&t, 0, 0, W, H),
+              PA_KNOWN | PA_HOLE | PA_LOSSLESS);
+    // A lossy colour under A4 == 0 is never drawn, so it does not make the rect lossy.
+    px[0] = 0x08; px[1] = 0x20; px[2] = 0x30; px[3] = 5;
+    check_int("classify lossy colour under hole ignored",
+              RasterBackend_MFGPU_TestPaClassify(&t, 0, 0, W, H), PA_KNOWN | PA_HOLE | PA_LOSSLESS);
+    // ...but under A4 = 1 it is drawn, and does.
+    px[3] = 9;
+    check_int("classify lossy colour at A4=1", classify_masked(&t, 0, 0, W, H), PA_KNOWN);
+    // Sub-rect: the lossy texel at (0,0) is outside rect (1,0)..
+    check_int("classify sub-rect excludes lossy texel",
+              RasterBackend_MFGPU_TestPaClassify(&t, 1, 0, W - 1, H), PA_KNOWN | PA_HOLE | PA_LOSSLESS);
+    // Fully opaque, lossless: nothing to do.
+    for (int i = 0; i < W * H; i++) { px[i*4] = px[i*4+1] = px[i*4+2] = 255; px[i*4+3] = 255; }
+    check_int("classify opaque white", RasterBackend_MFGPU_TestPaClassify(&t, 0, 0, W, H),
+              PA_KNOWN | PA_LOSSLESS);
+    // Policy: unfaded -> soft edges only, and only when lossless; faded -> any
+    // transparency, lossy or not (the alternative paints the colorkey sentinel).
+    const int L = PA_KNOWN | PA_LOSSLESS;
+    check_int("pick partial",            RasterBackend_MFGPU_TestPaPick(L | PA_PARTIAL, 0), 1);
+    check_int("pick hole unfaded",       RasterBackend_MFGPU_TestPaPick(L | PA_HOLE, 0), 0);
+    check_int("pick hole faded",         RasterBackend_MFGPU_TestPaPick(L | PA_HOLE, 1), 1);
+    check_int("pick opaque faded",       RasterBackend_MFGPU_TestPaPick(L, 1), 0);
+    check_int("pick lossy partial",      RasterBackend_MFGPU_TestPaPick(PA_KNOWN | PA_PARTIAL, 0), 0);
+    check_int("pick lossy faded",        RasterBackend_MFGPU_TestPaPick(PA_KNOWN | PA_PARTIAL | PA_HOLE, 1), 1);
+    check_int("pick lossy hole faded",   RasterBackend_MFGPU_TestPaPick(PA_KNOWN | PA_HOLE, 1), 1);
+    check_int("pick lossy opaque faded", RasterBackend_MFGPU_TestPaPick(PA_KNOWN, 1), 0);
+}
+
+// Random rects over random textures, both source formats, against the oracle --
+// the staged texels, mask_only and the classification.
+static void test_4444_differential_sweep() {
+    bool all_ok = true; int cases = 0;
+    for (int fmt = 0; fmt < 2; fmt++) {
+        for (int iter = 0; iter < 200; iter++) {
+            const int tw = 1 + (int)(rnd() % 40), th = 1 + (int)(rnd() % 12);
+            std::vector<uint8_t> buf((size_t)tw * th * 4);
+            // Mix exact colours (pure nibble-replicated) with arbitrary ones so both
+            // lossless and lossy rects occur.
+            const bool exact = (rnd() & 1) != 0;
+            const int base = (int)(rnd() % 16) * 17;
+            for (int i = 0; i < tw * th; i++) {
+                if (fmt == 0) {
+                    for (int c = 0; c < 3; c++) buf[i*4+c] = exact ? (uint8_t)base : (uint8_t)rnd();
+                    uint32_t k = rnd() % 4;
+                    buf[i*4+3] = k == 0 ? 0 : k == 1 ? 255 : (uint8_t)rnd();
+                } else {
+                    uint16_t p = (uint16_t)rnd();
+                    if (exact) p = (uint16_t)((p & 0x000F) | ((base >> 4) * 0x1110));
+                    ((uint16_t *)buf.data())[i] = p;
+                }
+            }
+            RTexture t{}; t.rgba = buf.data(); t.w = tw; t.h = th; t.valid = 1;
+            t.format = fmt ? RTEX_RGBA4444 : RTEX_RGBA8888;
+            const int rx = (int)(rnd() % tw), ry = (int)(rnd() % th);
+            const int rw = 1 + (int)(rnd() % (tw - rx)), rh = 1 + (int)(rnd() % (th - ry));
+            std::vector<uint16_t> got((size_t)rw * rh, 0xDEAD);
+            int mo = -1;
+            RasterBackend_MFGPU_TestStageTexels4444(&t, rx, ry, rw, rh, got.data(), &mo);
+            int wmo = 1; bool texels_ok = true;
+            for (int y = 0; y < rh; y++)
+                for (int x = 0; x < rw; x++) {
+                    int r, g, b, a; src_rgba(&t, rx + x, ry + y, &r, &g, &b, &a);
+                    uint16_t w = oracle_4444(r, g, b, a);
+                    if (got[(size_t)y * rw + x] != w) texels_ok = false;
+                    if (w >> 12) {
+                        int r4 = (w >> 8) & 0xF, g4 = (w >> 4) & 0xF, b4 = w & 0xF;
+                        uint16_t d = (uint16_t)((((r4 << 1) | (r4 >> 3)) << 11) |
+                                                (((g4 << 2) | (g4 >> 2)) << 5) | ((b4 << 1) | (b4 >> 3)));
+                        if (!oracle_dark(d)) wmo = 0;
+                    }
+                }
+            const int cls = classify_masked(&t, rx, ry, rw, rh);
+            const int wcls = oracle_classify(&t, rx, ry, rw, rh);
+            cases++;
+            if (!texels_ok || mo != wmo || cls != wcls) {
+                if (all_ok)
+                    fprintf(stderr, "  first mismatch: fmt=%d rect=%d,%d %dx%d texels %s mask %d/%d cls %d/%d\n",
+                            fmt, rx, ry, rw, rh, texels_ok ? "ok" : "DIFF", mo, wmo, cls, wcls);
+                all_ok = false;
+            }
+        }
+    }
+    fprintf(stderr, "     (%d rect cases)\n", cases);
+    report("4444 differential sweep matches oracle", all_ok);
+}
+
 int main(void) {
     test_alpha_threshold();
     test_colorkey_collision();
@@ -346,6 +547,10 @@ int main(void) {
     test_rgba4444_format();
     test_dark_classification_exhaustive();
     test_differential_sweep();
+    test_4444_goldens();
+    test_4444_exhaustive_channels();
+    test_pa_classify_cases();
+    test_4444_differential_sweep();
 
     if (g_fail) {
         fprintf(stderr, "\n%d FAILURE(S)\n", g_fail);

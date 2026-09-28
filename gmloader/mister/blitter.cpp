@@ -472,11 +472,27 @@ void Blitter_OnUniformMatrix4fv(GLint loc, GLsizei count, const GLfloat *value) 
             g_matByLoc[loc + i] = m;
         }
 }
-void Blitter_OnBlendState(int enabled, GLenum src, GLenum dst) {
-    if (!g_enabled) return;
-    if (enabled >= 0) g_blendEnabled = enabled;   // <0 = leave unchanged (glBlendFunc)
-    if (src) g_blendSrc = src;
-    if (dst) g_blendDst = dst;
+// Blend state is recorded REGARDLESS of g_enabled. GL state set before
+// Blitter_Init() (or while the blitter is off) is still in force when the
+// blitter later draws: Cursed Castilla EX calls
+// glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) once during init, while
+// g_enabled=0, and afterwards only toggles glEnable/glDisable(GL_BLEND). The old
+// `if (!g_enabled) return;` dropped that call, so every later draw was tracked
+// as the GL defaults GL_ONE/GL_ZERO (device .62, 2026-09-27, BLENDSTAT).
+// The factor setter and the enable toggle are separate entry points so that
+// GL_ZERO (== 0) is recordable: the old combined hook used 0 to mean "factors
+// not given" and so could never record GL_ZERO for src or dst.
+void Blitter_OnBlendFunc(GLenum src, GLenum dst) {
+    g_blendSrc = src;
+    g_blendDst = dst;
+}
+void Blitter_OnBlendEnable(int enabled) {
+    g_blendEnabled = enabled ? 1 : 0;
+}
+void Blitter_GetBlendState(int *enabled, GLenum *src, GLenum *dst) {
+    if (enabled) *enabled = g_blendEnabled;
+    if (src) *src = g_blendSrc;
+    if (dst) *dst = g_blendDst;
 }
 void Blitter_OnViewport(int x, int y, int w, int h) {
     if (!g_enabled) return;
